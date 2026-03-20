@@ -566,11 +566,15 @@ WhatsApp Web mode (native client):
 | `pair_phone` | Optional | Pair-code flow phone number (digits only) |
 | `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+| `allow_self_chat` | Optional | Allow the self chat / "Note to Self" thread (`false` by default) |
+| `allow_direct_messages` | Optional | Allow direct 1:1 chats with other users (`true` by default) |
+| `allow_group_messages` | Optional | Allow group chats (`true` by default) |
 
 Notes:
 
 - WhatsApp Web requires build flag `whatsapp-web`.
 - If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
+- `allow_self_chat` requires `pair_phone` in Web mode so ZeroClaw can identify the account's own chat thread.
 
 ### `[channels_config.linq]`
 

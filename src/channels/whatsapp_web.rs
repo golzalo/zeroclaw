@@ -19,6 +19,9 @@
 //! session_path = "~/.zeroclaw/whatsapp-session.db"  # Required for Web mode
 //! pair_phone = "15551234567"  # Optional: for pair code linking
 //! allowed_numbers = ["+1234567890", "*"]  # Same as Cloud API
+//! allow_self_chat = false
+//! allow_direct_messages = true
+//! allow_group_messages = true
 //! ```
 //!
 //! # Runtime Negotiation
@@ -47,6 +50,9 @@ use tokio::select;
 /// session_path = "~/.zeroclaw/whatsapp-session.db"
 /// pair_phone = "15551234567"  # Optional
 /// allowed_numbers = ["+1234567890", "*"]
+/// allow_self_chat = false
+/// allow_direct_messages = true
+/// allow_group_messages = true
 /// ```
 #[cfg(feature = "whatsapp-web")]
 pub struct WhatsAppWebChannel {
@@ -58,6 +64,14 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// Whether the self chat / "Note to Self" thread is allowed.
+    allow_self_chat: bool,
+    /// Whether direct 1:1 chats with other users are allowed.
+    allow_direct_messages: bool,
+    /// Whether group chats are allowed.
+    allow_group_messages: bool,
+    /// Canonical self phone derived from pair_phone when present.
+    self_phone: Option<String>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -86,18 +100,29 @@ impl WhatsAppWebChannel {
     /// * `pair_phone` - Optional phone number for pair code linking (format: "15551234567")
     /// * `pair_code` - Optional custom pair code (leave empty for auto-generated)
     /// * `allowed_numbers` - Phone numbers allowed to interact (E.164 format) or "*" for all
+    /// * `allow_self_chat` - Allow the self chat / "Note to Self" thread
+    /// * `allow_direct_messages` - Allow direct 1:1 chats with other people
+    /// * `allow_group_messages` - Allow group chats
     #[cfg(feature = "whatsapp-web")]
     pub fn new(
         session_path: String,
         pair_phone: Option<String>,
         pair_code: Option<String>,
         allowed_numbers: Vec<String>,
+        allow_self_chat: bool,
+        allow_direct_messages: bool,
+        allow_group_messages: bool,
     ) -> Self {
+        let self_phone = pair_phone.as_deref().and_then(Self::normalize_phone_token);
         Self {
             session_path,
             pair_phone,
             pair_code,
             allowed_numbers,
+            allow_self_chat,
+            allow_direct_messages,
+            allow_group_messages,
+            self_phone,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -200,6 +225,121 @@ impl WhatsAppWebChannel {
         }
 
         candidates
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_phone_candidates(
+        chat: &wa_rs_binary::jid::Jid,
+        mapped_phone: Option<&str>,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+
+        let mut add_candidate = |candidate: Option<String>| {
+            if let Some(candidate) = candidate {
+                if !candidates.iter().any(|existing| existing == &candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        };
+
+        add_candidate(Self::normalize_phone_token(&chat.to_string()));
+        if let Some(mapped_phone) = mapped_phone {
+            add_candidate(Self::normalize_phone_token(mapped_phone));
+        }
+
+        candidates
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_group_chat(chat: &wa_rs_binary::jid::Jid) -> bool {
+        chat.to_string().contains("@g.us")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn allowlist_mode(allowed_numbers: &[String]) -> &'static str {
+        if allowed_numbers.is_empty() {
+            "empty"
+        } else if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
+            "wildcard"
+        } else {
+            "explicit"
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn classify_chat_kind_for_candidates(
+        sender_candidates: &[String],
+        chat_candidates: &[String],
+        is_group_chat: bool,
+        self_phone: Option<&str>,
+    ) -> WhatsAppChatKind {
+        if is_group_chat {
+            return WhatsAppChatKind::Group;
+        }
+
+        if self_phone.is_some_and(|self_number| {
+            sender_candidates
+                .iter()
+                .any(|candidate| candidate == self_number)
+                && chat_candidates
+                    .iter()
+                    .any(|candidate| candidate == self_number)
+        }) {
+            WhatsAppChatKind::SelfChat
+        } else {
+            WhatsAppChatKind::Direct
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn evaluate_chat_policy(
+        allowed_numbers: &[String],
+        sender_candidates: &[String],
+        chat_candidates: &[String],
+        is_group_chat: bool,
+        self_phone: Option<&str>,
+        allow_self_chat: bool,
+        allow_direct_messages: bool,
+        allow_group_messages: bool,
+    ) -> WhatsAppChatPolicyDecision {
+        let sender_allowed_candidate = sender_candidates
+            .iter()
+            .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
+            .cloned();
+        let sender_in_allowlist = sender_allowed_candidate.is_some();
+        let chat_kind = Self::classify_chat_kind_for_candidates(
+            sender_candidates,
+            chat_candidates,
+            is_group_chat,
+            self_phone,
+        );
+        let flag_allows_chat = match chat_kind {
+            WhatsAppChatKind::SelfChat => allow_self_chat,
+            WhatsAppChatKind::Direct => allow_direct_messages,
+            WhatsAppChatKind::Group => allow_group_messages,
+        };
+        let rejection_reason = if allow_self_chat && self_phone.is_none() {
+            Some("self_requires_pair_phone")
+        } else if !sender_in_allowlist {
+            Some("sender_not_in_allowlist")
+        } else if !flag_allows_chat {
+            Some(match chat_kind {
+                WhatsAppChatKind::SelfChat => "self_disabled",
+                WhatsAppChatKind::Direct => "direct_disabled",
+                WhatsAppChatKind::Group => "group_disabled",
+            })
+        } else {
+            None
+        };
+
+        WhatsAppChatPolicyDecision {
+            sender_allowed_candidate,
+            chat_kind,
+            sender_in_allowlist,
+            flag_allows_chat,
+            accepted: rejection_reason.is_none(),
+            rejection_reason,
+        }
     }
 
     /// Normalize phone number to E.164 format
@@ -439,6 +579,25 @@ impl WhatsAppWebChannel {
 }
 
 #[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatsAppChatKind {
+    SelfChat,
+    Direct,
+    Group,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WhatsAppChatPolicyDecision {
+    sender_allowed_candidate: Option<String>,
+    chat_kind: WhatsAppChatKind,
+    sender_in_allowlist: bool,
+    flag_allows_chat: bool,
+    accepted: bool,
+    rejection_reason: Option<&'static str>,
+}
+
+#[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
@@ -450,6 +609,13 @@ impl Channel for WhatsAppWebChannel {
         let Some(client) = client else {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
+
+        tracing::trace!(
+            recipient = %message.recipient,
+            is_jid = Self::is_jid(&message.recipient),
+            allowlist_skipped = Self::is_jid(&message.recipient),
+            "WhatsApp Web send recipient evaluation"
+        );
 
         // Validate recipient allowlist only for direct phone-number targets.
         if !Self::is_jid(&message.recipient) {
@@ -624,9 +790,21 @@ impl Channel for WhatsAppWebChannel {
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
             let transcription_config = self.transcription.clone();
-
-            let transcription_config = self.transcription.clone();
             let voice_chats = self.voice_chats.clone();
+            let allow_self_chat = self.allow_self_chat;
+            let allow_direct_messages = self.allow_direct_messages;
+            let allow_group_messages = self.allow_group_messages;
+            let self_phone = self.self_phone.clone();
+
+            tracing::info!(
+                raw_pair_phone = ?self.pair_phone,
+                normalized_self_phone = ?self_phone,
+                allow_self_chat,
+                allow_direct_messages,
+                allow_group_messages,
+                allowlist_mode = Self::allowlist_mode(&allowed_numbers),
+                "WhatsApp Web chat policy configured"
+            );
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -640,41 +818,83 @@ impl Channel for WhatsAppWebChannel {
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
                     let voice_chats = voice_chats.clone();
+                    let self_phone = self_phone.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
+                                let chat_jid = info.source.chat.clone();
                                 let sender = sender_jid.user().to_string();
-                                let chat = info.source.chat.to_string();
+                                let chat = chat_jid.to_string();
+                                let sender_is_lid = sender_jid.is_lid();
+                                let chat_is_lid = chat_jid.is_lid();
 
-                                let mapped_phone = if sender_jid.is_lid() {
+                                let mapped_sender_phone = if sender_is_lid {
                                     client.get_phone_number_from_lid(&sender_jid.user).await
+                                } else {
+                                    None
+                                };
+                                let mapped_chat_phone = if chat_is_lid {
+                                    client.get_phone_number_from_lid(&chat_jid.user).await
                                 } else {
                                     None
                                 };
                                 let sender_candidates = Self::sender_phone_candidates(
                                     &sender_jid,
                                     sender_alt.as_ref(),
-                                    mapped_phone.as_deref(),
+                                    mapped_sender_phone.as_deref(),
+                                );
+                                let chat_candidates =
+                                    Self::chat_phone_candidates(&chat_jid, mapped_chat_phone.as_deref());
+                                let decision = Self::evaluate_chat_policy(
+                                    &allowed_numbers,
+                                    &sender_candidates,
+                                    &chat_candidates,
+                                    Self::is_group_chat(&chat_jid),
+                                    self_phone.as_deref(),
+                                    allow_self_chat,
+                                    allow_direct_messages,
+                                    allow_group_messages,
+                                );
+                                let rejection_reason =
+                                    decision.rejection_reason.unwrap_or("accepted");
+
+                                tracing::trace!(
+                                    raw_sender_jid = %sender_jid,
+                                    raw_sender_alt = ?sender_alt,
+                                    raw_chat_jid = %chat_jid,
+                                    sender_is_lid,
+                                    chat_is_lid,
+                                    mapped_sender_phone = ?mapped_sender_phone,
+                                    mapped_chat_phone = ?mapped_chat_phone,
+                                    sender_candidates = ?sender_candidates,
+                                    chat_candidates = ?chat_candidates,
+                                    normalized_self_phone = ?self_phone,
+                                    chat_kind = ?decision.chat_kind,
+                                    sender_in_allowlist = decision.sender_in_allowlist,
+                                    flag_allows_chat = decision.flag_allows_chat,
+                                    allow_self_chat,
+                                    allow_direct_messages,
+                                    allow_group_messages,
+                                    accepted = decision.accepted,
+                                    rejection_reason,
+                                    "WhatsApp Web inbound chat policy evaluation"
                                 );
 
-                                let normalized = match sender_candidates
-                                    .iter()
-                                    .find(|candidate| {
-                                        Self::is_number_allowed_for_list(&allowed_numbers, candidate)
-                                    })
-                                    .cloned()
-                                {
-                                    Some(n) => n,
-                                    None => {
-                                        tracing::warn!(
-                                            "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
-                                            sender_candidates.len()
-                                        );
-                                        return;
-                                    }
-                                };
+                                if !decision.accepted {
+                                    tracing::warn!(
+                                        reason = rejection_reason,
+                                        chat_kind = ?decision.chat_kind,
+                                        sender_candidates_count = sender_candidates.len(),
+                                        chat_candidates_count = chat_candidates.len(),
+                                        "WhatsApp Web inbound message rejected by chat policy"
+                                    );
+                                    return;
+                                }
+                                let normalized = decision
+                                    .sender_allowed_candidate
+                                    .expect("accepted implies sender candidate");
 
                                 // Attempt voice note transcription (ptt = push-to-talk = voice note)
                                 let voice_text = if let Some(ref audio) = msg.audio_message {
@@ -979,6 +1199,9 @@ impl WhatsAppWebChannel {
         _pair_phone: Option<String>,
         _pair_code: Option<String>,
         _allowed_numbers: Vec<String>,
+        _allow_self_chat: bool,
+        _allow_direct_messages: bool,
+        _allow_group_messages: bool,
     ) -> Self {
         Self { _private: () }
     }
@@ -1042,9 +1265,12 @@ mod tests {
     fn make_channel() -> WhatsAppWebChannel {
         WhatsAppWebChannel::new(
             "/tmp/test-whatsapp.db".into(),
-            None,
+            Some("1234567890".into()),
             None,
             vec!["+1234567890".into()],
+            false,
+            true,
+            true,
         )
     }
 
@@ -1066,7 +1292,15 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_allowed_wildcard() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()]);
+        let ch = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec!["*".into()],
+            false,
+            true,
+            true,
+        );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
@@ -1074,7 +1308,8 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![]);
+        let ch =
+            WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![], false, true, true);
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }
@@ -1120,6 +1355,130 @@ mod tests {
             &allowed,
             "+1 (555) 123-4567"
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_chat_candidates_include_lid_mapping_phone() {
+        let chat = Jid::lid("76188559093817");
+        let candidates = WhatsAppWebChannel::chat_phone_candidates(&chat, Some("15551234567"));
+        assert!(candidates.contains(&"+15551234567".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_group_detection_matches_group_jid() {
+        let group: Jid = "120363025246293599@g.us".parse().unwrap();
+        assert!(WhatsAppWebChannel::is_group_chat(&group));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_classifies_self_chat_from_self_phone() {
+        let kind = WhatsAppWebChannel::classify_chat_kind_for_candidates(
+            &["+15551234567".to_string()],
+            &["+15551234567".to_string()],
+            false,
+            Some("+15551234567"),
+        );
+        assert_eq!(kind, WhatsAppChatKind::SelfChat);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_chat_policy_accepts_self_only_mode() {
+        let decision = WhatsAppWebChannel::evaluate_chat_policy(
+            &["+15551234567".to_string()],
+            &["+15551234567".to_string()],
+            &["+15551234567".to_string()],
+            false,
+            Some("+15551234567"),
+            true,
+            false,
+            false,
+        );
+
+        assert!(decision.accepted);
+        assert_eq!(decision.chat_kind, WhatsAppChatKind::SelfChat);
+        assert_eq!(
+            decision.sender_allowed_candidate,
+            Some("+15551234567".to_string())
+        );
+        assert_eq!(decision.rejection_reason, None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_chat_policy_rejects_direct_when_disabled() {
+        let decision = WhatsAppWebChannel::evaluate_chat_policy(
+            &["+15551234567".to_string()],
+            &["+15551234567".to_string()],
+            &["+5491112345678".to_string()],
+            false,
+            Some("+15551234567"),
+            true,
+            false,
+            false,
+        );
+
+        assert!(!decision.accepted);
+        assert_eq!(decision.chat_kind, WhatsAppChatKind::Direct);
+        assert_eq!(decision.rejection_reason, Some("direct_disabled"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_chat_policy_rejects_group_when_disabled() {
+        let decision = WhatsAppWebChannel::evaluate_chat_policy(
+            &["+15551234567".to_string()],
+            &["+15551234567".to_string()],
+            &[],
+            true,
+            Some("+15551234567"),
+            true,
+            true,
+            false,
+        );
+
+        assert!(!decision.accepted);
+        assert_eq!(decision.chat_kind, WhatsAppChatKind::Group);
+        assert_eq!(decision.rejection_reason, Some("group_disabled"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_chat_policy_defaults_still_allow_direct_messages() {
+        let decision = WhatsAppWebChannel::evaluate_chat_policy(
+            &["+5491112345678".to_string()],
+            &["+5491112345678".to_string()],
+            &["+5491112345678".to_string()],
+            false,
+            Some("+15551234567"),
+            false,
+            true,
+            true,
+        );
+
+        assert!(decision.accepted);
+        assert_eq!(decision.chat_kind, WhatsAppChatKind::Direct);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_chat_policy_requires_pair_phone_for_self_mode() {
+        let decision = WhatsAppWebChannel::evaluate_chat_policy(
+            &["+15551234567".to_string()],
+            &["+15551234567".to_string()],
+            &["+15551234567".to_string()],
+            false,
+            None,
+            true,
+            false,
+            false,
+        );
+
+        assert!(!decision.accepted);
+        assert_eq!(decision.rejection_reason, Some("self_requires_pair_phone"));
     }
 
     #[test]

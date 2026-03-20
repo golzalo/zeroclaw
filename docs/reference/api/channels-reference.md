@@ -251,6 +251,9 @@ session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # optional; omit to use QR flow
 pair_code = ""                     # optional custom pair code
 allowed_numbers = ["*"]
+allow_self_chat = false
+allow_direct_messages = true
+allow_group_messages = true
 ```
 
 Notes:

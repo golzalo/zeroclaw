@@ -3690,6 +3690,11 @@ fn collect_configured_channels(
         // Runtime negotiation: detect backend type from config
         match wa.backend_type() {
             "cloud" => {
+                if wa.has_custom_chat_policy() {
+                    tracing::warn!(
+                        "WhatsApp Cloud API ignores allow_self_chat/allow_direct_messages/allow_group_messages; these flags only apply to Web mode"
+                    );
+                }
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
                 if wa.is_cloud_config() {
                     channels.push(ConfiguredChannel {
@@ -3717,6 +3722,9 @@ fn collect_configured_channels(
                                 wa.pair_phone.clone(),
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
+                                wa.allow_self_chat,
+                                wa.allow_direct_messages,
+                                wa.allow_group_messages,
                             )
                             .with_transcription(config.transcription.clone())
                             .with_tts(config.tts.clone()),
