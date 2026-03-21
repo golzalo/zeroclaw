@@ -1,7 +1,7 @@
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel,
+    self, Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel,
     TelegramChannel,
 };
 use crate::config::Config;
@@ -381,6 +381,13 @@ pub(crate) async fn deliver_announcement(
     target: &str,
     output: &str,
 ) -> Result<()> {
+    if let Some(runtime_channel) = channels::get_delivery_channel(channel) {
+        runtime_channel
+            .send(&SendMessage::new(output, target))
+            .await?;
+        return Ok(());
+    }
+
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config

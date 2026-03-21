@@ -282,6 +282,27 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn delivery_channels_store(
+) -> &'static parking_lot::RwLock<Option<Arc<HashMap<String, Arc<dyn Channel>>>>> {
+    static STORE: OnceLock<parking_lot::RwLock<Option<Arc<HashMap<String, Arc<dyn Channel>>>>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Publish the currently active channel map so other subsystems (e.g. cron
+/// scheduler) can reuse the same live connections for outbound delivery.
+pub fn set_delivery_channels(map: Arc<HashMap<String, Arc<dyn Channel>>>) {
+    *delivery_channels_store().write() = Some(map);
+}
+
+/// Obtain a live channel handle by name for out-of-band deliveries.
+pub fn get_delivery_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    delivery_channels_store()
+        .read()
+        .as_ref()
+        .and_then(|channels| channels.get(name).map(Arc::clone))
+}
+
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
 const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
@@ -4393,6 +4414,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    set_delivery_channels(Arc::clone(&channels_by_name));
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
