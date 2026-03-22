@@ -33,9 +33,25 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+#[cfg(feature = "whatsapp-web")]
+use base64::Engine as _;
 use parking_lot::Mutex;
+#[cfg(feature = "whatsapp-web")]
+use std::path::Path;
 use std::sync::Arc;
-use tokio::select;
+use tokio::{fs, select};
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_core::download::MediaType;
+
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] = [
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+];
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -517,7 +533,233 @@ impl WhatsAppWebChannel {
         }
     }
 
-    /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
+    #[cfg(feature = "whatsapp-web")]
+    async fn collect_image_markers(
+        client: &wa_rs::Client,
+        msg: &wa_rs_proto::whatsapp::Message,
+    ) -> Vec<String> {
+        let mut markers = Vec::new();
+
+        if let Some(ref image) = msg.image_message {
+            if let Some(marker) = Self::download_image_message(client, image).await {
+                markers.push(marker);
+            }
+        }
+
+        if let Some(ref document) = msg.document_message {
+            if Self::document_is_supported_image(document) {
+                if let Some(marker) = Self::download_document_image(client, document).await {
+                    markers.push(marker);
+                }
+            }
+        }
+
+        markers
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn download_image_message(
+        client: &wa_rs::Client,
+        image: &wa_rs_proto::whatsapp::message::ImageMessage,
+    ) -> Option<String> {
+        if image.view_once == Some(true) {
+            tracing::info!("WhatsApp Web: skipping view-once image attachment");
+            return None;
+        }
+
+        if let Some(len) = image
+            .file_length
+            .and_then(|len| usize::try_from(len).ok())
+        {
+            if len > WHATSAPP_IMAGE_MAX_BYTES {
+                tracing::warn!(
+                    "WhatsApp Web: image attachment declared length {} exceeds {} bytes",
+                    len,
+                    WHATSAPP_IMAGE_MAX_BYTES
+                );
+                return None;
+            }
+        }
+
+        use wa_rs::download::Downloadable;
+        let bytes = match client.download(image as &dyn Downloadable).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!("WhatsApp Web: failed to download image attachment: {err}");
+                return None;
+            }
+        };
+
+        Self::image_bytes_to_marker(bytes, image.mimetype.as_deref(), "image_message")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn download_document_image(
+        client: &wa_rs::Client,
+        document: &wa_rs_proto::whatsapp::message::DocumentMessage,
+    ) -> Option<String> {
+        if let Some(len) = document
+            .file_length
+            .and_then(|len| usize::try_from(len).ok())
+        {
+            if len > WHATSAPP_IMAGE_MAX_BYTES {
+                tracing::warn!(
+                    "WhatsApp Web: document image declared length {} exceeds {} bytes",
+                    len,
+                    WHATSAPP_IMAGE_MAX_BYTES
+                );
+                return None;
+            }
+        }
+
+        use wa_rs::download::Downloadable;
+        let bytes = match client.download(document as &dyn Downloadable).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!("WhatsApp Web: failed to download document image: {err}");
+                return None;
+            }
+        };
+
+        Self::image_bytes_to_marker(bytes, document.mimetype.as_deref(), "document_image")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn document_is_supported_image(
+        document: &wa_rs_proto::whatsapp::message::DocumentMessage,
+    ) -> bool {
+        Self::normalized_mime_hint(document.mimetype.as_deref())
+            .as_deref()
+            .and_then(Self::mime_from_hint)
+            .is_some()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn image_bytes_to_marker(
+        bytes: Vec<u8>,
+        declared_mime: Option<&str>,
+        source: &str,
+    ) -> Option<String> {
+        if bytes.is_empty() {
+            tracing::warn!(
+                "WhatsApp Web: downloaded empty image payload for {}",
+                source
+            );
+            return None;
+        }
+
+        if bytes.len() > WHATSAPP_IMAGE_MAX_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: image payload for {} is {} bytes (limit {})",
+                source,
+                bytes.len(),
+                WHATSAPP_IMAGE_MAX_BYTES
+            );
+            return None;
+        }
+
+        let mime = match Self::detect_image_mime(&bytes, declared_mime) {
+            Some(m) => m,
+            None => {
+                tracing::warn!(
+                    "WhatsApp Web: unsupported or unknown image MIME for {} (declared={:?})",
+                    source,
+                    declared_mime
+                );
+                return None;
+            }
+        };
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn detect_image_mime(
+        bytes: &[u8],
+        declared_mime: Option<&str>,
+    ) -> Option<&'static str> {
+        if let Some(magic) = Self::mime_from_magic(bytes) {
+            return Some(magic);
+        }
+
+        let normalized = Self::normalized_mime_hint(declared_mime)?;
+        let canonical = Self::mime_from_hint(&normalized)?;
+        if WHATSAPP_SUPPORTED_IMAGE_MIME_TYPES.contains(&canonical) {
+            Some(canonical)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn normalized_mime_hint(mime: Option<&str>) -> Option<String> {
+        mime.and_then(|value| {
+            let candidate = value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if candidate.is_empty() {
+                None
+            } else {
+                Some(candidate)
+            }
+        })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_from_hint(mime: &str) -> Option<&'static str> {
+        match mime {
+            "image/jpeg" | "image/jpg" | "image/pjpeg" | "image/jfif" => Some("image/jpeg"),
+            "image/png" | "image/x-png" => Some("image/png"),
+            "image/webp" => Some("image/webp"),
+            "image/gif" => Some("image/gif"),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.len() >= 8
+            && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'])
+        {
+            return Some("image/png");
+        }
+        if bytes.len() >= 3 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            return Some("image/jpeg");
+        }
+        if bytes.len() >= 6
+            && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
+        {
+            return Some("image/gif");
+        }
+        if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            return Some("image/webp");
+        }
+        None
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn find_matching_close(segment: &str) -> Option<usize> {
+        let mut depth = 1usize;
+        for (i, ch) in segment.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = \"whatsapp-web\")]\n    fn extract_outgoing_image_markers(message: &str) -> (String, Vec<String>) {\n        let mut cleaned = String::with_capacity(message.len());\n        let mut markers = Vec::new();\n        let mut cursor = 0;\n\n        while cursor < message.len() {\n            let Some(open_rel) = message[cursor..].find('[') else {\n                cleaned.push_str(&message[cursor..]);\n                break;\n            };\n\n            let open = cursor + open_rel;\n            cleaned.push_str(&message[cursor..open]);\n\n            let Some(close_rel) = Self::find_matching_close(&message[open + 1..]) else {\n                cleaned.push_str(&message[open..]);\n                break;\n            };\n\n            let close = open + 1 + close_rel;\n            let marker = &message[open + 1..close];\n\n            let parsed = marker.split_once(':').and_then(|(kind, target)| {\n                if kind.trim().eq_ignore_ascii_case(\"IMAGE\") {\n                    let trimmed = target.trim();\n                    if trimmed.is_empty() {\n                        return None;\n                    }\n                    Some(trimmed.to_string())\n                } else {\n                    None\n                }\n            });\n\n            if let Some(target) = parsed {\n                markers.push(target);\n            } else {\n                cleaned.push_str(&message[open..=close]);\n            }\n\n            cursor = close + 1;\n        }\n\n        (cleaned.trim().to_string(), markers)\n    }\n\n    #[cfg(feature = \"whatsapp-web\")]\n    async fn send_image_attachment(\n        client: &wa_rs::Client,\n        to: &wa_rs_binary::jid::Jid,\n        target: &str,\n    ) -> Result<()> {\n        let trimmed = target.trim_matches(|c| c == '"' || c == '\'' || c.is_whitespace());\n        if trimmed.is_empty() {\n            anyhow::bail!(\"Image marker missing target\");\n        }\n\n        if trimmed.starts_with(\"data:\") {\n            Self::send_image_from_data(client, to, trimmed).await\n        } else {\n            Self::send_image_from_path(client, to, trimmed).await\n        }\n    }\n\n    #[cfg(feature = \"whatsapp-web\")]\n    async fn send_image_from_path(\n        client: &wa_rs::Client,\n        to: &wa_rs_binary::jid::Jid,\n        target: &str,\n    ) -> Result<()> {\n        let path = Path::new(target);\n        if !path.exists() {\n            anyhow::bail!(\"Image file not found: {target}\");\n        }\n\n        let Some(mime) = Self::infer_mime_from_path(path) else {\n            anyhow::bail!(\"Unsupported image extension for {target}\");\n        };\n\n        let bytes = fs::read(path)\n            .await\n            .map_err(|e| anyhow!(\"Failed to read image {}: {e}\", path.display()))?;\n        Self::upload_and_send_image(client, to, bytes, mime).await\n    }\n\n    #[cfg(feature = \"whatsapp-web\")]\n    async fn send_image_from_data(\n        client: &wa_rs::Client,\n        to: &wa_rs_binary::jid::Jid,\n        data_url: &str,\n    ) -> Result<()> {\n        let Some(stripped) = data_url.strip_prefix(\"data:\") else {\n            anyhow::bail!(\"Invalid data URI\");\n        };\n        let Some((header, payload)) = stripped.split_once(',') else {\n            anyhow::bail!(\"Invalid data URI payload\");\n        };\n        let Some((mime_part, encoding)) = header.split_once(';') else {\n            anyhow::bail!(\"Invalid data URI header\");\n        };\n        if !encoding.eq_ignore_ascii_case(\"base64\") {\n            anyhow::bail!(\"Only base64 data URIs are supported\");\n        }\n\n        let Some(mime) = Self::mime_from_hint(mime_part.trim()) else {\n            anyhow::bail!(\"Unsupported image MIME: {mime_part}\");\n        };\n\n        let bytes = base64::engine::general_purpose::STANDARD\n            .decode(payload.trim())\n            .map_err(|e| anyhow!(\"Failed to decode base64 image data: {e}\"))?;\n        Self::upload_and_send_image(client, to, bytes, mime).await\n    }\n\n    #[cfg(feature = \"whatsapp-web\")]\n    fn infer_mime_from_path(path: &Path) -> Option<&'static str> {\n        let ext = path\n            .extension()\n            .and_then(|e| e.to_str())\n            .map(|e| e.to_ascii_lowercase())?;\n        match ext.as_str() {\n            \"png\" => Some(\"image/png\"),\n            \"jpg\" | \"jpeg\" => Some(\"image/jpeg\"),\n            \"webp\" => Some(\"image/webp\"),\n            \"gif\" => Some(\"image/gif\"),\n            _ => None,\n        }\n    }\n\n    #[cfg(feature = \"whatsapp-web\")]\n    async fn upload_and_send_image(\n        client: &wa_rs::Client,\n        to: &wa_rs_binary::jid::Jid,\n        bytes: Vec<u8>,\n        mime: &str,\n    ) -> Result<()> {\n        if bytes.is_empty() {\n            anyhow::bail!(\"Image payload is empty\");\n        }\n        if bytes.len() > WHATSAPP_IMAGE_MAX_BYTES {\n            anyhow::bail!(\"Image payload exceeds {WHATSAPP_IMAGE_MAX_BYTES} bytes\");\n        }\n\n        let upload = client\n            .upload(bytes, MediaType::Image)\n            .await\n            .map_err(|e| anyhow!(\"Failed to upload image: {e}\"))?;\n\n        let image_msg = wa_rs_proto::whatsapp::Message {\n            image_message: Some(Box::new(wa_rs_proto::whatsapp::message::ImageMessage {\n                url: Some(upload.url),\n                direct_path: Some(upload.direct_path),\n                media_key: Some(upload.media_key),\n                file_enc_sha256: Some(upload.file_enc_sha256),\n                file_sha256: Some(upload.file_sha256),\n                file_length: Some(upload.file_length),\n                mimetype: Some(mime.to_string()),\n                ..Default::default()\n            })),\n            ..Default::default()\n        };\n\n        client\n            .send_message(to.clone(), image_msg)\n            .await\n            .map_err(|e| anyhow!(\"Failed to send image: {e}\"))?;\n        Ok(())\n    }\n\n    /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
     #[cfg(feature = "whatsapp-web")]
     async fn synthesize_voice_static(
         client: &wa_rs::Client,
@@ -534,7 +776,6 @@ impl WhatsAppWebChannel {
             anyhow::bail!("TTS returned empty audio");
         }
 
-        use wa_rs_core::download::MediaType;
         let upload = client
             .upload(audio_bytes, MediaType::Audio)
             .await
@@ -610,6 +851,8 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
+        let content = super::strip_tool_call_tags(&message.content);
+
         tracing::trace!(
             recipient = %message.recipient,
             is_jid = Self::is_jid(&message.recipient),
@@ -630,6 +873,7 @@ impl Channel for WhatsAppWebChannel {
         }
 
         let to = self.recipient_to_jid(&message.recipient)?;
+        let (clean_content, image_markers) = Self::extract_outgoing_image_markers(&content);
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Only substantive messages (not tool outputs) are queued.
@@ -642,23 +886,22 @@ impl Channel for WhatsAppWebChannel {
             .unwrap_or(false);
 
         if is_voice_chat && self.tts_config.is_some() {
-            let content = &message.content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
+            let is_substantive = clean_content.len() > 40
+                && !clean_content.starts_with("http")
+                && !clean_content.starts_with('{')
+                && !clean_content.starts_with('[')
+                && !clean_content.starts_with("Error")
+                && !clean_content.contains("```")
+                && !clean_content.contains("tool_call")
+                && !clean_content.contains("wttr.in");
 
             if is_substantive {
                 if let Ok(mut pv) = self.pending_voice.lock() {
                     pv.insert(
                         message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
+                        (clean_content.clone(), std::time::Instant::now()),
                     );
                 }
 
@@ -711,9 +954,29 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
+        if !image_markers.is_empty() {
+            if !clean_content.is_empty() {
+                let text_msg = wa_rs_proto::whatsapp::Message {
+                    conversation: Some(clean_content.clone()),
+                    ..Default::default()
+                };
+                client.send_message(to.clone(), text_msg).await?;
+            }
+
+            for marker in image_markers {
+                Self::send_image_attachment(&client, &to, &marker).await?;
+            }
+
+            return Ok(());
+        }
+
         // Send text message
+        if clean_content.is_empty() {
+            return Ok(());
+        }
+
         let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
+            conversation: Some(clean_content.clone()),
             ..Default::default()
         };
 
@@ -896,47 +1159,51 @@ impl Channel for WhatsAppWebChannel {
                                     .sender_allowed_candidate
                                     .expect("accepted implies sender candidate");
 
-                                // Attempt voice note transcription (ptt = push-to-talk = voice note)
+                                // Attempt voice note transcription for any audio attachment
                                 let voice_text = if let Some(ref audio) = msg.audio_message {
-                                    if audio.ptt == Some(true) {
-                                        Self::try_transcribe_voice_note(
-                                            &client,
-                                            audio,
-                                            transcription_config.as_ref(),
-                                        )
-                                        .await
-                                    } else {
-                                        tracing::debug!(
-                                            "WhatsApp Web: ignoring non-PTT audio message from {}",
-                                            normalized
-                                        );
-                                        None
-                                    }
+                                    Self::try_transcribe_voice_note(
+                                        &client,
+                                        audio,
+                                        transcription_config.as_ref(),
+                                    )
+                                    .await
                                 } else {
                                     None
                                 };
 
+                                let image_markers =
+                                    Self::collect_image_markers(&client, &msg).await;
+                                let attachment_count = image_markers.len();
+
                                 // Use transcribed voice text, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
                                 // We store the chat JID (reply_target) since that's what send() receives.
-                                let content = if let Some(ref vt) = voice_text {
+                                let mut sections = Vec::new();
+                                if let Some(ref vt) = voice_text {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.insert(chat.clone());
                                     }
-                                    format!("[Voice] {vt}")
+                                    sections.push(format!("[Voice] {vt}"));
                                 } else {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.remove(&chat);
                                     }
-                                    let text = msg.text_content().unwrap_or("");
-                                    text.trim().to_string()
-                                };
+                                    let text = msg.text_content().unwrap_or("").trim().to_string();
+                                    if !text.is_empty() {
+                                        sections.push(text);
+                                    }
+                                }
+
+                                sections.extend(image_markers);
+
+                                let content = sections.join("\n\n");
 
                                 tracing::info!(
-                                    "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})",
+                                    "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={}, attachments={})",
                                     sender.len(),
                                     chat.len(),
-                                    content.len()
+                                    content.len(),
+                                    attachment_count
                                 );
                                 tracing::debug!(
                                     "WhatsApp Web message content: {}",

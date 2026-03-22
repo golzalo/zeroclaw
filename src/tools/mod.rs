@@ -47,6 +47,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod image_generate;
 pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;
@@ -115,6 +116,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use image_generate::ImageGenerateTool;
 pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
@@ -527,6 +529,14 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    if root_config.linkedin.image.enabled {
+        tool_arcs.push(Arc::new(ImageGenerateTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+            root_config.linkedin.image.clone(),
+        )));
+    }
 
     // LinkedIn integration (config-gated)
     if root_config.linkedin.enabled {
