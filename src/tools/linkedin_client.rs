@@ -825,6 +825,13 @@ impl ImageGenerator {
 
     /// Read an env var value from the workspace .env file (same format as LinkedInClient).
     async fn read_env_var(workspace_dir: &Path, var_name: &str) -> anyhow::Result<String> {
+        if let Ok(val) = std::env::var(var_name) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+
         let env_path = workspace_dir.join(".env");
         let content = tokio::fs::read_to_string(&env_path)
             .await
@@ -846,7 +853,7 @@ impl ImageGenerator {
             }
         }
 
-        anyhow::bail!("{var_name} not found or empty in .env")
+        anyhow::bail!("{var_name} not found in environment or .env")
     }
 
     fn http_client() -> reqwest::Client {

@@ -36,7 +36,7 @@ impl ImageGenerateTool {
 #[async_trait]
 impl Tool for ImageGenerateTool {
     fn name(&self) -> &str {
-        "image.generate"
+        "image_generate"
     }
 
     fn description(&self) -> &str {
