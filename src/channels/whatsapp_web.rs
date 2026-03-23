@@ -475,7 +475,14 @@ impl WhatsAppWebChannel {
         audio: &wa_rs_proto::whatsapp::message::AudioMessage,
         transcription_config: Option<&crate::config::TranscriptionConfig>,
     ) -> Option<String> {
-        let config = transcription_config?;
+        let Some(config) = transcription_config else {
+            tracing::debug!(
+                ptt = audio.ptt.unwrap_or(false),
+                mimetype = ?audio.mimetype.as_deref(),
+                "WhatsApp Web: received audio message but transcription is disabled"
+            );
+            return None;
+        };
 
         // Enforce duration limit
         if let Some(seconds) = audio.seconds {
