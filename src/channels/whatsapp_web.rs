@@ -546,6 +546,15 @@ impl WhatsAppWebChannel {
     ) -> &'a wa_rs_proto::whatsapp::Message {
         loop {
             if let Some(inner) = msg
+                .device_sent_message
+                .as_deref()
+                .and_then(|device_sent| device_sent.message.as_deref())
+            {
+                msg = inner;
+                continue;
+            }
+
+            if let Some(inner) = msg
                 .ephemeral_message
                 .as_deref()
                 .and_then(|fp| fp.message.as_deref())
@@ -583,6 +592,15 @@ impl WhatsAppWebChannel {
 
             if let Some(inner) = msg
                 .document_with_caption_message
+                .as_deref()
+                .and_then(|fp| fp.message.as_deref())
+            {
+                msg = inner;
+                continue;
+            }
+
+            if let Some(inner) = msg
+                .edited_message
                 .as_deref()
                 .and_then(|fp| fp.message.as_deref())
             {
@@ -1501,6 +1519,9 @@ impl Channel for WhatsAppWebChannel {
                                         has_audio = content_msg.audio_message.is_some(),
                                         has_image = content_msg.image_message.is_some(),
                                         has_document = content_msg.document_message.is_some(),
+                                        has_device_sent = msg.device_sent_message.is_some(),
+                                        has_edited = msg.edited_message.is_some(),
+                                        has_protocol = msg.protocol_message.is_some(),
                                         has_view_once = msg.view_once_message.is_some()
                                             || msg.view_once_message_v2.is_some(),
                                         has_ephemeral = msg.ephemeral_message.is_some(),
@@ -1815,6 +1836,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wa_rs_binary::jid::Jid;
+    #[cfg(feature = "whatsapp-web")]
+    use wa_rs_proto::whatsapp::{message::AudioMessage, message::DeviceSentMessage, Message};
 
     #[cfg(feature = "whatsapp-web")]
     fn make_channel() -> WhatsAppWebChannel {
@@ -2034,6 +2057,25 @@ mod tests {
 
         assert!(!decision.accepted);
         assert_eq!(decision.rejection_reason, Some("self_requires_pair_phone"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_resolve_content_message_unwraps_device_sent_audio() {
+        let inner = Message {
+            audio_message: Some(Box::new(AudioMessage::default())),
+            ..Default::default()
+        };
+        let wrapped = Message {
+            device_sent_message: Some(Box::new(DeviceSentMessage {
+                message: Some(Box::new(inner)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let resolved = WhatsAppWebChannel::resolve_content_message(&wrapped);
+        assert!(resolved.audio_message.is_some());
     }
 
     #[test]
