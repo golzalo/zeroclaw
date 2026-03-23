@@ -1,11 +1,14 @@
 use super::linkedin_client::ImageGenerator;
+use anyhow::Context;
 use super::traits::{Tool, ToolResult};
 use crate::config::LinkedInImageConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::PathBuf;
+use base64::Engine as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::warn;
 
 /// Generic image generation tool that reuses the multi-provider pipeline
 /// (Stability, Imagen, DALL·E, Flux) defined for LinkedIn posts.
@@ -102,11 +105,21 @@ impl Tool for ImageGenerateTool {
 
         let generator = ImageGenerator::new(config, self.workspace_dir.clone());
         match generator.generate(prompt).await {
-            Ok(path) => Ok(ToolResult {
-                success: true,
-                output: format!("[IMAGE:{}]", path.display()),
-                error: None,
-            }),
+            Ok(path) => match image_path_to_data_uri(&path).await {
+                Ok(data_uri) => Ok(ToolResult {
+                    success: true,
+                    output: format!("[IMAGE:{}]", data_uri),
+                    error: None,
+                }),
+                Err(err) => {
+                    warn!("Failed to convert generated image to data URI: {err}");
+                    Ok(ToolResult {
+                        success: true,
+                        output: format!("[IMAGE:{}]", path.display()),
+                        error: None,
+                    })
+                }
+            },
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -114,4 +127,28 @@ impl Tool for ImageGenerateTool {
             }),
         }
     }
+}
+
+async fn image_path_to_data_uri(path: &Path) -> anyhow::Result<String> {
+  let bytes = tokio::fs::read(path)
+    .await
+    .with_context(|| format!("Failed to read generated image {}", path.display()))?;
+  let mime = detect_mime_from_extension(path);
+  let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+  Ok(format!("data:{};base64,{}", mime, encoded))
+}
+
+fn detect_mime_from_extension(path: &Path) -> &'static str {
+  match path
+    .extension()
+    .and_then(|ext| ext.to_str())
+    .map(|ext| ext.to_ascii_lowercase())
+  {
+    Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg",
+    Some(ext) if ext == "png" => "image/png",
+    Some(ext) if ext == "webp" => "image/webp",
+    Some(ext) if ext == "gif" => "image/gif",
+    Some(ext) if ext == "svg" => "image/svg+xml",
+    _ => "image/png",
+  }
 }
