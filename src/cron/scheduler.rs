@@ -360,6 +360,11 @@ fn resolve_matrix_delivery_room(configured_room_id: &str, target: &str) -> Strin
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
+        tracing::trace!(
+            job_id = %job.id,
+            delivery_mode = %delivery.mode,
+            "Skipping cron delivery because mode is not announce"
+        );
         return Ok(());
     }
 
@@ -372,6 +377,15 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
+    tracing::trace!(
+        job_id = %job.id,
+        channel,
+        target,
+        output_len = output.len(),
+        best_effort = delivery.best_effort,
+        "Delivering cron job output"
+    );
+
     deliver_announcement(config, channel, target, output).await
 }
 
@@ -382,11 +396,24 @@ pub(crate) async fn deliver_announcement(
     output: &str,
 ) -> Result<()> {
     if let Some(runtime_channel) = channels::get_delivery_channel(channel) {
+        tracing::trace!(
+            channel,
+            target,
+            output_len = output.len(),
+            "Sending cron delivery through registered runtime channel"
+        );
         runtime_channel
             .send(&SendMessage::new(output, target))
             .await?;
         return Ok(());
     }
+
+    tracing::trace!(
+        channel,
+        target,
+        output_len = output.len(),
+        "Sending cron delivery through configured channel fallback"
+    );
 
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {

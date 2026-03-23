@@ -2247,6 +2247,11 @@ fn maybe_inject_channel_delivery_defaults(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
+        tracing::trace!(
+            tool = "cron_add",
+            channel = channel_name,
+            "Skipping delivery default injection because reply target is missing"
+        );
         return;
     };
 
@@ -2263,6 +2268,11 @@ fn maybe_inject_channel_delivery_defaults(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|prompt| !prompt.trim().is_empty());
     if !is_agent_job {
+        tracing::trace!(
+            tool = "cron_add",
+            channel = channel_name,
+            "Skipping delivery default injection for non-agent cron_add request"
+        );
         return;
     }
 
@@ -2277,9 +2287,21 @@ fn maybe_inject_channel_delivery_defaults(
     match args.get_mut("delivery") {
         None => {
             args.insert("delivery".to_string(), default_delivery());
+            tracing::trace!(
+                tool = "cron_add",
+                channel = channel_name,
+                to = reply_target,
+                "Injected default delivery for cron_add"
+            );
         }
         Some(serde_json::Value::Null) => {
             *args.get_mut("delivery").expect("delivery key exists") = default_delivery();
+            tracing::trace!(
+                tool = "cron_add",
+                channel = channel_name,
+                to = reply_target,
+                "Replaced null delivery with default cron_add delivery"
+            );
         }
         Some(serde_json::Value::Object(delivery)) => {
             if delivery
@@ -2287,6 +2309,11 @@ fn maybe_inject_channel_delivery_defaults(
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|mode| mode.eq_ignore_ascii_case("none"))
             {
+                tracing::trace!(
+                    tool = "cron_add",
+                    channel = channel_name,
+                    "Preserving explicit delivery mode=none"
+                );
                 return;
             }
 
@@ -2315,6 +2342,15 @@ fn maybe_inject_channel_delivery_defaults(
                     serde_json::Value::String(reply_target.to_string()),
                 );
             }
+
+            tracing::trace!(
+                tool = "cron_add",
+                channel = channel_name,
+                to = reply_target,
+                injected_channel = needs_channel,
+                injected_target = needs_target,
+                "Filled missing cron_add delivery fields from channel context"
+            );
         }
         Some(_) => {}
     }

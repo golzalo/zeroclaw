@@ -236,6 +236,16 @@ impl Tool for CronAddTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
+        tracing::trace!(
+            tool = "cron_add",
+            requested_name = name.as_deref().unwrap_or(""),
+            ?job_type,
+            ?schedule,
+            delete_after_run,
+            approved,
+            "Processing cron_add request"
+        );
+
         let result = match job_type {
             JobType::Shell => {
                 let command = match args.get("command").and_then(serde_json::Value::as_str) {
@@ -321,6 +331,16 @@ impl Tool for CronAddTool {
                     None => None,
                 };
 
+                tracing::trace!(
+                    tool = "cron_add",
+                    delivery_present = delivery.is_some(),
+                    session_target = ?session_target,
+                    model = model.as_deref().unwrap_or(""),
+                    prompt_len = prompt.len(),
+                    allowed_tools_count = allowed_tools.as_ref().map_or(0, Vec::len),
+                    "Validated cron_add agent job request"
+                );
+
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
                 }
@@ -340,24 +360,41 @@ impl Tool for CronAddTool {
         };
 
         match result {
-            Ok(job) => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&json!({
-                    "id": job.id,
-                    "name": job.name,
-                    "job_type": job.job_type,
-                    "schedule": job.schedule,
-                    "next_run": job.next_run,
-                    "enabled": job.enabled,
-                    "allowed_tools": job.allowed_tools
-                }))?,
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(e.to_string()),
-            }),
+            Ok(job) => {
+                tracing::trace!(
+                    tool = "cron_add",
+                    job_id = %job.id,
+                    job_name = job.name.as_deref().unwrap_or(""),
+                    ?job.job_type,
+                    ?job.schedule,
+                    next_run = ?job.next_run,
+                    delivery_mode = %job.delivery.mode,
+                    delivery_channel = job.delivery.channel.as_deref().unwrap_or(""),
+                    delivery_to = job.delivery.to.as_deref().unwrap_or(""),
+                    "cron_add created job"
+                );
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&json!({
+                        "id": job.id,
+                        "name": job.name,
+                        "job_type": job.job_type,
+                        "schedule": job.schedule,
+                        "next_run": job.next_run,
+                        "enabled": job.enabled,
+                        "allowed_tools": job.allowed_tools
+                    }))?,
+                    error: None,
+                })
+            }
+            Err(e) => {
+                tracing::trace!(tool = "cron_add", error = %e, "cron_add failed");
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                })
+            }
         }
     }
 }

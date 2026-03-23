@@ -43,16 +43,22 @@ impl Tool for CronListTool {
         }
 
         match cron::list_jobs(&self.config) {
-            Ok(jobs) => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&jobs)?,
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(e.to_string()),
-            }),
+            Ok(jobs) => {
+                tracing::trace!(tool = "cron_list", count = jobs.len(), "Listed cron jobs");
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&jobs)?,
+                    error: None,
+                })
+            }
+            Err(e) => {
+                tracing::trace!(tool = "cron_list", error = %e, "cron_list failed");
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                })
+            }
         }
     }
 }

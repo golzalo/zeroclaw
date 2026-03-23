@@ -1351,7 +1351,6 @@ impl Channel for WhatsAppWebChannel {
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
             let transcription_config = self.transcription.clone();
-            let voice_chats = self.voice_chats.clone();
             let allow_self_chat = self.allow_self_chat;
             let allow_direct_messages = self.allow_direct_messages;
             let allow_group_messages = self.allow_group_messages;
@@ -1378,7 +1377,6 @@ impl Channel for WhatsAppWebChannel {
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
-                    let voice_chats = voice_chats.clone();
                     let self_phone = self_phone.clone();
                     async move {
                         match event {
@@ -1475,19 +1473,17 @@ impl Channel for WhatsAppWebChannel {
                                     Self::collect_image_markers(&client, content_msg).await;
                                 let attachment_count = image_markers.len();
 
-                                // Use transcribed voice text, or fall back to text content.
-                                // Track whether this chat used a voice note so we reply in kind.
-                                // We store the chat JID (reply_target) since that's what send() receives.
+                                // Use transcribed voice text as plain user text, so reminder/tool
+                                // detection sees the same shape as a typed message.
                                 let mut sections = Vec::new();
                                 if let Some(ref vt) = voice_text {
-                                    if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.insert(chat.clone());
-                                    }
-                                    sections.push(format!("[Voice] {vt}"));
+                                    tracing::trace!(
+                                        chat = %chat,
+                                        text_len = vt.len(),
+                                        "WhatsApp Web: treating transcribed voice note as plain text"
+                                    );
+                                    sections.push(vt.clone());
                                 } else {
-                                    if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.remove(&chat);
-                                    }
                                     let text = content_msg
                                         .text_content()
                                         .unwrap_or("")

@@ -3217,7 +3217,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     });
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
-    prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
+    prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Treat the transcribed text as the user's real message and intent. Ignore transport markers like `[Voice]` when deciding whether the user is asking for a reminder, scheduling action, tool use, or any other task. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
     prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
 
     if prompt.is_empty() {
@@ -7496,6 +7496,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
             "missing security instruction"
+        );
+        assert!(
+            prompt.contains("Treat the transcribed text as the user's real message and intent."),
+            "missing voice transcription intent guidance"
+        );
+        assert!(
+            prompt.contains("Ignore transport markers like `[Voice]`"),
+            "missing voice marker guidance"
         );
     }
 
