@@ -2674,6 +2674,29 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
+        let prompt_messages: Vec<serde_json::Value> = prepared_messages
+            .messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": message.role,
+                    "content": scrub_credentials(&message.content),
+                })
+            })
+            .collect();
+        let prompt_tools: Vec<&str> = request_tools
+            .map(|tools| tools.iter().map(|tool| tool.name.as_str()).collect())
+            .unwrap_or_default();
+        tracing::trace!(
+            provider = provider_name,
+            model,
+            iteration = iteration + 1,
+            native_tools = use_native_tools,
+            prompt_messages = ?prompt_messages,
+            prompt_tools = ?prompt_tools,
+            "Dispatching prompt to LLM"
+        );
+
         let chat_future = provider.chat(
             ChatRequest {
                 messages: &prepared_messages.messages,
