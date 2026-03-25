@@ -1166,6 +1166,20 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn contains_attachment_marker_syntax(message: &str) -> bool {
+        let trimmed = message.trim();
+        trimmed.contains("[IMAGE:")
+            || trimmed.contains("[PHOTO:")
+            || trimmed.contains("[DOCUMENT:")
+            || trimmed.contains("[FILE:")
+            || trimmed.contains("[VIDEO:")
+            || trimmed.contains("[AUDIO:")
+            || trimmed.contains("[VOICE:")
+            || trimmed.contains("<artifact")
+            || trimmed.starts_with("![")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     fn parse_markdown_image_marker(segment: &str) -> Option<(usize, String)> {
         if !segment.starts_with("![") {
             return None;
@@ -1930,6 +1944,14 @@ impl Channel for WhatsAppWebChannel {
         let to = self.recipient_to_jid(&message.recipient)?;
         let (clean_content, attachments) = Self::extract_outgoing_attachments(&content);
         let prefixed_clean_content = Self::apply_agent_message_prefix(&clean_content);
+
+        if attachments.is_empty() && Self::contains_attachment_marker_syntax(&content) {
+            tracing::warn!(
+                recipient = %message.recipient,
+                content = %content,
+                "WhatsApp Web: outbound message contains unresolved attachment markers; sending text only"
+            );
+        }
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Only substantive messages (not tool outputs) are queued.
@@ -2934,6 +2956,20 @@ mod tests {
         let (cleaned, attachments) = WhatsAppWebChannel::extract_outgoing_attachments(message);
         assert_eq!(cleaned, message);
         assert!(attachments.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_contains_attachment_marker_syntax_detects_supported_markers() {
+        assert!(WhatsAppWebChannel::contains_attachment_marker_syntax(
+            "[IMAGE:/tmp/fake.png]"
+        ));
+        assert!(WhatsAppWebChannel::contains_attachment_marker_syntax(
+            "<artifact src=\"/tmp/fake.pdf\"></artifact>"
+        ));
+        assert!(!WhatsAppWebChannel::contains_attachment_marker_syntax(
+            "Solo texto normal"
+        ));
     }
 
     #[test]

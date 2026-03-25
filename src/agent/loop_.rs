@@ -7210,6 +7210,14 @@ Let me check the result."#;
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
         );
+        assert!(
+            system_prompt.contains("NEVER invent attachment markers"),
+            "Native prompt should forbid fabricated attachment markers"
+        );
+        assert!(
+            system_prompt.contains("call `image_generate`"),
+            "Native prompt should instruct the model to use image_generate for images"
+        );
     }
 
     // ── Cross-Alias & GLM Shortened Body Tests ──────────────────────────
