@@ -1,6 +1,6 @@
 use crate::config::LinkedInImageConfig;
 use anyhow::Context;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest::Method;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -864,6 +864,78 @@ impl ImageGenerator {
         )
     }
 
+    fn uses_gpt_image_model(model: &str) -> bool {
+        let model = model.trim().to_ascii_lowercase();
+        model.starts_with("gpt-image-") || model == "chatgpt-image-latest"
+    }
+
+    fn build_openai_image_request_body(&self, prompt: &str) -> serde_json::Value {
+        let mut body = serde_json::Map::new();
+        body.insert("model".into(), json!(self.config.dalle.model));
+        body.insert("prompt".into(), json!(prompt));
+        body.insert("n".into(), json!(1));
+        body.insert("size".into(), json!(self.config.dalle.size));
+
+        if !Self::uses_gpt_image_model(&self.config.dalle.model) {
+            body.insert("response_format".into(), json!("b64_json"));
+        }
+
+        serde_json::Value::Object(body)
+    }
+
+    fn image_extension_from_content_type(content_type: &str) -> &'static str {
+        let content_type = content_type.trim().to_ascii_lowercase();
+        if content_type.starts_with("image/jpeg") {
+            "jpg"
+        } else if content_type.starts_with("image/webp") {
+            "webp"
+        } else {
+            "png"
+        }
+    }
+
+    async fn save_openai_image_response(
+        client: &reqwest::Client,
+        json: serde_json::Value,
+        output_dir: &Path,
+        base_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        if let Some(b64) = json.pointer("/data/0/b64_json").and_then(|v| v.as_str()) {
+            let bytes = base64_decode(b64)?;
+            let path = output_dir.join(format!("{base_name}_dalle.png"));
+            tokio::fs::write(&path, &bytes).await?;
+            return Ok(path);
+        }
+
+        if let Some(url) = json.pointer("/data/0/url").and_then(|v| v.as_str()) {
+            let resp = client
+                .get(url)
+                .send()
+                .await
+                .context("OpenAI image download failed")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("OpenAI image download failed ({status}): {body_text}");
+            }
+
+            let content_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("image/png")
+                .to_string();
+            let bytes = resp.bytes().await.context("Failed to read image bytes")?;
+            let extension = Self::image_extension_from_content_type(&content_type);
+            let path = output_dir.join(format!("{base_name}_dalle.{extension}"));
+            tokio::fs::write(&path, &bytes).await?;
+            return Ok(path);
+        }
+
+        anyhow::bail!("No image data in DALL-E response")
+    }
+
     // ── Stability AI ────────────────────────────────────────────
 
     async fn try_stability(
@@ -985,14 +1057,7 @@ impl ImageGenerator {
 
         let client = Self::http_client();
         let url = "https://api.openai.com/v1/images/generations";
-
-        let body = json!({
-            "model": self.config.dalle.model,
-            "prompt": prompt,
-            "n": 1,
-            "size": self.config.dalle.size,
-            "response_format": "b64_json"
-        });
+        let body = self.build_openai_image_request_body(prompt);
 
         let resp = client
             .post(url)
@@ -1010,15 +1075,7 @@ impl ImageGenerator {
         }
 
         let json: serde_json::Value = resp.json().await?;
-        let b64 = json
-            .pointer("/data/0/b64_json")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No image data in DALL-E response"))?;
-
-        let bytes = base64_decode(b64)?;
-        let path = output_dir.join(format!("{base_name}_dalle.png"));
-        tokio::fs::write(&path, &bytes).await?;
-        Ok(path)
+        Self::save_openai_image_response(&client, json, output_dir, base_name).await
     }
 
     // ── Flux (fal.ai) ──────────────────────────────────────────
@@ -1569,6 +1626,48 @@ mod tests {
         let svg = ImageGenerator::generate_fallback_card("Title", "#FF5733");
         assert!(svg.contains("#FF5733"));
         assert!(!svg.contains("#0A66C2"));
+    }
+
+    #[test]
+    fn openai_image_request_omits_response_format_for_gpt_image_models() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = LinkedInImageConfig::default();
+        config.dalle.model = "gpt-image-1".into();
+        config.dalle.size = "1024x1024".into();
+
+        let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
+        let body = generator.build_openai_image_request_body("Draw a monkey");
+
+        assert_eq!(body.get("model").and_then(|v| v.as_str()), Some("gpt-image-1"));
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn openai_image_request_keeps_response_format_for_legacy_dalle_models() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = LinkedInImageConfig::default();
+        config.dalle.model = "dall-e-3".into();
+        config.dalle.size = "1024x1024".into();
+
+        let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
+        let body = generator.build_openai_image_request_body("Draw a monkey");
+
+        assert_eq!(body.get("model").and_then(|v| v.as_str()), Some("dall-e-3"));
+        assert_eq!(
+            body.get("response_format").and_then(|v| v.as_str()),
+            Some("b64_json")
+        );
+    }
+
+    #[test]
+    fn image_extension_from_content_type_supports_common_formats() {
+        assert_eq!(ImageGenerator::image_extension_from_content_type("image/png"), "png");
+        assert_eq!(ImageGenerator::image_extension_from_content_type("image/jpeg"), "jpg");
+        assert_eq!(ImageGenerator::image_extension_from_content_type("image/webp"), "webp");
+        assert_eq!(
+            ImageGenerator::image_extension_from_content_type("image/jpeg; charset=binary"),
+            "jpg"
+        );
     }
 
     #[test]
