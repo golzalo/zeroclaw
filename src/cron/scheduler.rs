@@ -22,6 +22,7 @@ use tokio::time::{self, Duration};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+const WHATSAPP_REMINDER_PREFIX: &str = "⏰ *REMINDER:* ";
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
@@ -395,15 +396,17 @@ pub(crate) async fn deliver_announcement(
     target: &str,
     output: &str,
 ) -> Result<()> {
+    let delivered_output = apply_reminder_prefix(output);
+
     if let Some(runtime_channel) = channels::get_delivery_channel(channel) {
         tracing::trace!(
             channel,
             target,
-            output_len = output.len(),
+            output_len = delivered_output.len(),
             "Sending cron delivery through registered runtime channel"
         );
         runtime_channel
-            .send(&SendMessage::new(output, target))
+            .send(&SendMessage::new(&delivered_output, target))
             .await?;
         return Ok(());
     }
@@ -411,7 +414,7 @@ pub(crate) async fn deliver_announcement(
     tracing::trace!(
         channel,
         target,
-        output_len = output.len(),
+        output_len = delivered_output.len(),
         "Sending cron delivery through configured channel fallback"
     );
 
@@ -427,7 +430,7 @@ pub(crate) async fn deliver_announcement(
                 tg.allowed_users.clone(),
                 tg.mention_only,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(&delivered_output, target)).await?;
         }
         "discord" => {
             let dc = config
@@ -442,7 +445,7 @@ pub(crate) async fn deliver_announcement(
                 dc.listen_to_bots,
                 dc.mention_only,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(&delivered_output, target)).await?;
         }
         "slack" => {
             let sl = config
@@ -458,7 +461,7 @@ pub(crate) async fn deliver_announcement(
                 sl.allowed_users.clone(),
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(&delivered_output, target)).await?;
         }
         "mattermost" => {
             let mm = config
@@ -474,7 +477,7 @@ pub(crate) async fn deliver_announcement(
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(&delivered_output, target)).await?;
         }
         "signal" => {
             let sg = config
@@ -490,7 +493,7 @@ pub(crate) async fn deliver_announcement(
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(&delivered_output, target)).await?;
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -510,7 +513,7 @@ pub(crate) async fn deliver_announcement(
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 );
-                channel.send(&SendMessage::new(output, target)).await?;
+                channel.send(&SendMessage::new(&delivered_output, target)).await?;
             }
             #[cfg(not(feature = "channel-matrix"))]
             {
@@ -521,6 +524,19 @@ pub(crate) async fn deliver_announcement(
     }
 
     Ok(())
+}
+
+fn apply_reminder_prefix(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed.starts_with(WHATSAPP_REMINDER_PREFIX) {
+        return trimmed.to_string();
+    }
+
+    format!("{WHATSAPP_REMINDER_PREFIX}{trimmed}")
 }
 
 async fn run_job_command(
@@ -1280,6 +1296,19 @@ mod tests {
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("cron-ok"));
+    }
+
+    #[test]
+    fn apply_reminder_prefix_is_idempotent() {
+        assert_eq!(
+            apply_reminder_prefix("recordar follow-up"),
+            "⏰ *REMINDER:* recordar follow-up"
+        );
+        assert_eq!(
+            apply_reminder_prefix("⏰ *REMINDER:* recordar follow-up"),
+            "⏰ *REMINDER:* recordar follow-up"
+        );
+        assert_eq!(apply_reminder_prefix("   "), "");
     }
 
     #[tokio::test]
