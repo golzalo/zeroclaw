@@ -397,6 +397,8 @@ pub(crate) async fn deliver_announcement(
     output: &str,
 ) -> Result<()> {
     let delivered_output = apply_reminder_prefix(output);
+    let delivered_output =
+        channels::promote_delivery_markers(&delivered_output, &config.workspace_dir);
 
     if let Some(runtime_channel) = channels::get_delivery_channel(channel) {
         tracing::trace!(

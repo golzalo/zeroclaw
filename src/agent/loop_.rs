@@ -34,6 +34,107 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+const ARTIFACT_CREATION_HINTS: &[&str] = &[
+    "create",
+    "crear",
+    "export",
+    "exporta",
+    "exportar",
+    "file",
+    "files",
+    "archivo",
+    "archivos",
+    "document",
+    "documento",
+    "documents",
+    "documentos",
+    "generate",
+    "genera",
+    "generar",
+    "image",
+    "imagen",
+    "images",
+    "imagenes",
+    "pool",
+    "bundle",
+    "pdf",
+    "docx",
+    "pptx",
+    "xlsx",
+    "txt",
+    "markdown",
+    "cron",
+];
+
+const ARTIFACT_FILE_EXTENSIONS: &[&str] = &[
+    ".txt", ".md", ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".json",
+    ".zip", ".tar", ".gz", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".mp3", ".m4a",
+    ".wav", ".flac", ".ogg", ".oga", ".opus", ".mp4", ".mov", ".mkv", ".avi", ".webm",
+];
+
+const SCHEDULING_REQUEST_HINTS: &[&str] = &[
+    "agenda",
+    "agend",
+    "calendar",
+    "calendariz",
+    "cron",
+    "delay",
+    "delayed",
+    "later",
+    "minutes",
+    "minutos",
+    "program",
+    "programa",
+    "programar",
+    "recorda",
+    "recordatorio",
+    "recordar",
+    "remind",
+    "reminder",
+    "schedule",
+    "scheduled",
+];
+
+const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
+    "agend",
+    "avisar",
+    "avisare",
+    "calendar",
+    "cumpl",
+    "en cuanto se cumpla",
+    "i'll send",
+    "i will send",
+    "ya esta program",
+    "ya está program",
+    "queda program",
+    "llegara",
+    "llegará",
+    "lo recibiras",
+    "lo recibirás",
+    "recibiras",
+    "recibirás",
+    "recordatorio",
+    "scheduled",
+    "te avisare",
+    "te avisaré",
+    "te envia",
+    "te mandar",
+    "voy a programar",
+    "ya pasaron",
+];
+
+const SCHEDULING_FAILURE_HINTS: &[&str] = &[
+    "error",
+    "fallo",
+    "falló",
+    "failed",
+    "no pude",
+    "no puedo",
+    "no se pudo",
+    "not created",
+    "unable",
+];
+
 /// Callback type for checking if model has been switched during tool execution.
 /// Returns Some((provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
@@ -68,6 +169,174 @@ fn glob_match(pattern: &str, name: &str) -> bool {
                 && name.len() >= prefix.len() + suffix.len()
         }
     }
+}
+
+fn should_enforce_artifact_existence(history: &[ChatMessage], display_text: &str) -> bool {
+    if extract_artifact_references(display_text).is_empty() {
+        return false;
+    }
+
+    let last_user = latest_user_message_lower(history);
+
+    ARTIFACT_CREATION_HINTS
+        .iter()
+        .any(|hint| last_user.contains(hint))
+}
+
+fn latest_user_message_lower(history: &[ChatMessage]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn user_requested_scheduling(history: &[ChatMessage]) -> bool {
+    let last_user = latest_user_message_lower(history);
+    SCHEDULING_REQUEST_HINTS
+        .iter()
+        .any(|hint| last_user.contains(hint))
+}
+
+fn response_claims_schedule_success(display_text: &str) -> bool {
+    let lowered = display_text.to_ascii_lowercase();
+    SCHEDULING_SUCCESS_HINTS
+        .iter()
+        .any(|hint| lowered.contains(hint))
+        && !SCHEDULING_FAILURE_HINTS
+            .iter()
+            .any(|hint| lowered.contains(hint))
+}
+
+fn extract_artifact_references(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut seen = HashSet::new();
+
+    for capture in Regex::new(
+        r"\[(?:IMAGE|PHOTO|DOCUMENT|FILE|SPREADSHEET|XLS|XLSX|PDF|DOC|DOCX|PPT|PPTX|TXT|TEXT|MD|MARKDOWN|CSV|JSON|AUDIO|VOICE|VIDEO):([^\]]+)\]",
+    )
+    .unwrap()
+    .captures_iter(text)
+    {
+        let Some(path) = capture.get(1).map(|m| m.as_str().trim()) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        let path_string = path.to_string();
+        if seen.insert(path_string.clone()) {
+            found.push(path_string);
+        }
+    }
+
+    for token in text.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';')) {
+        let candidate = token
+            .trim_matches(|ch: char| matches!(ch, '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | '"'))
+            .trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        let normalized_candidate = strip_artifact_marker_prefix(candidate);
+        if normalized_candidate.is_empty() {
+            continue;
+        }
+        if !looks_like_artifact_reference(normalized_candidate) {
+            continue;
+        }
+        let candidate_string = normalized_candidate.to_string();
+        if seen.insert(candidate_string.clone()) {
+            found.push(candidate_string);
+        }
+    }
+
+    found
+}
+
+fn strip_artifact_marker_prefix(candidate: &str) -> &str {
+    let Some((kind, target)) = candidate.split_once(':') else {
+        return candidate;
+    };
+
+    if [
+        "IMAGE",
+        "PHOTO",
+        "DOCUMENT",
+        "FILE",
+        "SPREADSHEET",
+        "XLS",
+        "XLSX",
+        "PDF",
+        "DOC",
+        "DOCX",
+        "PPT",
+        "PPTX",
+        "TXT",
+        "TEXT",
+        "MD",
+        "MARKDOWN",
+        "CSV",
+        "JSON",
+        "AUDIO",
+        "VOICE",
+        "VIDEO",
+    ]
+    .iter()
+    .any(|marker| kind.eq_ignore_ascii_case(marker))
+    {
+        return target.trim();
+    }
+
+    candidate
+}
+
+fn looks_like_artifact_reference(candidate: &str) -> bool {
+    let lowered = candidate.to_ascii_lowercase();
+    if lowered.starts_with("http://") || lowered.starts_with("https://") {
+        return false;
+    }
+    ARTIFACT_FILE_EXTENSIONS
+        .iter()
+        .any(|extension| lowered.ends_with(extension))
+}
+
+fn resolve_artifact_reference(reference: &str, workspace_dir: &Path) -> PathBuf {
+    let candidate = reference.trim();
+    let path = Path::new(candidate);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if let Some(stripped) = candidate.strip_prefix("workspace/") {
+        return workspace_dir.join(stripped);
+    }
+    if let Some(stripped) = candidate.strip_prefix("./") {
+        return workspace_dir.join(stripped);
+    }
+    workspace_dir.join(candidate)
+}
+
+fn workspace_dir_for_artifact_checks() -> PathBuf {
+    std::env::var("ZEROCLAW_WORKSPACE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn missing_artifact_references(display_text: &str) -> Vec<(String, PathBuf)> {
+    let workspace_dir = workspace_dir_for_artifact_checks();
+    extract_artifact_references(display_text)
+        .into_iter()
+        .filter_map(|reference| {
+            let resolved = resolve_artifact_reference(&reference, &workspace_dir);
+            if resolved.exists() {
+                None
+            } else {
+                Some((reference, resolved))
+            }
+        })
+        .collect()
 }
 
 /// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
@@ -2567,6 +2836,8 @@ pub(crate) async fn run_tool_call_loop(
     };
 
     let turn_id = Uuid::new_v4().to_string();
+    let mut scheduled_delivery_created = false;
+    let mut scheduled_delivery_verified = false;
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -2870,6 +3141,82 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            if user_requested_scheduling(history) && response_claims_schedule_success(&display_text) {
+                if !scheduled_delivery_created || !scheduled_delivery_verified {
+                    let reason = if !scheduled_delivery_created {
+                        "assistant claimed a scheduled delivery without creating a cron job"
+                    } else {
+                        "assistant claimed a scheduled delivery without verifying it"
+                    };
+                    let repair_prompt = if !scheduled_delivery_created {
+                        "You just told the user the task was scheduled, but you did not create any cron job in this turn. Use cron_add for the delayed delivery, verify it with cron_list, and only then confirm the saved schedule."
+                    } else {
+                        "You just told the user the task was scheduled, but you did not verify it in this turn. Run cron_list to confirm the saved cron job, then answer with the actual schedule details."
+                    };
+
+                    runtime_trace::record_event(
+                        "final_response_unverified_schedule",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some(reason),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "cron_created": scheduled_delivery_created,
+                            "cron_verified": scheduled_delivery_verified,
+                            "text": scrub_credentials(&display_text),
+                        }),
+                    );
+
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    history.push(ChatMessage::user(repair_prompt));
+                    continue;
+                }
+            }
+
+            if should_enforce_artifact_existence(history, &display_text) {
+                let missing_artifacts = missing_artifact_references(&display_text);
+                if !missing_artifacts.is_empty() {
+                    let missing_summary = missing_artifacts
+                        .iter()
+                        .take(8)
+                        .map(|(reference, resolved)| {
+                            format!("{reference} -> {}", resolved.display())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    runtime_trace::record_event(
+                        "final_response_missing_artifacts",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some("assistant referenced artifact paths that do not exist"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "missing": missing_artifacts
+                                .iter()
+                                .map(|(reference, resolved)| serde_json::json!({
+                                    "reference": reference,
+                                    "resolved_path": resolved.display().to_string(),
+                                }))
+                                .collect::<Vec<_>>(),
+                            "text": scrub_credentials(&display_text),
+                        }),
+                    );
+
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    history.push(ChatMessage::user(format!(
+                        "The files you just referenced do not exist in the workspace: {missing_summary}. Create the real files with tools before replying. After they exist, answer again with only the final paths or markers for the real files."
+                    )));
+                    continue;
+                }
+            }
+
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -3156,6 +3503,15 @@ pub(crate) async fn run_tool_call_loop(
             .zip(executable_calls.iter())
             .zip(executed_outcomes.into_iter())
         {
+            if outcome.success {
+                if call.name == "cron_add" {
+                    scheduled_delivery_created = true;
+                }
+                if call.name == "cron_list" {
+                    scheduled_delivery_verified = true;
+                }
+            }
+
             runtime_trace::record_event(
                 "tool_call_result",
                 Some(channel_name),

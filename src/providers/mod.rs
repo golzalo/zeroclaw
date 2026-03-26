@@ -1132,7 +1132,13 @@ fn create_provider_with_url_and_options(
             options.provider_timeout_secs,
         ))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        "openai" => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+            "OpenAI",
+            api_url.unwrap_or("https://api.openai.com/v1"),
+            key,
+            AuthStyle::Bearer,
+            true,
+        ))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => {
 
