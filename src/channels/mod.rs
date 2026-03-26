@@ -282,6 +282,27 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn delivery_channels_store(
+) -> &'static parking_lot::RwLock<Option<Arc<HashMap<String, Arc<dyn Channel>>>>> {
+    static STORE: OnceLock<parking_lot::RwLock<Option<Arc<HashMap<String, Arc<dyn Channel>>>>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Publish the currently active channel map so other subsystems (e.g. cron
+/// scheduler) can reuse the same live connections for outbound delivery.
+pub fn set_delivery_channels(map: Arc<HashMap<String, Arc<dyn Channel>>>) {
+    *delivery_channels_store().write() = Some(map);
+}
+
+/// Obtain a live channel handle by name for out-of-band deliveries.
+pub fn get_delivery_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    delivery_channels_store()
+        .read()
+        .as_ref()
+        .and_then(|channels| channels.get(name).map(Arc::clone))
+}
+
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
 const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
@@ -1649,6 +1670,417 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     strip_tool_narration(&stripped_json)
 }
 
+fn normalize_image_marker_target(target: &str, workspace_dir: &Path) -> Option<PathBuf> {
+    let trimmed = target.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("data:")
+    {
+        return None;
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix("workspace/") {
+        return Some(workspace_dir.join(stripped));
+    }
+
+    Some(workspace_dir.join(trimmed))
+}
+
+fn normalize_image_markers(message: &str, workspace_dir: &Path) -> (String, bool, bool) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut cursor = 0usize;
+    let mut saw_image_marker = false;
+    let mut has_unresolved_marker = false;
+
+    while let Some(rel_start) = message[cursor..].find("[IMAGE:") {
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+
+        let Some(rel_end) = message[start..].find(']') else {
+            cleaned.push_str(&message[start..]);
+            cursor = message.len();
+            break;
+        };
+        let end = start + rel_end;
+        let target = &message[start + 7..end];
+        saw_image_marker = true;
+
+        if let Some(path) = normalize_image_marker_target(target, workspace_dir) {
+            if path.is_file() {
+                let _ = write!(cleaned, "[IMAGE:{}]", path.display());
+            } else {
+                has_unresolved_marker = true;
+                cleaned.push_str(&message[start..=end]);
+            }
+        } else {
+            cleaned.push_str(&message[start..=end]);
+        }
+
+        cursor = end + 1;
+    }
+
+    if cursor < message.len() {
+        cleaned.push_str(&message[cursor..]);
+    }
+
+    (cleaned.trim().to_string(), saw_image_marker, has_unresolved_marker)
+}
+
+fn is_likely_delivery_followup(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let has_delivery_word = [
+        "whatsapp",
+        "pasamela",
+        "pasámela",
+        "enviamela",
+        "enviámela",
+        "mandamela",
+        "mandámela",
+        "jpg",
+        "png",
+        "archivo",
+        "solo el archivo",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token));
+
+    let has_generation_word = [
+        "imagen",
+        "image",
+        "foto",
+        "photo",
+        "genera",
+        "generá",
+        "crea",
+        "creá",
+        "draw",
+        "illustr",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token));
+
+    has_delivery_word && !has_generation_word
+}
+
+fn is_likely_image_request(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    [
+        "imagen",
+        "image",
+        "foto",
+        "photo",
+        "genera",
+        "generá",
+        "crea",
+        "creá",
+        "draw",
+        "illustr",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token))
+}
+
+fn infer_image_prompt_from_history(history: &[ChatMessage]) -> Option<String> {
+    let mut fallback = None;
+
+    for turn in history.iter().rev() {
+        if turn.role != "user" {
+            continue;
+        }
+
+        let content = turn.content.trim();
+        if content.is_empty() || content.contains("[IMAGE:") {
+            continue;
+        }
+
+        if is_likely_image_request(content) && !is_likely_delivery_followup(content) {
+            return Some(content.to_string());
+        }
+
+        if fallback.is_none() && !is_likely_delivery_followup(content) {
+            fallback = Some(content.to_string());
+        }
+    }
+
+    fallback
+}
+
+fn slugify_image_basename(prompt: &str) -> String {
+    let mut slug = prompt
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let slug = slug.trim_matches('-');
+    let base = if slug.is_empty() {
+        "generated-image"
+    } else {
+        slug
+    };
+    base.chars().take(48).collect()
+}
+
+fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) -> Option<String> {
+    let script_path = workspace_dir.join("tools").join("persistent_image_generate.py");
+    if !script_path.is_file() {
+        tracing::warn!(
+            script = %script_path.display(),
+            "persistent image generator script not found"
+        );
+        return None;
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let output_name = format!("{}-{timestamp}.png", slugify_image_basename(prompt));
+    let output_rel = format!("outbox/images/{output_name}");
+
+    let output = match Command::new("python3")
+        .arg(&script_path)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--output")
+        .arg(&output_rel)
+        .current_dir(workspace_dir)
+        .env("ZEROCLAW_WORKSPACE", workspace_dir)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!(err = %error, "failed to execute persistent image generator");
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        tracing::warn!(
+            status = ?output.status.code(),
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "persistent image generator exited with failure"
+        );
+        return None;
+    }
+
+    let marker = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if marker.starts_with("[IMAGE:") && marker.ends_with(']') {
+        Some(marker)
+    } else {
+        tracing::warn!(stdout = %marker, "persistent image generator returned unexpected output");
+        None
+    }
+}
+
+fn repair_unresolved_image_response(
+    message: &str,
+    history: &[ChatMessage],
+    workspace_dir: &Path,
+) -> String {
+    let (normalized, saw_image_marker, has_unresolved_marker) =
+        normalize_image_markers(message, workspace_dir);
+
+    if !saw_image_marker || !has_unresolved_marker {
+        return normalized;
+    }
+
+    let Some(prompt) = infer_image_prompt_from_history(history) else {
+        return normalized;
+    };
+
+    if let Some(marker) = generate_persistent_image_marker(workspace_dir, &prompt) {
+        tracing::info!(
+            prompt = %truncate_with_ellipsis(&prompt, 120),
+            "repaired unresolved image marker with persisted workspace file"
+        );
+        return marker;
+    }
+
+    normalized
+}
+
+fn delivery_marker_kind_for_path(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some("IMAGE"),
+        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx"
+        | "xls" | "xlsx" | "ppt" | "pptx" => Some("DOCUMENT"),
+        "mp4" | "mov" | "mkv" | "avi" | "webm" => Some("VIDEO"),
+        "mp3" | "m4a" | "wav" | "flac" => Some("AUDIO"),
+        "ogg" | "oga" | "opus" => Some("VOICE"),
+        _ => None,
+    }
+}
+
+fn canonical_delivery_marker_kind(kind: &str) -> Option<&'static str> {
+    if ["IMAGE", "PHOTO"]
+        .iter()
+        .any(|marker| kind.eq_ignore_ascii_case(marker))
+    {
+        return Some("IMAGE");
+    }
+
+    if [
+        "DOCUMENT",
+        "FILE",
+        "SPREADSHEET",
+        "XLS",
+        "XLSX",
+        "PDF",
+        "DOC",
+        "DOCX",
+        "PPT",
+        "PPTX",
+        "TXT",
+        "TEXT",
+        "MD",
+        "MARKDOWN",
+        "CSV",
+        "JSON",
+    ]
+    .iter()
+    .any(|marker| kind.eq_ignore_ascii_case(marker))
+    {
+        return Some("DOCUMENT");
+    }
+
+    if ["VIDEO"].iter().any(|marker| kind.eq_ignore_ascii_case(marker)) {
+        return Some("VIDEO");
+    }
+
+    if ["AUDIO"].iter().any(|marker| kind.eq_ignore_ascii_case(marker)) {
+        return Some("AUDIO");
+    }
+
+    if ["VOICE"].iter().any(|marker| kind.eq_ignore_ascii_case(marker)) {
+        return Some("VOICE");
+    }
+
+    None
+}
+
+fn strip_delivery_list_prefix(line: &str) -> &str {
+    let trimmed = line.trim();
+    for prefix in ["- ", "* ", "• "] {
+        if let Some(stripped) = trimmed.strip_prefix(prefix) {
+            return stripped.trim();
+        }
+    }
+
+    for separator in [". ", ") "] {
+        if let Some(index) = trimmed.find(separator) {
+            if trimmed[..index].chars().all(|ch| ch.is_ascii_digit()) {
+                return trimmed[index + separator.len()..].trim();
+            }
+        }
+    }
+
+    trimmed
+}
+
+fn resolve_delivery_artifact_path(candidate: &str, workspace_dir: &Path) -> Option<PathBuf> {
+    let trimmed = candidate.trim_matches(|ch: char| matches!(ch, '`' | '"' | '\''));
+    if trimmed.is_empty()
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with('[')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+
+    let path = if let Some(stripped) = trimmed.strip_prefix("workspace/") {
+        workspace_dir.join(stripped)
+    } else if let Some(stripped) = trimmed.strip_prefix("./") {
+        workspace_dir.join(stripped)
+    } else {
+        let candidate_path = Path::new(trimmed);
+        if candidate_path.is_absolute() {
+            candidate_path.to_path_buf()
+        } else {
+            workspace_dir.join(candidate_path)
+        }
+    };
+
+    if path.is_file() { Some(path) } else { None }
+}
+
+fn promote_delivery_path_line(line: &str, workspace_dir: &Path) -> Option<String> {
+    let candidate = strip_delivery_list_prefix(line);
+    let resolved = resolve_delivery_artifact_path(candidate, workspace_dir)?;
+    let kind = delivery_marker_kind_for_path(&resolved)?;
+    Some(format!("[{kind}:{}]", resolved.display()))
+}
+
+fn normalize_delivery_marker_aliases(message: &str, workspace_dir: &Path) -> String {
+    static DELIVERY_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[(?P<kind>[A-Za-z_]+):(?P<target>[^\]]+)\]").unwrap()
+    });
+
+    DELIVERY_MARKER_RE
+        .replace_all(message, |captures: &regex::Captures| {
+            let Some(kind) = captures.name("kind").map(|m| m.as_str()) else {
+                return captures[0].to_string();
+            };
+            let Some(target) = captures.name("target").map(|m| m.as_str()) else {
+                return captures[0].to_string();
+            };
+            let Some(canonical_kind) = canonical_delivery_marker_kind(kind) else {
+                return captures[0].to_string();
+            };
+            let Some(resolved) = resolve_delivery_artifact_path(target, workspace_dir) else {
+                return captures[0].to_string();
+            };
+
+            format!("[{canonical_kind}:{}]", resolved.display())
+        })
+        .into_owned()
+}
+
+pub(crate) fn promote_delivery_markers(message: &str, workspace_dir: &Path) -> String {
+    let normalized = normalize_delivery_marker_aliases(message, workspace_dir);
+    let mut promoted = Vec::new();
+    let mut changed = false;
+
+    for line in normalized.lines() {
+        if line.trim().is_empty() {
+            promoted.push(String::new());
+            continue;
+        }
+
+        if let Some(marker) = promote_delivery_path_line(line, workspace_dir) {
+            promoted.push(marker);
+            changed = true;
+        } else {
+            promoted.push(line.to_string());
+        }
+    }
+
+    if !changed {
+        return normalized.trim().to_string();
+    }
+
+    promoted.join("\n").trim().to_string()
+}
+
 /// Remove leading lines that narrate tool usage (e.g. "Let me check the weather for you.").
 ///
 /// Only strips lines from the very beginning of the message that match common
@@ -2500,13 +2932,20 @@ async fn process_channel_message(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty()
+            let mut delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
             } else {
                 sanitized_response
             };
+            delivered_response = repair_unresolved_image_response(
+                &delivered_response,
+                &history,
+                ctx.workspace_dir.as_ref(),
+            );
+            delivered_response =
+                promote_delivery_markers(&delivered_response, ctx.workspace_dir.as_ref());
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -3022,7 +3461,10 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         "## CRITICAL: Tool Honesty\n\n\
          - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
          - If a tool call fails, report the error — never make up data to fill the gap.\n\
-         - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
+         - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\
+         - NEVER invent attachment markers such as `[IMAGE:...]`, `[DOCUMENT:...]`, `[VIDEO:...]`, `[AUDIO:...]`, or `[VOICE:...]`.\n\
+         - Only output an attachment marker when it came directly from a tool result or from a file path you verified exists.\n\
+         - If the user asks for an image, call `image_generate`; do not fabricate a fake image path.\n\n",
     );
 
     // ── 1. Tooling ──────────────────────────────────────────────
@@ -3196,7 +3638,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     });
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
-    prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
+    prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Treat the transcribed text as the user's real message and intent. Ignore transport markers like `[Voice]` when deciding whether the user is asking for a reminder, scheduling action, tool use, or any other task. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
     prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
 
     if prompt.is_empty() {
@@ -3690,6 +4132,11 @@ fn collect_configured_channels(
         // Runtime negotiation: detect backend type from config
         match wa.backend_type() {
             "cloud" => {
+                if wa.has_custom_chat_policy() {
+                    tracing::warn!(
+                        "WhatsApp Cloud API ignores allow_self_chat/allow_direct_messages/allow_group_messages; these flags only apply to Web mode"
+                    );
+                }
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
                 if wa.is_cloud_config() {
                     channels.push(ConfiguredChannel {
@@ -3717,6 +4164,9 @@ fn collect_configured_channels(
                                 wa.pair_phone.clone(),
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
+                                wa.allow_self_chat,
+                                wa.allow_direct_messages,
+                                wa.allow_group_messages,
                             )
                             .with_transcription(config.transcription.clone())
                             .with_tts(config.tts.clone()),
@@ -4385,6 +4835,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    set_delivery_channels(Arc::clone(&channels_by_name));
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -7466,6 +7917,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
             "missing security instruction"
+        );
+        assert!(
+            prompt.contains("Treat the transcribed text as the user's real message and intent."),
+            "missing voice transcription intent guidance"
+        );
+        assert!(
+            prompt.contains("Ignore transport markers like `[Voice]`"),
+            "missing voice marker guidance"
         );
     }
 

@@ -704,13 +704,15 @@ impl TranscriptionManager {
 
 // ── Backward-compatible convenience function ────────────────────
 
-/// Transcribe audio bytes via a Whisper-compatible transcription API.
+/// Transcribe audio bytes via the configured transcription provider.
 ///
 /// Returns the transcribed text on success.
 ///
 /// This is the backward-compatible entry point that preserves the original
-/// function signature. It uses the Groq provider directly, matching the
-/// original single-provider behavior.
+/// function signature used by channels. When transcription is enabled, it
+/// honors `transcription.default_provider` via `TranscriptionManager`. When
+/// transcription is disabled, it falls back to the legacy Groq-compatible
+/// fields for older direct callers.
 ///
 /// Credential resolution order:
 /// 1. `config.transcription.api_key`
@@ -727,8 +729,13 @@ pub async fn transcribe_audio(
     // are reported before missing-key errors (preserves original behavior).
     validate_audio(&audio_data, file_name)?;
 
-    let groq = GroqProvider::from_config(config)?;
-    groq.transcribe(&audio_data, file_name).await
+    if config.enabled {
+        let manager = TranscriptionManager::new(config)?;
+        manager.transcribe(&audio_data, file_name).await
+    } else {
+        let groq = GroqProvider::from_config(config)?;
+        groq.transcribe(&audio_data, file_name).await
+    }
 }
 
 #[cfg(test)]
@@ -859,6 +866,23 @@ mod tests {
         assert!(
             msg.contains(".aac"),
             "error should mention the rejected extension, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_transcription_uses_configured_default_provider() {
+        let data = vec![0u8; 100];
+        let mut config = TranscriptionConfig::default();
+        config.enabled = true;
+        config.default_provider = "openai".to_string();
+
+        let err = transcribe_audio(data, "test.ogg", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Default transcription provider 'openai' is not configured"),
+            "expected default-provider config error, got: {err}"
         );
     }
 

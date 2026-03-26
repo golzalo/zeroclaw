@@ -4932,6 +4932,15 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+    /// Allow the self chat / "Note to Self" thread (Web mode only).
+    #[serde(default)]
+    pub allow_self_chat: bool,
+    /// Allow direct 1:1 chats with other users (Web mode only).
+    #[serde(default = "default_whatsapp_allow_direct_messages")]
+    pub allow_direct_messages: bool,
+    /// Allow group chats (Web mode only).
+    #[serde(default = "default_whatsapp_allow_group_messages")]
+    pub allow_group_messages: bool,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -5051,6 +5060,40 @@ impl WhatsAppConfig {
     pub fn is_ambiguous_config(&self) -> bool {
         self.phone_number_id.is_some() && self.session_path.is_some()
     }
+
+    pub fn has_custom_chat_policy(&self) -> bool {
+        self.allow_self_chat || !self.allow_direct_messages || !self.allow_group_messages
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.backend_type() != "web" {
+            return Ok(());
+        }
+
+        if self.allow_self_chat
+            && self
+                .pair_phone
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            return Err(
+                "channels_config.whatsapp.pair_phone is required when allow_self_chat = true"
+                    .into(),
+            );
+        }
+
+        Ok(())
+    }
+}
+
+fn default_whatsapp_allow_direct_messages() -> bool {
+    true
+}
+
+fn default_whatsapp_allow_group_messages() -> bool {
+    true
 }
 
 /// IRC channel configuration.
@@ -7500,6 +7543,10 @@ impl Config {
             validate_mcp_config(&self.mcp)?;
         }
 
+        if let Some(ref wa) = self.channels_config.whatsapp {
+            wa.validate().map_err(anyhow::Error::msg)?;
+        }
+
         // Knowledge graph
         if self.knowledge.enabled {
             if self.knowledge.max_nodes == 0 {
@@ -9876,6 +9923,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
+            allow_self_chat: false,
+            allow_direct_messages: true,
+            allow_group_messages: true,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -9896,6 +9946,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            allow_self_chat: false,
+            allow_direct_messages: true,
+            allow_group_messages: true,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -9908,6 +9961,9 @@ channel_id = "C123"
         let json = r#"{"access_token":"tok","phone_number_id":"123","verify_token":"ver"}"#;
         let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.allowed_numbers.is_empty());
+        assert!(!parsed.allow_self_chat);
+        assert!(parsed.allow_direct_messages);
+        assert!(parsed.allow_group_messages);
     }
 
     #[test]
@@ -9921,6 +9977,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["*".into()],
+            allow_self_chat: false,
+            allow_direct_messages: true,
+            allow_group_messages: true,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -9938,6 +9997,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            allow_self_chat: false,
+            allow_direct_messages: true,
+            allow_group_messages: true,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -9954,6 +10016,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec![],
+            allow_self_chat: false,
+            allow_direct_messages: true,
+            allow_group_messages: true,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -9980,6 +10045,9 @@ channel_id = "C123"
                 pair_phone: None,
                 pair_code: None,
                 allowed_numbers: vec!["+1".into()],
+                allow_self_chat: false,
+                allow_direct_messages: true,
+                allow_group_messages: true,
             }),
             linq: None,
             wati: None,
@@ -10010,6 +10078,28 @@ channel_id = "C123"
         let wa = parsed.whatsapp.unwrap();
         assert_eq!(wa.phone_number_id, Some("123".into()));
         assert_eq!(wa.allowed_numbers, vec!["+1"]);
+    }
+
+    #[test]
+    async fn whatsapp_config_self_chat_requires_pair_phone_in_web_mode() {
+        let wc = WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["+1".into()],
+            allow_self_chat: true,
+            allow_direct_messages: false,
+            allow_group_messages: false,
+        };
+
+        let err = wc
+            .validate()
+            .expect_err("allow_self_chat should require pair_phone");
+        assert!(err.contains("pair_phone"));
     }
 
     #[test]

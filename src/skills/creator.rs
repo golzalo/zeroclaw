@@ -76,6 +76,14 @@ impl SkillCreator {
             .await
             .with_context(|| format!("Failed to write {}", toml_path.display()))?;
 
+        tracing::trace!(
+            slug = %slug,
+            skill_path = %toml_path.display(),
+            tool_count = tool_calls.len(),
+            task_description = task_description,
+            "Persisted auto-created skill upload"
+        );
+
         Ok(Some(slug))
     }
 

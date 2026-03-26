@@ -137,7 +137,10 @@ impl PromptSection for ToolHonestySection {
             "## CRITICAL: Tool Honesty\n\n\
              - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
              - If a tool call fails, report the error — never make up data to fill the gap.\n\
-             - When unsure whether a tool call succeeded, ask the user rather than guessing."
+             - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\
+             - NEVER invent attachment markers such as `[IMAGE:...]`, `[DOCUMENT:...]`, `[VIDEO:...]`, `[AUDIO:...]`, or `[VOICE:...]`.\n\
+             - Only output an attachment marker when it came directly from a tool result or from a file path you verified exists.\n\
+             - If the user asks for an image, call `image_generate`; do not fabricate a fake image path."
                 .into(),
         )
     }
@@ -510,6 +513,26 @@ mod tests {
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains(" ("));
         assert!(payload.ends_with(')'));
+    }
+
+    #[test]
+    fn tool_honesty_section_forbids_fabricated_attachment_markers() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+        };
+
+        let rendered = ToolHonestySection.build(&ctx).unwrap();
+        assert!(rendered.contains("NEVER invent attachment markers"));
+        assert!(rendered.contains("call `image_generate`"));
     }
 
     #[test]
