@@ -1274,7 +1274,7 @@ if [[ "$DOCKER_MODE" == true ]]; then
   echo -e "${BOLD}Your containerized ZeroClaw data is persisted under:${RESET}"
   echo -e "  ${DIM}$DOCKER_DATA_DIR${RESET}"
   echo
-  echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}http://127.0.0.1:42617${RESET}"
+  echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}http://127.0.0.1:24817${RESET}"
   echo
   echo -e "${BOLD}Next steps:${RESET}"
   echo -e "  ${DIM}zeroclaw status${RESET}"
@@ -1521,7 +1521,7 @@ if [[ "$INSTALL_MODE" == "upgrade" ]]; then
 fi
 
 # --- Dashboard URL ---
-GATEWAY_PORT=42617
+GATEWAY_PORT=24817
 DASHBOARD_URL="http://127.0.0.1:${GATEWAY_PORT}"
 echo
 echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}${DASHBOARD_URL}${RESET}"

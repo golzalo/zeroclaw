@@ -70,6 +70,7 @@ pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+pub(crate) mod tenant_app_delivery;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;

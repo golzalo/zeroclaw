@@ -106,6 +106,7 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+mod tenant_app_delivery;
 mod tools;
 mod tunnel;
 mod util;

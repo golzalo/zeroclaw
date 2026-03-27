@@ -74,7 +74,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'default_temperature = 0.7' \
         '' \
         '[gateway]' \
-        'port = 42617' \
+        'port = 24817' \
         'host = "[::]"' \
         'allow_public_bind = true' \
         > /zeroclaw-data/.zeroclaw/config.toml && \
@@ -105,14 +105,14 @@ ENV HOME=/zeroclaw-data
 # Defaults for local dev (Ollama) - matches config.template.toml
 ENV PROVIDER="ollama"
 ENV ZEROCLAW_MODEL="llama3.2"
-ENV ZEROCLAW_GATEWAY_PORT=42617
+ENV ZEROCLAW_GATEWAY_PORT=24817
 
 # Note: API_KEY is intentionally NOT set here to avoid confusion.
 # It is set in config.toml as the Ollama URL.
 
 WORKDIR /zeroclaw-data
 USER 65534:65534
-EXPOSE 42617
+EXPOSE 24817
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
     CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]
@@ -132,13 +132,13 @@ ENV HOME=/zeroclaw-data
 # Default provider and model are set in config.toml, not here,
 # so config file edits are not silently overridden
 #ENV PROVIDER=
-ENV ZEROCLAW_GATEWAY_PORT=42617
+ENV ZEROCLAW_GATEWAY_PORT=24817
 
 # API_KEY must be provided at runtime!
 
 WORKDIR /zeroclaw-data
 USER 65534:65534
-EXPOSE 42617
+EXPOSE 24817
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
     CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]

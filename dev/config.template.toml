@@ -7,6 +7,6 @@ default_model = "llama3.2"
 default_temperature = 0.7
 
 [gateway]
-port = 42617
+port = 24817
 host = "[::]"
 allow_public_bind = true

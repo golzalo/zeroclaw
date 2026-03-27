@@ -16,10 +16,10 @@ COPY --chown=65534:65534 zeroclaw-data/ /zeroclaw-data/
 ENV LANG=C.UTF-8
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-ENV ZEROCLAW_GATEWAY_PORT=42617
+ENV ZEROCLAW_GATEWAY_PORT=24817
 
 WORKDIR /zeroclaw-data
 USER 65534:65534
-EXPOSE 42617
+EXPOSE 24817
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]

@@ -111,6 +111,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 
 /// Observer wrapper that forwards tool-call events to a channel sender
@@ -2081,6 +2082,194 @@ pub(crate) fn promote_delivery_markers(message: &str, workspace_dir: &Path) -> S
     promoted.join("\n").trim().to_string()
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct TenantAppReceiptPublish {
+    #[serde(default, rename = "indexPath")]
+    index_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TenantAppReceipt {
+    #[serde(default)]
+    changed: bool,
+    #[serde(default, rename = "userSummary")]
+    user_summary: String,
+    #[serde(default, rename = "refreshHint")]
+    refresh_hint: String,
+    #[serde(default, rename = "userMessage")]
+    user_message: String,
+    #[serde(default, rename = "publicBaseUrl")]
+    public_base_url: Option<String>,
+    #[serde(default)]
+    publish: TenantAppReceiptPublish,
+}
+
+fn normalize_tenant_intent_text(text: &str) -> String {
+    text.to_lowercase()
+        .replace(['á', 'à', 'ä', 'â'], "a")
+        .replace(['é', 'è', 'ë', 'ê'], "e")
+        .replace(['í', 'ì', 'ï', 'î'], "i")
+        .replace(['ó', 'ò', 'ö', 'ô'], "o")
+        .replace(['ú', 'ù', 'ü', 'û'], "u")
+}
+
+fn is_tenant_app_delivery_request(message: &str) -> bool {
+    crate::tenant_app_delivery::is_tenant_app_delivery_request(message)
+}
+
+fn canonical_tenant_app_user_message(receipt: &TenantAppReceipt) -> Option<String> {
+    let direct = receipt.user_message.trim();
+    if !direct.is_empty() {
+        return Some(direct.to_string());
+    }
+
+    let summary = receipt.user_summary.trim();
+    let hint = receipt.refresh_hint.trim();
+    if summary.is_empty() && hint.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if !summary.is_empty() {
+        lines.push(format!("1. {summary}"));
+    }
+    if !hint.is_empty() {
+        lines.push(format!("2. {hint}"));
+    }
+    Some(lines.join("\n\n"))
+}
+
+fn resolve_tenant_app_index_path(
+    workspace_dir: &Path,
+    receipt: &TenantAppReceipt,
+) -> Option<PathBuf> {
+    if let Some(path) = receipt.publish.index_path.as_deref() {
+        let candidate = PathBuf::from(path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let fallback = workspace_dir.join("tenant-app").join("dist").join("index.html");
+    if fallback.is_file() {
+        Some(fallback)
+    } else {
+        None
+    }
+}
+
+fn load_fresh_tenant_app_receipt(
+    workspace_dir: &Path,
+    turn_started_at: SystemTime,
+) -> Option<TenantAppReceipt> {
+    let raw = crate::tenant_app_delivery::load_fresh_tenant_app_receipt(workspace_dir, turn_started_at)?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn tenant_app_delivery_block_message() -> String {
+    "Todavia no publique un cambio real del tenant. Necesito construir y publicar la app antes de confirmartelo.".to_string()
+}
+
+fn is_tenant_app_truthful_blocker_response(message: &str) -> bool {
+    let normalized = normalize_tenant_intent_text(message.trim());
+    normalized.starts_with("todavia no publique un cambio real del tenant")
+        || (normalized.starts_with("no pude publicar la app del tenant")
+            && normalized.contains("bloqueo real"))
+        || (normalized.starts_with("no pude ejecutar el publicador del tenant")
+            && normalized.contains("bloqueo real"))
+}
+
+fn enforce_tenant_app_delivery_contract(
+    user_message: &str,
+    workspace_dir: &Path,
+    turn_started_at: SystemTime,
+) -> Option<String> {
+    if !crate::tenant_app_delivery::should_handle_tenant_app_request(workspace_dir, user_message) {
+        return None;
+    }
+
+    if let Some(receipt) = load_fresh_tenant_app_receipt(workspace_dir, turn_started_at) {
+        return canonical_tenant_app_user_message(&receipt);
+    }
+
+    Some(tenant_app_delivery_block_message())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantAppControllerMode {
+    Build,
+    Update,
+}
+
+fn tenant_app_controller_mode(workspace_dir: &Path) -> TenantAppControllerMode {
+    let app_root = workspace_dir.join("tenant-app");
+    if app_root.join("spec.json").is_file() || app_root.join("dist").join("index.html").is_file() {
+        TenantAppControllerMode::Update
+    } else {
+        TenantAppControllerMode::Build
+    }
+}
+
+fn tenant_app_request_summary(message: &str) -> String {
+    let trimmed = message.trim();
+    let lower = normalize_tenant_intent_text(trimmed);
+
+    for prefix in [
+        "hola :",
+        "hola:",
+        "hola ",
+        "hello :",
+        "hello:",
+        "hello ",
+        "hi :",
+        "hi:",
+        "hi ",
+    ] {
+        if lower.starts_with(prefix) {
+            let cut = trimmed
+                .char_indices()
+                .nth(prefix.chars().count())
+                .map(|(idx, _)| idx)
+                .unwrap_or(trimmed.len());
+            return trimmed[cut..].trim().to_string();
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn tenant_app_controller_args(workspace_dir: &Path, user_message: &str) -> Vec<String> {
+    let summary = tenant_app_request_summary(user_message);
+    let controller_path = workspace_dir.join("tools").join("tenant_app_controller.py");
+    match tenant_app_controller_mode(workspace_dir) {
+        TenantAppControllerMode::Build => vec![
+            controller_path.display().to_string(),
+            "build".to_string(),
+            "--brief".to_string(),
+            summary,
+        ],
+        TenantAppControllerMode::Update => vec![
+            controller_path.display().to_string(),
+            "update".to_string(),
+            "--goal".to_string(),
+            summary,
+        ],
+    }
+}
+
+async fn execute_tenant_app_controller_request(
+    workspace_dir: &Path,
+    user_message: &str,
+    turn_started_at: SystemTime,
+) -> String {
+    crate::tenant_app_delivery::execute_tenant_app_controller_request(
+        workspace_dir,
+        user_message,
+        turn_started_at,
+    )
+    .await
+}
+
 /// Remove leading lines that narrate tool usage (e.g. "Let me check the weather for you.").
 ///
 /// Only strips lines from the very beginning of the message that match common
@@ -2545,6 +2734,7 @@ async fn process_channel_message(
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
+    let started_at_wall = SystemTime::now();
 
     let force_fresh_session = take_pending_new_session(ctx.as_ref(), &history_key);
     if force_fresh_session {
@@ -2781,39 +2971,72 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
-    let llm_result = tokio::select! {
-        () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-        result = tokio::time::timeout(
-            Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                notify_observer.as_ref() as &dyn Observer,
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                Some(&*ctx.approval_manager),
-                msg.channel.as_str(),
-                Some(msg.reply_target.as_str()),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                ctx.hooks.as_deref(),
-                if msg.channel == "cli"
-                    || ctx.autonomy_level == AutonomyLevel::Full
-                {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
-                ctx.tool_call_dedup_exempt.as_ref(),
-                ctx.activated_tools.as_ref(),
-                None,
-            ),
-        ) => LlmExecutionResult::Completed(result),
+    let llm_result = if let Some(status_response) =
+        crate::tenant_app_delivery::tenant_app_status_response(
+            ctx.workspace_dir.as_ref(),
+            &msg.content,
+        )
+    {
+        LlmExecutionResult::Completed(Ok(Ok(status_response)))
+    } else if crate::tenant_app_delivery::should_handle_tenant_app_planning_request(
+        ctx.workspace_dir.as_ref(),
+        &msg.content,
+    ) {
+        tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            response = execute_tenant_app_controller_request(
+                ctx.workspace_dir.as_ref(),
+                &msg.content,
+                started_at_wall,
+            ) => LlmExecutionResult::Completed(Ok(Ok(response))),
+        }
+    } else if crate::tenant_app_delivery::should_handle_tenant_app_request(
+        ctx.workspace_dir.as_ref(),
+        &msg.content,
+    ) {
+        tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            response = execute_tenant_app_controller_request(
+                ctx.workspace_dir.as_ref(),
+                &msg.content,
+                started_at_wall,
+            ) => LlmExecutionResult::Completed(Ok(Ok(response))),
+        }
+    } else {
+        tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            result = tokio::time::timeout(
+                Duration::from_secs(timeout_budget_secs),
+                run_tool_call_loop(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    notify_observer.as_ref() as &dyn Observer,
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    Some(&*ctx.approval_manager),
+                    msg.channel.as_str(),
+                    Some(msg.reply_target.as_str()),
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx,
+                    ctx.hooks.as_deref(),
+                    if msg.channel == "cli"
+                        || ctx.autonomy_level == AutonomyLevel::Full
+                    {
+                        &[]
+                    } else {
+                        ctx.non_cli_excluded_tools.as_ref()
+                    },
+                    ctx.tool_call_dedup_exempt.as_ref(),
+                    ctx.activated_tools.as_ref(),
+                    None,
+                ),
+            ) => LlmExecutionResult::Completed(result),
+        }
     };
 
     if let Some(handle) = draft_updater {
@@ -2927,6 +3150,34 @@ async fn process_channel_message(
 
                         outbound_response = modified_content;
                     }
+                }
+            }
+
+            if crate::tenant_app_delivery::should_handle_tenant_app_request(
+                ctx.workspace_dir.as_ref(),
+                &msg.content,
+            ) {
+                if let Some(contract_response) = load_fresh_tenant_app_receipt(
+                    ctx.workspace_dir.as_ref(),
+                    started_at_wall,
+                )
+                .and_then(|receipt| canonical_tenant_app_user_message(&receipt))
+                {
+                    if contract_response != outbound_response {
+                        tracing::info!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            "tenant app delivery contract rewrote outbound response from fresh receipt"
+                        );
+                    }
+                    outbound_response = contract_response;
+                } else if !is_tenant_app_truthful_blocker_response(&outbound_response) {
+                    tracing::info!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        "tenant app delivery contract replaced unverified outbound response"
+                    );
+                    outbound_response = tenant_app_delivery_block_message();
                 }
             }
 
@@ -8851,6 +9102,124 @@ This is an example JSON object for profile settings."#;
 
         let result = strip_isolated_tool_json_artifacts(input, &known_tools);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn tenant_app_delivery_request_detects_spanish_product_prompts() {
+        assert!(is_tenant_app_delivery_request(
+            "Quiero una app para onboarding/offboarding con dashboard y FAQ visible."
+        ));
+        assert!(is_tenant_app_delivery_request(
+            "Publica la webapp del tenant y dejala lista."
+        ));
+        assert!(!is_tenant_app_delivery_request(
+            "Como funciona la arquitectura del tenant web?"
+        ));
+    }
+
+    #[test]
+    fn tenant_app_delivery_contract_uses_fresh_receipt_message() {
+        let workspace = make_workspace();
+        let app_root = workspace.path().join("tenant-app");
+        let dist_dir = app_root.join("dist");
+        let receipts_dir = app_root.join("receipts");
+        std::fs::create_dir_all(&dist_dir).unwrap();
+        std::fs::create_dir_all(&receipts_dir).unwrap();
+        std::fs::write(dist_dir.join("index.html"), "<html>ok</html>").unwrap();
+        std::fs::write(
+            receipts_dir.join("latest.json"),
+            serde_json::json!({
+                "changed": true,
+                "userSummary": "Publique una revision nueva.",
+                "refreshHint": "Refresca la URL publica.",
+                "userMessage": "1. Publique una revision nueva.\n\n2. Refresca la URL publica.",
+                "publish": {
+                    "indexPath": dist_dir.join("index.html").display().to_string()
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = enforce_tenant_app_delivery_contract(
+            "Quiero una app con dashboard para el tenant.",
+            workspace.path(),
+            SystemTime::now()
+                .checked_sub(Duration::from_secs(5))
+                .unwrap(),
+        );
+
+        assert_eq!(
+            result.as_deref(),
+            Some("1. Publique una revision nueva.\n\n2. Refresca la URL publica.")
+        );
+    }
+
+    #[test]
+    fn tenant_app_delivery_contract_blocks_without_fresh_receipt() {
+        let workspace = make_workspace();
+
+        let result = enforce_tenant_app_delivery_contract(
+            "Quiero una app MVP para el tenant.",
+            workspace.path(),
+            SystemTime::now(),
+        );
+
+        assert_eq!(
+            result.as_deref(),
+            Some(
+                "Todavia no publique un cambio real del tenant. Necesito construir y publicar la app antes de confirmartelo."
+            )
+        );
+    }
+
+    #[test]
+    fn tenant_app_controller_args_use_build_when_no_app_exists() {
+        let workspace = make_workspace();
+        let args = tenant_app_controller_args(
+            workspace.path(),
+            "Hola : Quiero una app para onboarding y offboarding",
+        );
+
+        assert!(args.iter().any(|arg| arg == "build"));
+        assert!(args.iter().any(|arg| arg == "--brief"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "Quiero una app para onboarding y offboarding")
+        );
+    }
+
+    #[test]
+    fn tenant_app_controller_args_use_update_when_app_exists() {
+        let workspace = make_workspace();
+        let app_root = workspace.path().join("tenant-app");
+        std::fs::create_dir_all(app_root.join("dist")).unwrap();
+        std::fs::write(app_root.join("dist").join("index.html"), "<html>ok</html>").unwrap();
+
+        let args = tenant_app_controller_args(
+            workspace.path(),
+            "Cambia el dashboard para mostrar metricas",
+        );
+
+        assert!(args.iter().any(|arg| arg == "update"));
+        assert!(args.iter().any(|arg| arg == "--goal"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "Cambia el dashboard para mostrar metricas")
+        );
+    }
+
+    #[test]
+    fn tenant_app_truthful_blocker_response_detection_accepts_explicit_blockers() {
+        assert!(is_tenant_app_truthful_blocker_response(
+            "No pude publicar la app del tenant todavia. Bloqueo real: falta python3."
+        ));
+        assert!(is_tenant_app_truthful_blocker_response(
+            "Todavia no publique un cambio real del tenant. Necesito construir y publicar la app antes de confirmartelo."
+        ));
+        assert!(!is_tenant_app_truthful_blocker_response(
+            "La app ya esta publicada."
+        ));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────

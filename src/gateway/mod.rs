@@ -27,6 +27,10 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
+use crate::tenant_app_delivery::{
+    execute_tenant_app_controller_request, should_handle_tenant_app_planning_request,
+    should_handle_tenant_app_request, tenant_app_status_response,
+};
 use crate::tools;
 use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
@@ -43,7 +47,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -1127,6 +1131,28 @@ async fn handle_webhook(
         .unwrap_or_else(|| "unknown".to_string());
     let model_label = state.model.clone();
     let started_at = Instant::now();
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    if let Some(status_response) = tenant_app_status_response(&workspace_dir, message) {
+        let body = serde_json::json!({"response": status_response, "model": state.model});
+        return (StatusCode::OK, Json(body));
+    }
+
+    if should_handle_tenant_app_planning_request(&workspace_dir, message) {
+        let response =
+            execute_tenant_app_controller_request(&workspace_dir, message, SystemTime::now())
+                .await;
+        let body = serde_json::json!({"response": response, "model": state.model});
+        return (StatusCode::OK, Json(body));
+    }
+
+    if should_handle_tenant_app_request(&workspace_dir, message) {
+        let response =
+            execute_tenant_app_controller_request(&workspace_dir, message, SystemTime::now())
+                .await;
+        let body = serde_json::json!({"response": response, "model": state.model});
+        return (StatusCode::OK, Json(body));
+    }
 
     state
         .observer

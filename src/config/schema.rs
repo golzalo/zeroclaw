@@ -1551,7 +1551,7 @@ impl Default for PeripheralBoardConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct GatewayConfig {
-    /// Gateway port (default: 42617)
+    /// Gateway port (default: 24817)
     #[serde(default = "default_gateway_port")]
     pub port: u16,
     /// Gateway host (default: 127.0.0.1)
@@ -1606,7 +1606,7 @@ pub struct GatewayConfig {
 }
 
 fn default_gateway_port() -> u16 {
-    42617
+    24817
 }
 
 fn default_gateway_host() -> String {
@@ -4341,7 +4341,7 @@ pub struct OpenVpnTunnelConfig {
     /// Optional path to auth credentials file (`--auth-user-pass`).
     #[serde(default)]
     pub auth_file: Option<String>,
-    /// Advertised address once VPN is connected (e.g., `"10.8.0.2:42617"`).
+    /// Advertised address once VPN is connected (e.g., `"10.8.0.2:24817"`).
     /// When omitted the tunnel falls back to `http://{local_host}:{local_port}`.
     #[serde(default)]
     pub advertise_address: Option<String>,
@@ -10166,7 +10166,7 @@ channel_id = "C123"
     #[test]
     async fn checklist_gateway_serde_roundtrip() {
         let g = GatewayConfig {
-            port: 42617,
+            port: 24817,
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
@@ -11266,7 +11266,7 @@ default_model = "persisted-profile"
     async fn env_override_gateway_port() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        assert_eq!(config.gateway.port, 42617);
+        assert_eq!(config.gateway.port, 24817);
 
         std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
         config.apply_env_overrides();
@@ -11613,7 +11613,7 @@ default_model = "persisted-profile"
     #[test]
     async fn gateway_config_default_values() {
         let g = GatewayConfig::default();
-        assert_eq!(g.port, 42617);
+        assert_eq!(g.port, 24817);
         assert_eq!(g.host, "127.0.0.1");
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
