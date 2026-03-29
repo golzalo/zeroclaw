@@ -46,6 +46,8 @@ impl SystemPromptBuilder {
                 Box::new(ToolHonestySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
+                Box::new(CodingWorkSection),
+                Box::new(ProductDeliverySection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
@@ -78,6 +80,8 @@ pub struct IdentitySection;
 pub struct ToolHonestySection;
 pub struct ToolsSection;
 pub struct SafetySection;
+pub struct CodingWorkSection;
+pub struct ProductDeliverySection;
 pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
@@ -112,6 +116,7 @@ impl PromptSection for IdentitySection {
         }
         for file in [
             "AGENTS.md",
+            "PRODUCT.md",
             "SOUL.md",
             "TOOLS.md",
             "IDENTITY.md",
@@ -215,6 +220,29 @@ impl PromptSection for SkillsSection {
     }
 }
 
+impl PromptSection for CodingWorkSection {
+    fn name(&self) -> &str {
+        "coding_work"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let tool_names: Vec<&str> = ctx.tools.iter().map(|tool| tool.name()).collect();
+        Ok(crate::coding_prompt::build_coding_work_guidance(&tool_names).unwrap_or_default())
+    }
+}
+
+impl PromptSection for ProductDeliverySection {
+    fn name(&self) -> &str {
+        "product_delivery"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let tool_names: Vec<&str> = ctx.tools.iter().map(|tool| tool.name()).collect();
+        Ok(crate::product_prompt::build_product_delivery_guidance(&tool_names)
+            .unwrap_or_default())
+    }
+}
+
 impl PromptSection for WorkspaceSection {
     fn name(&self) -> &str {
         "workspace"
@@ -312,7 +340,13 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
 mod tests {
     use super::*;
     use crate::tools::traits::Tool;
+    use crate::{
+        runtime::NativeRuntime,
+        security::{AutonomyLevel, SecurityPolicy},
+        tools::{FileEditTool, FileReadTool, ShellTool},
+    };
     use async_trait::async_trait;
+    use std::sync::Arc;
 
     struct TestTool;
 
@@ -405,6 +439,85 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn prompt_builder_includes_coding_section_for_coding_tools() {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let runtime = Arc::new(NativeRuntime::new());
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ShellTool::new(security.clone(), runtime)),
+            Box::new(FileReadTool::new(security.clone())),
+            Box::new(FileEditTool::new(security)),
+        ];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(prompt.contains("## Coding Work"));
+        assert!(prompt.contains("Prefer action over questionnaires"));
+        assert!(prompt.contains("`file_edit`"));
+        assert!(prompt.contains("`shell`"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn prompt_builder_includes_product_section_for_site_work_tools() {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let runtime = Arc::new(NativeRuntime::new());
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ShellTool::new(security.clone(), runtime)),
+            Box::new(FileReadTool::new(security.clone())),
+            Box::new(crate::tools::WebFetchTool::new(
+                security,
+                vec!["*".into()],
+                vec![],
+                20_000,
+                30,
+            )),
+        ];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(prompt.contains("## Product & Site Delivery"));
+        assert!(prompt.contains("product/specs/current.md"));
+        assert!(prompt.contains("product/revisions/"));
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

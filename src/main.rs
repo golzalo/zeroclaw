@@ -75,6 +75,7 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod coding_prompt;
 mod commands;
 mod rag {
     pub use zeroclaw::rag::*;
@@ -100,6 +101,7 @@ mod onboard;
 mod peripherals;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
+mod product_prompt;
 mod providers;
 mod runtime;
 mod security;

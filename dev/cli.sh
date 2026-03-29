@@ -49,6 +49,18 @@ function ensure_config {
     fi
 }
 
+function ensure_env_secret_file {
+    if [ ! -f "$ENV_FILE" ]; then
+        echo -e "${YELLOW}⚙️  .env missing. Creating an empty placeholder for the dev Docker secret...${NC}"
+        mkdir -p "$(dirname "$ENV_FILE")"
+        cat > "$ENV_FILE" <<'EOF'
+# Optional local environment overrides for the ZeroClaw dev environment.
+# Leave this file empty if you want to use the default dev config template
+# (Ollama on host.docker.internal:11434).
+EOF
+    fi
+}
+
 function print_help {
     echo -e "${YELLOW}ZeroClaw Development Environment Manager${NC}"
     echo "Usage: ./dev/cli.sh [command]"
@@ -74,6 +86,7 @@ load_env
 case "$1" in
     up)
         ensure_config
+        ensure_env_secret_file
         echo -e "${GREEN}🚀 Starting Dev Environment...${NC}"
         # Build context MUST be set correctly for docker compose
         docker compose -f "$COMPOSE_FILE" up -d
@@ -105,6 +118,7 @@ case "$1" in
 
     build)
         echo -e "${YELLOW}🔨 Rebuilding images...${NC}"
+        ensure_env_secret_file
         docker compose -f "$COMPOSE_FILE" build
         ensure_config
         docker compose -f "$COMPOSE_FILE" up -d

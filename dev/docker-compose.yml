@@ -19,6 +19,8 @@ services:
       target: dev
     container_name: zeroclaw-dev
     restart: unless-stopped
+    env_file:
+      - ../.env
     environment:
       - ZEROCLAW_GATEWAY_PORT=24817
       - SANDBOX_HOST=zeroclaw-sandbox
@@ -33,7 +35,7 @@ services:
           . /run/secrets/zeroclaw_env
           set +a
         fi
-        exec zeroclaw gateway --port "${ZEROCLAW_GATEWAY_PORT:-24817}" --host "[::]"
+        exec zeroclaw gateway start --port "${ZEROCLAW_GATEWAY_PORT:-24817}" --host "[::]"
     volumes:
       # Mount single config file (avoids shadowing other files in .zeroclaw)
       - ../target/.zeroclaw/config.toml:/zeroclaw-data/.zeroclaw/config.toml

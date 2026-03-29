@@ -2978,6 +2978,18 @@ async fn process_channel_message(
         )
     {
         LlmExecutionResult::Completed(Ok(Ok(status_response)))
+    } else if crate::tenant_app_delivery::should_handle_reference_site_analysis_request(
+        ctx.workspace_dir.as_ref(),
+        &msg.content,
+    ) {
+        tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            response = execute_tenant_app_controller_request(
+                ctx.workspace_dir.as_ref(),
+                &msg.content,
+                started_at_wall,
+            ) => LlmExecutionResult::Completed(Ok(Ok(response))),
+        }
     } else if crate::tenant_app_delivery::should_handle_tenant_app_planning_request(
         ctx.workspace_dir.as_ref(),
         &msg.content,
@@ -3601,7 +3613,14 @@ fn load_openclaw_bootstrap_files(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
 
-    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
+    let bootstrap_files = [
+        "AGENTS.md",
+        "PRODUCT.md",
+        "SOUL.md",
+        "TOOLS.md",
+        "IDENTITY.md",
+        "USER.md",
+    ];
 
     for filename in &bootstrap_files {
         inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
@@ -3792,6 +3811,20 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     });
     prompt.push('\n');
+
+    let coding_tool_names: Vec<&str> = tools.iter().map(|(name, _)| *name).collect();
+    if let Some(coding_guidance) =
+        crate::coding_prompt::build_coding_work_guidance(&coding_tool_names)
+    {
+        prompt.push_str(&coding_guidance);
+        prompt.push('\n');
+    }
+    if let Some(product_guidance) =
+        crate::product_prompt::build_product_delivery_guidance(&coding_tool_names)
+    {
+        prompt.push_str(&product_guidance);
+        prompt.push('\n');
+    }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -5237,6 +5270,11 @@ mod tests {
         std::fs::write(
             tmp.path().join("AGENTS.md"),
             "# Agents\nFollow instructions.",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("PRODUCT.md"),
+            "# Product\nCurrent spec lives in product/specs/current.md",
         )
         .unwrap();
         std::fs::write(tmp.path().join("TOOLS.md"), "# Tools\nUse shell carefully.").unwrap();
@@ -7841,6 +7879,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // Section headers
         assert!(prompt.contains("## Tools"), "missing Tools section");
         assert!(prompt.contains("## Safety"), "missing Safety section");
+        assert!(prompt.contains("## Coding Work"), "missing Coding Work section");
         assert!(prompt.contains("## Workspace"), "missing Workspace section");
         assert!(
             prompt.contains("## Project Context"),
@@ -7898,6 +7937,15 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn prompt_omits_coding_work_when_no_coding_tools_are_present() {
+        let ws = make_workspace();
+        let tools = vec![("memory_recall", "Search memory")];
+        let prompt = build_system_prompt(ws.path(), "model", &tools, &[], None, None);
+
+        assert!(!prompt.contains("## Coding Work"));
+    }
+
+    #[test]
     fn prompt_injects_workspace_files() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
@@ -7911,6 +7959,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert!(prompt.contains("### USER.md"), "missing USER.md");
         assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
+        assert!(prompt.contains("### PRODUCT.md"), "missing PRODUCT.md");
         assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
         // HEARTBEAT.md is intentionally excluded from channel prompts — it's only
         // relevant to the heartbeat worker and causes LLMs to emit spurious
@@ -7931,7 +7980,19 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(prompt.contains("[File not found: SOUL.md]"));
         assert!(prompt.contains("[File not found: AGENTS.md]"));
+        assert!(prompt.contains("[File not found: PRODUCT.md]"));
         assert!(prompt.contains("[File not found: IDENTITY.md]"));
+    }
+
+    #[test]
+    fn prompt_injects_product_delivery_guidance_when_site_tools_exist() {
+        let ws = make_workspace();
+        let tools = vec![("web_fetch", "Fetch a web page"), ("file_write", "Write files")];
+        let prompt = build_system_prompt(ws.path(), "model", &tools, &[], None, None);
+
+        assert!(prompt.contains("## Product & Site Delivery"));
+        assert!(prompt.contains("product/specs/current.md"));
+        assert!(prompt.contains("product/revisions/"));
     }
 
     #[test]

@@ -23,14 +23,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Remove robot-kit from workspace members — it is excluded by .dockerignore
-# and is not needed for the Docker build (hardware-only crate).
-RUN sed -i 's/members = \[".", "crates\/robot-kit"\]/members = ["."]/' Cargo.toml
+# Keep the workspace shape intact so Cargo.lock remains valid during the
+# dependency-cache build, but stub out the member sources for this warmup step.
+COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
-RUN mkdir -p src benches \
+RUN mkdir -p src benches crates/robot-kit/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
-    && echo "fn main() {}" > benches/agent_benchmarks.rs
+    && echo "fn main() {}" > benches/agent_benchmarks.rs \
+    && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
@@ -43,6 +44,7 @@ RUN rm -rf src benches
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
 COPY src/ src/
+COPY crates/robot-kit/src/ crates/robot-kit/src/
 COPY benches/ benches/
 COPY --from=web-builder /web/dist web/dist
 COPY *.rs .
@@ -102,13 +104,7 @@ ENV LANG=C.UTF-8
 # Use consistent workspace path
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-# Defaults for local dev (Ollama) - matches config.template.toml
-ENV PROVIDER="ollama"
-ENV ZEROCLAW_MODEL="llama3.2"
 ENV ZEROCLAW_GATEWAY_PORT=24817
-
-# Note: API_KEY is intentionally NOT set here to avoid confusion.
-# It is set in config.toml as the Ollama URL.
 
 WORKDIR /zeroclaw-data
 USER 65534:65534

@@ -67,6 +67,28 @@ struct TenantPlanReceipt {
     user_message: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct TenantProductReceipt {
+    #[serde(default, rename = "createdAt")]
+    created_at: String,
+    #[serde(default, rename = "referenceUrl")]
+    reference_url: String,
+    #[serde(default, rename = "referenceTitle")]
+    reference_title: String,
+    #[serde(default, rename = "analysisPath")]
+    analysis_path: String,
+    #[serde(default, rename = "specPath")]
+    spec_path: String,
+    #[serde(default, rename = "referenceCues")]
+    reference_cues: Vec<String>,
+    #[serde(default)]
+    summary: Vec<String>,
+    #[serde(default, rename = "v1Scope")]
+    v1_scope: Vec<String>,
+    #[serde(default, rename = "userMessage")]
+    user_message: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TenantAppControllerMode {
     Build,
@@ -134,8 +156,21 @@ fn is_tenant_app_reset_request(message: &str) -> bool {
 
 fn tenant_app_has_workspace_context(workspace_dir: &Path) -> bool {
     let app_root = workspace_dir.join("tenant-app");
+    let product_dir = workspace_dir.join("product");
+    let product_analysis_dir = product_dir.join("analysis");
+    let product_spec_path = product_dir.join("specs").join("current.md");
+    let tenant_plan_path = workspace_dir.join("tenant-plan").join("latest.md");
+
+    let has_product_analysis = std::fs::read_dir(&product_analysis_dir)
+        .ok()
+        .map(|mut entries| entries.any(|entry| entry.ok().map(|item| item.path().is_file()).unwrap_or(false)))
+        .unwrap_or(false);
+
     app_root.join("spec.json").is_file()
         || app_root.join("dist").join("index.html").is_file()
+        || product_spec_path.is_file()
+        || has_product_analysis
+        || tenant_plan_path.is_file()
         || latest_requirement_attachment(workspace_dir).is_some()
 }
 
@@ -200,6 +235,14 @@ fn is_tenant_app_contextual_action_request(workspace_dir: &Path, message: &str) 
             "segui con eso",
             "continua con eso",
             "avanza con eso",
+            "avanza",
+            "implementalo",
+            "implementa",
+            "construilo",
+            "construila",
+            "hacelo",
+            "hacela",
+            "dale",
             "quiero que construyas esa app",
             "construi esa app",
             "construye esa app",
@@ -237,6 +280,24 @@ fn is_tenant_app_exploratory_request(normalized: &str) -> bool {
             "quiero un plan para",
             "me ayudas a pensar una",
             "me ayudas a pensar un",
+            "te doy el link",
+            "te paso el link",
+            "te mando el link",
+            "saca tus conclusiones",
+            "sacas tus conclusiones",
+            "saca conclusiones",
+            "sacas conclusiones",
+            "toma tus conclusiones",
+            "tomá tus conclusiones",
+            "sacar tus conclusiones",
+            "sacar conclusiones",
+            "mi objetivo es",
+            "mas adelante lo iteramos",
+            "luego lo iteramos",
+            "despues lo iteramos",
+            "después lo iteramos",
+            "seguro lo vamos a iterar",
+            "lo vamos a iterar",
         ],
     );
     let direct_delivery_intent = normalized_contains_any(
@@ -324,15 +385,6 @@ fn has_direct_delivery_intent(normalized: &str) -> bool {
             "deja la app lista",
             "servila",
             "sirvela",
-            "mejora",
-            "improve",
-            "actualiza",
-            "update",
-            "cambia",
-            "change",
-            "agrega",
-            "suma",
-            "itera",
         ],
     )
 }
@@ -406,6 +458,59 @@ fn is_tenant_app_planning_request(normalized: &str) -> bool {
     );
     ((hints_future_handoff || asks_to_read_or_plan) && mentions_requirements_document)
         && !has_direct_delivery_intent(normalized)
+}
+
+fn user_message_requests_site_analysis(normalized: &str) -> bool {
+    normalized_contains_any(
+        normalized,
+        &[
+            "analiza ",
+            "analizalo",
+            "analizar ",
+            "evalua ",
+            "evalua ",
+            "hallazgos",
+            "conclusiones",
+            "deja los hallazgos",
+            "deja hallazgos",
+            "deja evidencia",
+            "evidencia concreta",
+            "review the site",
+            "analyze the site",
+            "estructura base",
+            "estructura inicial",
+            "timeline",
+            "roadmap",
+            "prioridades",
+            "spec",
+            "especificacion",
+            "especificación",
+            "plan del sitio",
+            "plan de trabajo",
+            "redise",
+            "reversion",
+            "reversión",
+        ],
+    )
+}
+
+pub(crate) fn should_handle_reference_site_analysis_request(
+    workspace_dir: &Path,
+    message: &str,
+) -> bool {
+    if extract_reference_url(message).is_none() {
+        return false;
+    }
+
+    if is_tenant_app_status_request(workspace_dir, message)
+        || should_handle_tenant_app_planning_request(workspace_dir, message)
+        || should_handle_tenant_app_request(workspace_dir, message)
+    {
+        return false;
+    }
+
+    let normalized = normalize_tenant_intent_text(message);
+    user_message_requests_site_analysis(&normalized) || is_tenant_app_exploratory_request(&normalized)
 }
 
 fn collapse_whitespace(text: &str) -> String {
@@ -487,6 +592,36 @@ fn clean_reference_title(raw: &str) -> String {
         .unwrap_or(&collapsed)
         .trim();
     collapse_whitespace(preferred)
+}
+
+fn title_from_reference_url(reference_url: &str) -> Option<String> {
+    let host = reqwest::Url::parse(reference_url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(ToOwned::to_owned))?;
+    let stem = host.trim_start_matches("www.").split('.').next()?;
+    let tokens = stem
+        .split(['-', '_'])
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| {
+            let lower = token.to_ascii_lowercase();
+            match lower.as_str() {
+                "epg" => "EPG".to_string(),
+                _ => {
+                    let mut chars = lower.chars();
+                    match chars.next() {
+                        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.collect::<String>()),
+                        None => String::new(),
+                    }
+                }
+            }
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
 }
 
 fn reference_summary_bullets(reference: &TenantAppReferencePage) -> Vec<String> {
@@ -659,6 +794,520 @@ fn build_reference_summary(user_message: &str, reference: &TenantAppReferencePag
     }
 
     parts.join("\n\n")
+}
+
+fn product_dir(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join("product")
+}
+
+fn product_spec_path(workspace_dir: &Path) -> PathBuf {
+    product_dir(workspace_dir).join("specs").join("current.md")
+}
+
+fn latest_product_analysis_path(workspace_dir: &Path) -> Option<PathBuf> {
+    let analysis_dir = product_dir(workspace_dir).join("analysis");
+    let entries = std::fs::read_dir(&analysis_dir).ok()?;
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| extension.eq_ignore_ascii_case("md"))
+                    .unwrap_or(false)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| !name.eq_ignore_ascii_case("README.md"))
+                    .unwrap_or(true)
+        })
+        .max_by_key(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+        })
+}
+
+fn load_latest_tenant_product_receipt_anytime(workspace_dir: &Path) -> Option<TenantProductReceipt> {
+    let receipt_path = product_dir(workspace_dir).join("latest.json");
+    let raw = std::fs::read_to_string(receipt_path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn reference_site_slug(reference_url: &str) -> String {
+    reqwest::Url::parse(reference_url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(ToOwned::to_owned))
+        .map(|host| host.trim_start_matches("www.").replace('.', "-"))
+        .map(|host| {
+            host.chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                .collect::<String>()
+        })
+        .map(|slug| slug.trim_matches('-').to_string())
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "reference-site".to_string())
+}
+
+fn reference_site_cues(reference: &TenantAppReferencePage) -> Vec<String> {
+    let normalized = normalize_tenant_intent_text(&reference.text);
+    let mut labels = Vec::new();
+    for (needle, label) in [
+        ("about us", "About Us"),
+        ("about", "About Us"),
+        ("solutions", "Solutions"),
+        ("products", "Products"),
+        ("sectors", "Sectors"),
+        ("industries", "Sectors"),
+        ("resources", "Resources"),
+        ("media", "Media"),
+        ("news", "News"),
+        ("press", "Press"),
+        ("blog", "Blog"),
+        ("contact", "Contact"),
+        ("sustainability", "Sustainability"),
+    ] {
+        if normalized.contains(needle)
+            && !labels.iter().any(|existing: &String| existing.eq_ignore_ascii_case(label))
+        {
+            labels.push(label.to_string());
+        }
+    }
+
+    if labels.is_empty() {
+        labels = vec![
+            "Home".to_string(),
+            "About Us".to_string(),
+            "Solutions".to_string(),
+            "News".to_string(),
+            "Contact".to_string(),
+        ];
+    } else if !labels.iter().any(|label| label.eq_ignore_ascii_case("Home")) {
+        labels.insert(0, "Home".to_string());
+    }
+
+    labels.truncate(6);
+    labels
+}
+
+fn reference_v1_scope_items(
+    user_message: &str,
+    reference: &TenantAppReferencePage,
+    title: &str,
+) -> Vec<String> {
+    let requested_outcome = tenant_app_request_summary(user_message);
+    let outcome = if requested_outcome.is_empty() {
+        format!("Rediseñar el sitio de {title} con una estructura más clara y ligera.")
+    } else {
+        requested_outcome
+    };
+
+    let cues = reference_site_cues(reference);
+    let sections = cues
+        .iter()
+        .skip(1)
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut items = vec![
+        format!(
+            "Home corporativa para {title} con propuesta de valor más clara, navegación simple y CTA visibles."
+        ),
+        format!(
+            "Arquitectura inicial con secciones prioritarias ({sections}) para reducir ruido y mejorar el escaneo."
+        ),
+        format!(
+            "Dirección visual más sobria y contemporánea, basada en el objetivo pedido: {}",
+            truncate_with_ellipsis(&collapse_whitespace(&outcome), 180)
+        ),
+        "Publicar una v1 estática útil primero y dejar las siguientes iteraciones para profundidad visual, contenido y refinamiento editorial.".to_string(),
+    ];
+
+    let mut deduped = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items.drain(..) {
+        if seen.insert(item.to_lowercase()) {
+            deduped.push(item);
+        }
+    }
+    deduped
+}
+
+fn build_reference_analysis_artifact(
+    created_at: &str,
+    user_message: &str,
+    reference: &TenantAppReferencePage,
+    summary: &[String],
+    cues: &[String],
+) -> String {
+    let requested_outcome = tenant_app_request_summary(user_message);
+    let mut lines = vec![
+        "# Reference Site Analysis".to_string(),
+        String::new(),
+        format!("Generated at: {created_at}"),
+        format!("Reference URL: {}", reference.url),
+    ];
+    if !reference.title.trim().is_empty() {
+        lines.push(format!("Reference title: {}", reference.title.trim()));
+    }
+    lines.push(String::new());
+    lines.push("## Requested Outcome".to_string());
+    lines.push(if requested_outcome.is_empty() {
+        "No additional requested outcome was provided.".to_string()
+    } else {
+        requested_outcome
+    });
+    lines.push(String::new());
+    lines.push("## Concrete Findings".to_string());
+    for item in summary {
+        lines.push(format!("- {item}"));
+    }
+    lines.push(String::new());
+    lines.push("## Information Architecture Cues".to_string());
+    for cue in cues {
+        lines.push(format!("- {cue}"));
+    }
+    lines.push(String::new());
+    lines.push("## Reference Evidence".to_string());
+    lines.push(truncate_with_ellipsis(&collapse_whitespace(&reference.text), 1_200));
+    lines.join("\n")
+}
+
+fn build_reference_spec_artifact(
+    created_at: &str,
+    user_message: &str,
+    reference: &TenantAppReferencePage,
+    title: &str,
+    summary: &[String],
+    cues: &[String],
+    v1_scope: &[String],
+) -> String {
+    let requested_outcome = tenant_app_request_summary(user_message);
+    let mut lines = vec![
+        format!("# {title}"),
+        String::new(),
+        format!("Generated at: {created_at}"),
+        format!("Reference URL: {}", reference.url),
+        String::new(),
+        "## Product Direction".to_string(),
+        format!("- Product type: {}", "Corporate marketing site"),
+        format!(
+            "- Goal: {}",
+            if requested_outcome.is_empty() {
+                "Deliver a clearer, more agile first version inspired by the reference site."
+            } else {
+                requested_outcome.as_str()
+            }
+        ),
+        "- Delivery strategy: analyze first, ship a focused v1, then iterate with explicit deltas.".to_string(),
+        String::new(),
+        "## Reference Findings".to_string(),
+    ];
+    for item in summary.iter().take(4) {
+        lines.push(format!("- {item}"));
+    }
+    lines.push(String::new());
+    lines.push("## Information Architecture".to_string());
+    for cue in cues {
+        lines.push(format!("- {cue}"));
+    }
+    lines.push(String::new());
+    lines.push("## V1 Scope".to_string());
+    for (index, item) in v1_scope.iter().enumerate() {
+        lines.push(format!("{}. {}", index + 1, item));
+    }
+    lines.push(String::new());
+    lines.push("## Visual Direction".to_string());
+    lines.push("- Cleaner hierarchy, fewer heavy blocks, and clearer section transitions.".to_string());
+    lines.push("- Corporate but contemporary; avoid dashboard and backoffice visual language.".to_string());
+    lines.push("- Make the first screen explain the value proposition quickly and guide the user toward the main sections.".to_string());
+    lines.join("\n")
+}
+
+fn read_markdown_excerpt(path: &Path, max_chars: usize) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_with_ellipsis(trimmed, max_chars))
+    }
+}
+
+fn first_markdown_heading(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("# "))
+        .map(collapse_whitespace)
+        .filter(|heading| !heading.is_empty())
+}
+
+fn build_product_context_summary(
+    workspace_dir: &Path,
+    user_message: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let spec_path = product_spec_path(workspace_dir);
+    let analysis_path = latest_product_analysis_path(workspace_dir);
+    let spec_text = read_markdown_excerpt(&spec_path, 3_500);
+    let analysis_text = analysis_path
+        .as_ref()
+        .and_then(|path| read_markdown_excerpt(path, 3_500));
+    let product_receipt = load_latest_tenant_product_receipt_anytime(workspace_dir);
+
+    if spec_text.is_none() && analysis_text.is_none() && product_receipt.is_none() {
+        return None;
+    }
+
+    let mut parts = vec![format!(
+        "Requested outcome: {}",
+        tenant_app_request_summary(user_message)
+    )];
+
+    if let Some(receipt) = &product_receipt {
+        if !receipt.reference_url.trim().is_empty() {
+            parts.push(format!("Reference website: {}", receipt.reference_url.trim()));
+        }
+        if !receipt.reference_title.trim().is_empty() {
+            parts.push(format!("Reference title: {}", receipt.reference_title.trim()));
+        }
+        if !receipt.reference_cues.is_empty() {
+            parts.push(format!(
+                "Reference cues:\n- {}",
+                receipt.reference_cues.join("\n- ")
+            ));
+        }
+    }
+
+    if let Some(spec_text) = &spec_text {
+        parts.push(format!("Living spec:\n{spec_text}"));
+    }
+    if let Some(analysis_text) = &analysis_text {
+        parts.push(format!("Reference analysis:\n{analysis_text}"));
+    }
+
+    let derived_title = spec_text
+        .as_deref()
+        .and_then(first_markdown_heading)
+        .or_else(|| {
+            product_receipt
+                .as_ref()
+                .map(|receipt| collapse_whitespace(&receipt.reference_title))
+                .filter(|title| !title.is_empty())
+        });
+
+    let mode_hint = if product_receipt
+        .as_ref()
+        .map(|receipt| !receipt.reference_url.trim().is_empty())
+        .unwrap_or(false)
+        || analysis_path.is_some()
+    {
+        Some("marketing".to_string())
+    } else {
+        None
+    };
+
+    Some((parts.join("\n\n"), derived_title, mode_hint))
+}
+
+fn should_reuse_product_context(
+    workspace_dir: &Path,
+    user_message: &str,
+    mode: TenantAppControllerMode,
+) -> bool {
+    if matches!(mode, TenantAppControllerMode::Replace) {
+        return false;
+    }
+    if product_spec_path(workspace_dir).is_file() == false
+        && latest_product_analysis_path(workspace_dir).is_none()
+        && load_latest_tenant_product_receipt_anytime(workspace_dir).is_none()
+    {
+        return false;
+    }
+    if user_message_mentions_requirements_document(user_message)
+        || extract_reference_url(user_message).is_some()
+    {
+        return false;
+    }
+
+    let normalized = normalize_tenant_intent_text(user_message);
+    normalized_contains_any(
+        &normalized,
+        &[
+            "implementalo",
+            "implementa",
+            "implement it",
+            "build it",
+            "construilo",
+            "construila",
+            "hacelo",
+            "hacela",
+            "avanza",
+            "avanza con eso",
+            "segui",
+            "segui con eso",
+            "continua",
+            "continua con eso",
+            "dale",
+            "hace la v1",
+            "arma la v1",
+            "version inicial",
+            "v1",
+        ],
+    )
+}
+
+fn append_optional_controller_overrides(
+    args: &mut Vec<String>,
+    title: Option<String>,
+    mode_hint: Option<String>,
+) {
+    if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+        args.push("--title".to_string());
+        args.push(title);
+    }
+    if let Some(mode_hint) = mode_hint.filter(|value| !value.trim().is_empty()) {
+        args.push("--mode".to_string());
+        args.push(mode_hint);
+    }
+}
+
+fn should_force_marketing_mode(user_message: &str, reference: &TenantAppReferencePage) -> bool {
+    let combined = normalize_tenant_intent_text(&format!(
+        "{} {} {}",
+        user_message, reference.title, reference.text
+    ));
+    if normalized_contains_any(
+        &combined,
+        &["store", "shop", "ecommerce", "tienda", "checkout", "pricing"],
+    ) {
+        return false;
+    }
+
+    normalized_contains_any(
+        &combined,
+        &[
+            "sitio",
+            "website",
+            "site",
+            "landing",
+            "pagina",
+            "page",
+            "company",
+            "empresa",
+            "corporativ",
+            "minimal",
+            "editorial",
+            "about us",
+            "solutions",
+            "media",
+            "news",
+            "press",
+            "resources",
+            "contact",
+        ],
+    )
+}
+
+async fn execute_reference_site_analysis_request(
+    workspace_dir: &Path,
+    user_message: &str,
+) -> Result<String, String> {
+    let reference_url = extract_reference_url(user_message).ok_or_else(|| {
+        "mencionaste un sitio de referencia, pero no pude extraer una URL valida".to_string()
+    })?;
+    let reference = fetch_reference_page(&reference_url).await?;
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let summary = reference_summary_bullets(&reference);
+    let cues = reference_site_cues(&reference);
+    let title = derive_title_from_reference_page(user_message, &reference)
+        .or_else(|| title_from_reference_url(&reference.url))
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| "Reference Website".to_string());
+    let v1_scope = reference_v1_scope_items(user_message, &reference, &title);
+
+    let product_dir = product_dir(workspace_dir);
+    let analysis_dir = product_dir.join("analysis");
+    let specs_dir = product_dir.join("specs");
+    std::fs::create_dir_all(&analysis_dir)
+        .map_err(|error| format!("no pude crear product/analysis: {error}"))?;
+    std::fs::create_dir_all(&specs_dir)
+        .map_err(|error| format!("no pude crear product/specs: {error}"))?;
+
+    let analysis_path = analysis_dir.join(format!("{}.md", reference_site_slug(&reference.url)));
+    let spec_path = specs_dir.join("current.md");
+    let analysis_artifact = build_reference_analysis_artifact(
+        &created_at,
+        user_message,
+        &reference,
+        &summary,
+        &cues,
+    );
+    let spec_artifact = build_reference_spec_artifact(
+        &created_at,
+        user_message,
+        &reference,
+        &title,
+        &summary,
+        &cues,
+        &v1_scope,
+    );
+    std::fs::write(&analysis_path, analysis_artifact)
+        .map_err(|error| format!("no pude escribir el análisis del sitio: {error}"))?;
+    std::fs::write(&spec_path, spec_artifact)
+        .map_err(|error| format!("no pude escribir la spec viva del producto: {error}"))?;
+
+    let user_message = {
+        let mut lines = vec![format!(
+            "Analicé {} y dejé evidencia real en {}.",
+            reference.url,
+            analysis_path.display()
+        )];
+        lines.push(format!(
+            "También actualicé la spec viva en {}.",
+            spec_path.display()
+        ));
+        if !summary.is_empty() {
+            lines.push(String::new());
+            lines.push("Hallazgos clave:".to_string());
+            for item in &summary {
+                lines.push(format!("- {item}"));
+            }
+        }
+        if !v1_scope.is_empty() {
+            lines.push(String::new());
+            lines.push("V1 recomendada:".to_string());
+            for (index, item) in v1_scope.iter().enumerate() {
+                lines.push(format!("{}. {}", index + 1, item));
+            }
+        }
+        lines.push(String::new());
+        lines.push(
+            "Si querés, avanzo ahora con la construcción de la v1 en este tenant usando esa spec como source of truth."
+                .to_string(),
+        );
+        lines.join("\n")
+    };
+
+    let receipt = TenantProductReceipt {
+        created_at,
+        reference_url: reference.url.clone(),
+        reference_title: title,
+        analysis_path: analysis_path.display().to_string(),
+        spec_path: spec_path.display().to_string(),
+        reference_cues: cues,
+        summary,
+        v1_scope,
+        user_message: user_message.clone(),
+    };
+    let receipt_path = product_dir.join("latest.json");
+    let raw_receipt = serde_json::to_string_pretty(&receipt)
+        .map_err(|error| format!("no pude serializar el receipt de producto: {error}"))?;
+    std::fs::write(receipt_path, raw_receipt)
+        .map_err(|error| format!("no pude guardar el receipt de producto: {error}"))?;
+    Ok(user_message)
 }
 
 fn is_tenant_app_replace_request(message: &str) -> bool {
@@ -912,6 +1561,44 @@ pub(crate) fn tenant_app_status_response(workspace_dir: &Path, user_message: &st
         }
         lines.push(
             "Todavia no veo una publicacion nueva del tenant ni cambios reales en tenant-app/dist."
+                .to_string(),
+        );
+        return Some(lines.join(" "));
+    }
+
+    if let Some(product_receipt) = load_latest_tenant_product_receipt_anytime(workspace_dir) {
+        let mut lines = Vec::new();
+        if !product_receipt.reference_url.trim().is_empty() {
+            lines.push(format!(
+                "La ultima evidencia real es que analicé {} y dejé una spec viva del producto.",
+                product_receipt.reference_url.trim()
+            ));
+        } else {
+            lines.push(
+                "La ultima evidencia real es un análisis de producto con spec viva guardada en el workspace."
+                    .to_string(),
+            );
+        }
+        if !product_receipt.created_at.trim().is_empty() {
+            lines.push(format!(
+                "Ese análisis se generó en {}.",
+                product_receipt.created_at.trim()
+            ));
+        }
+        if !product_receipt.analysis_path.trim().is_empty() {
+            lines.push(format!(
+                "El análisis quedó en {}.",
+                product_receipt.analysis_path.trim()
+            ));
+        }
+        if !product_receipt.spec_path.trim().is_empty() {
+            lines.push(format!(
+                "La spec quedó en {}.",
+                product_receipt.spec_path.trim()
+            ));
+        }
+        lines.push(
+            "Todavía no veo una publicación nueva del tenant ni cambios reales en tenant-app/dist."
                 .to_string(),
         );
         return Some(lines.join(" "));
@@ -1430,10 +2117,62 @@ async fn tenant_app_controller_args(
         });
     }
 
+    if should_reuse_product_context(workspace_dir, user_message, mode) {
+        if let Some((summary, derived_title, mode_hint)) =
+            build_product_context_summary(workspace_dir, user_message)
+        {
+            return Ok(match mode {
+                TenantAppControllerMode::Build => {
+                    let mut args = vec![
+                        controller_path.display().to_string(),
+                        "build".to_string(),
+                        "--brief".to_string(),
+                        summary,
+                    ];
+                    append_optional_controller_overrides(
+                        &mut args,
+                        derived_title.clone(),
+                        mode_hint.clone(),
+                    );
+                    args
+                }
+                TenantAppControllerMode::Update => {
+                    let mut args = vec![
+                        controller_path.display().to_string(),
+                        "update".to_string(),
+                        "--goal".to_string(),
+                        summary,
+                    ];
+                    append_optional_controller_overrides(
+                        &mut args,
+                        derived_title.clone(),
+                        mode_hint.clone(),
+                    );
+                    args
+                }
+                TenantAppControllerMode::Replace => {
+                    let mut args = vec![
+                        controller_path.display().to_string(),
+                        "replace".to_string(),
+                        "--goal".to_string(),
+                        summary,
+                    ];
+                    append_optional_controller_overrides(&mut args, derived_title, mode_hint);
+                    args
+                }
+            });
+        }
+    }
+
     if let Some(reference_url) = extract_reference_url(user_message) {
         let reference = fetch_reference_page(&reference_url).await?;
         let enriched_summary = build_reference_summary(user_message, &reference);
         let derived_title = derive_title_from_reference_page(user_message, &reference);
+        let mode_hint = if should_force_marketing_mode(user_message, &reference) {
+            Some("marketing".to_string())
+        } else {
+            None
+        };
 
         return Ok(match mode {
             TenantAppControllerMode::Build => {
@@ -1443,18 +2182,27 @@ async fn tenant_app_controller_args(
                     "--brief".to_string(),
                     enriched_summary,
                 ];
-                if let Some(title) = derived_title {
-                    args.push("--title".to_string());
-                    args.push(title);
-                }
+                append_optional_controller_overrides(
+                    &mut args,
+                    derived_title.clone(),
+                    mode_hint.clone(),
+                );
                 args
             }
-            TenantAppControllerMode::Update => vec![
-                controller_path.display().to_string(),
-                "update".to_string(),
-                "--goal".to_string(),
-                enriched_summary,
-            ],
+            TenantAppControllerMode::Update => {
+                let mut args = vec![
+                    controller_path.display().to_string(),
+                    "update".to_string(),
+                    "--goal".to_string(),
+                    enriched_summary,
+                ];
+                append_optional_controller_overrides(
+                    &mut args,
+                    derived_title.clone(),
+                    mode_hint.clone(),
+                );
+                args
+            }
             TenantAppControllerMode::Replace => {
                 let mut args = vec![
                     controller_path.display().to_string(),
@@ -1462,10 +2210,7 @@ async fn tenant_app_controller_args(
                     "--goal".to_string(),
                     enriched_summary,
                 ];
-                if let Some(title) = derived_title {
-                    args.push("--title".to_string());
-                    args.push(title);
-                }
+                append_optional_controller_overrides(&mut args, derived_title, mode_hint);
                 args
             }
         });
@@ -1498,6 +2243,16 @@ pub(crate) async fn execute_tenant_app_controller_request(
     user_message: &str,
     turn_started_at: SystemTime,
 ) -> String {
+    if should_handle_reference_site_analysis_request(workspace_dir, user_message) {
+        return match execute_reference_site_analysis_request(workspace_dir, user_message).await {
+            Ok(message) => message,
+            Err(error) => format!(
+                "No pude dejar el análisis real del sitio todavía. Bloqueo real: {}",
+                truncate_with_ellipsis(&scrub_credentials(&error), 280)
+            ),
+        };
+    }
+
     if should_handle_tenant_app_planning_request(workspace_dir, user_message) {
         return match execute_tenant_plan_request(workspace_dir, user_message).await {
             Ok(message) => message,
@@ -1577,11 +2332,12 @@ pub(crate) async fn execute_tenant_app_controller_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_tenant_app_user_message, is_tenant_app_delivery_request, is_tenant_app_replace_request,
+        canonical_tenant_app_user_message, extract_reference_url,
+        is_tenant_app_delivery_request, is_tenant_app_replace_request,
         is_tenant_app_status_request, is_tenant_app_truthful_blocker_response,
-        should_handle_tenant_app_planning_request,
-        should_handle_tenant_app_request, tenant_app_status_response,
-        user_message_mentions_requirements_document,
+        should_handle_reference_site_analysis_request,
+        should_handle_tenant_app_planning_request, should_handle_tenant_app_request,
+        tenant_app_status_response, user_message_mentions_requirements_document,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -1605,6 +2361,9 @@ mod tests {
         ));
         assert!(!is_tenant_app_delivery_request(
             "Sabes que estoy con ganas de crear una webApp"
+        ));
+        assert!(!is_tenant_app_delivery_request(
+            "Te doy el link y sacas tus conclusiones sobre algunas de las preguntas: https://www.epgindustries.com/ . Mi objetivo es tener un sitio mas agil, que mantenga funcionalidades y contenido. Luego seguro lo vamos a iterar."
         ));
     }
 
@@ -1692,6 +2451,23 @@ mod tests {
     }
 
     #[test]
+    fn implementation_follow_up_triggers_after_analysis_and_spec_context() {
+        let dir = tempdir().unwrap();
+        let product_analysis_dir = dir.path().join("product").join("analysis");
+        let product_specs_dir = dir.path().join("product").join("specs");
+        fs::create_dir_all(&product_analysis_dir).unwrap();
+        fs::create_dir_all(&product_specs_dir).unwrap();
+        fs::write(product_analysis_dir.join("epg-industries.md"), "# Analisis").unwrap();
+        fs::write(product_specs_dir.join("current.md"), "# Spec").unwrap();
+
+        assert!(should_handle_tenant_app_request(
+            dir.path(),
+            "Implementalo por favor"
+        ));
+        assert!(should_handle_tenant_app_request(dir.path(), "Dale"));
+    }
+
+    #[test]
     fn planning_follow_up_requests_reuse_attachment_context() {
         let dir = tempdir().unwrap();
         let attachments_dir = dir.path().join("attachments").join("whatsapp");
@@ -1709,6 +2485,19 @@ mod tests {
         assert!(!should_handle_tenant_app_planning_request(
             dir.path(),
             "Quiero que construyas la app ahora mismo"
+        ));
+    }
+
+    #[test]
+    fn reference_site_analysis_requests_trigger_before_delivery() {
+        let dir = tempdir().unwrap();
+        assert!(should_handle_reference_site_analysis_request(
+            dir.path(),
+            "Analizá ahora https://www.epgindustries.com/, dejá los hallazgos por escrito y respondeme sólo cuando tengas evidencia concreta."
+        ));
+        assert!(!should_handle_reference_site_analysis_request(
+            dir.path(),
+            "Construí ahora la primera versión del sitio para https://www.epgindustries.com/ y publicala."
         ));
     }
 

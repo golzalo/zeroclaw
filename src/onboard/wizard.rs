@@ -5453,6 +5453,21 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Tools & Skills\n\n\
          Skills are listed in the system prompt. Use `read_skill` when available, or `file_read` on a skill file, for full details.\n\
          Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.\n\n\
+         ## Coding & Repo Work\n\n\
+         - When the user asks you to build, fix, refactor, or review code, start working instead of turning it into a questionnaire unless a missing choice would materially change the outcome.\n\
+         - First locate the relevant files with search tools, then read before editing.\n\
+         - Prefer `file_edit` for precise patches and `file_write` for new files or deliberate full rewrites.\n\
+         - Run targeted verification (`shell`, tests, build, lint, or diff inspection) before saying code work is done whenever the runtime allows it.\n\
+         - For quick/basic apps or prototypes, ship a sensible v1 first and iterate.\n\
+         - If the repo already contains a build, serve, or publish path, use it instead of assuming the user must do those steps manually.\n\
+         - Keep progress updates short: one start update, milestone/blocker updates only, then a completion summary with changed files, verification, and caveats.\n\n\
+         ## Product, Site, & Version Work\n\n\
+         - If the user gives you a reference URL for a site or product, inspect it before redesigning or rebuilding it.\n\
+         - Save reference-site findings in `product/analysis/` so future revisions keep the same context.\n\
+         - Treat `product/specs/current.md` as the living source of truth for the current product direction.\n\
+         - Record each concrete delivery in `product/revisions/` with version notes such as `v1.md`, `v2.md`, and what changed.\n\
+         - If the user changes direction entirely, rewrite the living spec intentionally and note that the next revision replaces the previous concept.\n\
+         - If the user asks for a new version, update the spec first and then implement the delta instead of starting from scratch unless they explicitly ask for a full replacement.\n\n\
          ## Crash Recovery\n\n\
          - If a run stops unexpectedly, recover context before acting.\n\
          - Check `MEMORY.md` + latest `memory/*.md` notes to avoid duplicate work.\n\
@@ -5548,9 +5563,21 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          - **file_read** — Read file contents\n\
            - Use when: inspecting project files, configs, or logs.\n\
            - Don't use when: you only need a quick string search (prefer targeted search first).\n\
+         - **file_edit** — Apply a precise in-place edit\n\
+           - Use when: replacing one exact block or string in an existing file.\n\
+           - Don't use when: the target text is ambiguous or you really need to rewrite the whole file.\n\
          - **file_write** — Write file contents\n\
            - Use when: applying focused edits, scaffolding files, or updating docs/code.\n\
            - Don't use when: unsure about side effects or when the file should remain user-owned.\n\
+         - **glob_search** — Find files by path/pattern\n\
+           - Use when: locating candidate files before reading or editing.\n\
+           - Don't use when: you already know the exact file you need.\n\
+         - **content_search** — Search inside files\n\
+           - Use when: finding symbols, strings, handlers, or config references across the workspace.\n\
+           - Don't use when: the match surface is already tiny and `file_read` is enough.\n\
+         - **git_operations** — Repository-aware git workflows\n\
+           - Use when: checking status, diff, history, or branch state during coding work.\n\
+           - Don't use when: a simpler dedicated tool or read-only file inspection already answers the question.\n\
          - **memory_store** — Save to memory\n\
            - Use when: preserving durable preferences, decisions, or key context.\n\
            - Don't use when: info is transient, noisy, or sensitive without explicit need.\n\
@@ -5602,6 +5629,65 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Open Loops\n\
          (Track unfinished tasks and follow-ups here)\n";
 
+    let product = "\
+         # PRODUCT.md — Product Delivery Notes\n\n\
+         Use this workspace area to analyze references, define the current product, and track iterations.\n\n\
+         ## Default Workflow\n\n\
+         1. If a user gives you a reference site, inspect it first and capture notes in `product/analysis/`.\n\
+         2. Keep the current source of truth in `product/specs/current.md`.\n\
+         3. Record each shipped or proposed revision in `product/revisions/`.\n\
+         4. Replace the spec intentionally when the user changes direction entirely.\n\n\
+         ## Current Product Snapshot\n\n\
+         - Name: \n\
+         - Goal: \n\
+         - Audience: \n\
+         - Current revision: \n\
+         - References: \n\
+         - Notes: \n";
+
+    let current_spec = "\
+         # Current Product Spec\n\n\
+         ## Goal\n\n\
+         - Describe the product you are currently building.\n\n\
+         ## Reference Inputs\n\n\
+         - Existing site URLs:\n\
+         - Files or docs:\n\
+         - Notes from user:\n\n\
+         ## Audience\n\n\
+         - Primary user:\n\
+         - Secondary user:\n\n\
+         ## Core Capabilities\n\n\
+         - \n\n\
+         ## Constraints\n\n\
+         - \n\n\
+         ## Accepted Decisions\n\n\
+         - \n\n\
+         ## Open Questions\n\n\
+         - \n\n\
+         ## Current Delivery Target\n\n\
+         - Version: v1\n\
+         - Status: draft\n";
+
+    let analysis_readme = "\
+         # Reference Site Analysis\n\n\
+         Store one file per reference source here.\n\n\
+         Suggested sections:\n\
+         - URL or source\n\
+         - Information architecture\n\
+         - Visual system\n\
+         - Notable modules and flows\n\
+         - Content tone\n\
+         - Reuse vs avoid\n";
+
+    let revisions_readme = "\
+         # Product Revisions\n\n\
+         Create one file per revision, for example `v1.md`, `v2.md`, `v3.md`.\n\n\
+         Each revision note should explain:\n\
+         - What changed\n\
+         - Why it changed\n\
+         - Whether it replaced the previous direction or iterated on it\n\
+         - What you verified\n";
+
     let files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
         ("AGENTS.md", agents),
@@ -5611,10 +5697,24 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         ("TOOLS.md", tools.to_string()),
         ("BOOTSTRAP.md", bootstrap),
         ("MEMORY.md", memory.to_string()),
+        ("PRODUCT.md", product.to_string()),
+        ("product/specs/current.md", current_spec.to_string()),
+        ("product/analysis/README.md", analysis_readme.to_string()),
+        ("product/revisions/README.md", revisions_readme.to_string()),
     ];
 
     // Create subdirectories
-    let subdirs = ["sessions", "memory", "state", "cron", "skills"];
+    let subdirs = [
+        "sessions",
+        "memory",
+        "state",
+        "cron",
+        "skills",
+        "product",
+        "product/analysis",
+        "product/specs",
+        "product/revisions",
+    ];
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
@@ -6213,6 +6313,10 @@ mod tests {
             "TOOLS.md",
             "BOOTSTRAP.md",
             "MEMORY.md",
+            "PRODUCT.md",
+            "product/specs/current.md",
+            "product/analysis/README.md",
+            "product/revisions/README.md",
         ];
         for f in &expected {
             assert!(tmp.path().join(f).exists(), "missing file: {f}");
@@ -6225,7 +6329,17 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
-        for dir in &["sessions", "memory", "state", "cron", "skills"] {
+        for dir in &[
+            "sessions",
+            "memory",
+            "state",
+            "cron",
+            "skills",
+            "product",
+            "product/analysis",
+            "product/specs",
+            "product/revisions",
+        ] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
         }
     }
@@ -6483,6 +6597,10 @@ mod tests {
             "TOOLS.md",
             "BOOTSTRAP.md",
             "MEMORY.md",
+            "PRODUCT.md",
+            "product/specs/current.md",
+            "product/analysis/README.md",
+            "product/revisions/README.md",
         ] {
             let content = tokio::fs::read_to_string(tmp.path().join(f)).await.unwrap();
             assert!(!content.trim().is_empty(), "{f} should not be empty");
@@ -6545,7 +6663,11 @@ mod tests {
         for tool in &[
             "shell",
             "file_read",
+            "file_edit",
             "file_write",
+            "glob_search",
+            "content_search",
+            "git_operations",
             "memory_store",
             "memory_recall",
             "memory_forget",
@@ -6563,6 +6685,42 @@ mod tests {
             tools.contains("Don't use when:"),
             "TOOLS.md should include 'Don't use when' guidance"
         );
+    }
+
+    #[tokio::test]
+    async fn agents_md_includes_coding_workflow_guidance() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
+        assert!(agents.contains("## Coding & Repo Work"));
+        assert!(agents.contains("ship a sensible v1 first"));
+        assert!(agents.contains("completion summary with changed files"));
+        assert!(agents.contains("## Product, Site, & Version Work"));
+        assert!(agents.contains("product/specs/current.md"));
+        assert!(agents.contains("product/revisions/"));
+    }
+
+    #[tokio::test]
+    async fn product_md_and_spec_scaffold_version_workflow() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+
+        let product = tokio::fs::read_to_string(tmp.path().join("PRODUCT.md"))
+            .await
+            .unwrap();
+        assert!(product.contains("product/analysis/"));
+        assert!(product.contains("product/specs/current.md"));
+
+        let spec = tokio::fs::read_to_string(tmp.path().join("product/specs/current.md"))
+            .await
+            .unwrap();
+        assert!(spec.contains("## Goal"));
+        assert!(spec.contains("## Current Delivery Target"));
     }
 
     #[tokio::test]
