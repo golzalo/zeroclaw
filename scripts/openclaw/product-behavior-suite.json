@@ -1,0 +1,85 @@
+{
+  "name": "product-behavior-suite",
+  "cases": [
+    {
+      "id": "reference-site-redesign-epg",
+      "title": "Reference Site Redesign",
+      "intent": "Measure analysis, decomposition, handoff and iteration quality starting from a visible corporate reference.",
+      "steps": [
+        {
+          "id": "analysis",
+          "title": "Reference Site Analysis",
+          "message": "Analizá https://www.epgindustries.com/ y devolvé exactamente estas 6 secciones con títulos claros: 1. propuesta de valor, 2. mapa de navegación visible, 3. componentes principales de la home, 4. decisiones visuales que conviene conservar, 5. decisiones visuales que conviene reinterpretar, 6. spec corta para una v1 más premium."
+        },
+        {
+          "id": "handoff",
+          "title": "Agent Handoff Pack",
+          "message": "Con esa referencia, generá un handoff operativo para que otro agente reconstruya la home en una versión más premium. Quiero exactamente estas partes: spec, tasklist priorizada, component map, criterios visuales, decisiones de ingeniería y riesgos."
+        },
+        {
+          "id": "v2",
+          "title": "Iteration From Feedback",
+          "message": "Ahora iterá: la v1 quedó demasiado genérica y poco premium. Proponé una v2 más editorial, con 5 cambios visuales concretos, 3 cambios estructurales y una nota breve sobre mantenibilidad."
+        }
+      ]
+    },
+    {
+      "id": "super86-end-to-end",
+      "title": "super86 End To End",
+      "intent": "Measure whether the model can hold product context across direction, correction and V2 requests without falling into app templates.",
+      "steps": [
+        {
+          "id": "direction",
+          "title": "Initial Direction",
+          "message": "Quiero definir una primera dirección para el sitio de super86. La frase elegida es: \"AI, now for everyone. Welcome to super86.\" Necesito una landing muy simple y premium, pensada para convertir por WhatsApp, no una app operativa."
+        },
+        {
+          "id": "v1-correction",
+          "title": "Correct The Bad V1",
+          "message": "La primera versión quedó horrible y con secciones que no quiero. Ninguna de esas secciones las quiero. No quiero dashboard, inventory, métricas, módulos, timeline ni release notes. Quiero que vuelvas a pensar la dirección antes de construir."
+        },
+        {
+          "id": "v2",
+          "title": "Minimal Resend-Inspired V2",
+          "message": "Ahora hacé una V2. Inspirate visualmente en Resend. Inventá un logo para super86 y ponelo arriba a la izquierda. Poné en el centro la frase \"AI, now for everyone. Welcome to super86.\" y abajo un único CTA que abra WhatsApp al +54 9 11 7829-0582 con el mensaje \"Hola, quiero un agente\". Quiero una landing mínima de una sola pantalla."
+        }
+      ]
+    },
+    {
+      "id": "minimal-brand-landing",
+      "title": "Minimal Brand Landing",
+      "intent": "Measure whether the model respects forbidden patterns and produces a real minimal landing instead of a dashboard/storefront shell.",
+      "steps": [
+        {
+          "id": "single-step",
+          "title": "Landing Contract",
+          "message": "Build a completely new V1 for super86 as a one-screen marketing landing page in English only. Hard constraints: do not use the inventory template, do not use the dashboard template, do not use storefront, do not generate metrics, tables, modules, timelines, release notes, capability grids, operational cards or admin UI. Take visual inspiration from Resend. One compact logo for \"super86\" in the top-left. One central hero statement only: \"AI, now for everyone. Welcome to super86.\" One primary CTA button below the hero that opens WhatsApp to +54 9 11 7829-0582 with the message \"Hola, quiero un agente\"."
+        }
+      ]
+    },
+    {
+      "id": "operational-webapp-split",
+      "title": "Operational Webapp Split",
+      "intent": "Measure whether the model treats an operational product brief as an app build instead of a marketing landing.",
+      "steps": [
+        {
+          "id": "app-brief",
+          "title": "Operational App Brief",
+          "message": "Quiero una webapp operativa para onboarding y offboarding de empleados con estados, responsables, FAQ de soporte y un tablero con métricas. No quiero una landing pública: quiero pantallas, entidades, flujos y una propuesta concreta de app."
+        }
+      ]
+    },
+    {
+      "id": "process-design-split",
+      "title": "Process Design Split",
+      "intent": "Measure whether the model can stay in process/spec mode without publicar una UI cuando el pedido es de workflow y reglas.",
+      "steps": [
+        {
+          "id": "process-brief",
+          "title": "Workflow Brief",
+          "message": "Necesito diseñar el proceso de onboarding interno para un equipo chico: actores, pasos, reglas, excepciones, SLA y handoff entre ventas, operaciones y soporte. No construyas una app todavía; quiero primero proceso, criterios y plan."
+        }
+      ]
+    }
+  ]
+}

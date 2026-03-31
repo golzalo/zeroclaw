@@ -1,0 +1,35 @@
+{
+  "name": "product-reference-suite",
+  "prompts": [
+    {
+      "id": "site-analysis-epg",
+      "title": "Reference Site Analysis",
+      "intent": "Measure how well OpenClaw inspects an existing corporate site and extracts actionable structure.",
+      "message": "Analizá https://www.epgindustries.com/ y devolvé exactamente estas 6 secciones con títulos claros: 1. propuesta de valor, 2. mapa de navegación visible, 3. componentes principales de la home, 4. decisiones visuales que conviene conservar, 5. decisiones visuales que conviene reinterpretar, 6. spec corta para una v1 más premium."
+    },
+    {
+      "id": "product-decomposition-epg",
+      "title": "Product Decomposition",
+      "intent": "Measure product abstraction from a visible website into engineering-facing structure.",
+      "message": "Tomá un sitio corporativo industrial como https://www.epgindustries.com/ y descomponelo en formato estructurado con estas secciones: pantallas, estados, entidades, flujos, reglas de negocio implícitas, riesgos de implementación y supuestos técnicos sobre stack o integraciones."
+    },
+    {
+      "id": "handoff-pack-epg",
+      "title": "Agent Handoff Pack",
+      "intent": "Measure whether OpenClaw can package work for another agent instead of only describing it.",
+      "message": "Generá un handoff operativo para que otro agente reconstruya la home de https://www.epgindustries.com/ en una versión más premium. Quiero exactamente estas partes: spec, tasklist priorizada, component map, criterios visuales, decisiones de ingeniería y riesgos."
+    },
+    {
+      "id": "v1-build-brief",
+      "title": "V1 Build Brief",
+      "intent": "Measure whether OpenClaw scopes a first version instead of overpromising a full redesign.",
+      "message": "Definí una v1 realista para rediseñar la home de EPG Industries sin rehacer todo el sitio. Respondé con: objetivo de v1, alcance incluido, alcance explícitamente excluido, componentes a construir primero, secuencia recomendada de implementación y criterios de aceptación."
+    },
+    {
+      "id": "iteration-from-feedback",
+      "title": "Iteration From Feedback",
+      "intent": "Measure how well OpenClaw converts concrete criticism into a next revision plan.",
+      "message": "Partiendo de una v1 que quedó demasiado genérica y poco premium, proponé una v2 más editorial para la home de un sitio industrial como EPG Industries. Quiero: diagnóstico de por qué una v1 puede verse genérica, 5 cambios visuales concretos, 3 cambios estructurales y una nota breve de cómo preservar mantenibilidad y velocidad de implementación."
+    }
+  ]
+}

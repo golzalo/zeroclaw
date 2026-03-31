@@ -28,9 +28,9 @@ use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
 use crate::tenant_app_delivery::{
-    execute_tenant_app_controller_request, should_handle_reference_site_analysis_request,
-    should_handle_tenant_app_planning_request, should_handle_tenant_app_request,
-    tenant_app_status_response,
+    execute_tenant_app_controller_request, should_handle_product_handoff_request,
+    should_handle_reference_site_analysis_request, should_handle_tenant_app_planning_request,
+    should_handle_tenant_app_request, tenant_app_status_response,
 };
 use crate::tools;
 use crate::tools::traits::ToolSpec;
@@ -1134,12 +1134,22 @@ async fn handle_webhook(
     let started_at = Instant::now();
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
+    let _ = crate::tenant_app_delivery::prime_project_context_for_message(&workspace_dir, message);
+
     if let Some(status_response) = tenant_app_status_response(&workspace_dir, message) {
         let body = serde_json::json!({"response": status_response, "model": state.model});
         return (StatusCode::OK, Json(body));
     }
 
     if should_handle_reference_site_analysis_request(&workspace_dir, message) {
+        let response =
+            execute_tenant_app_controller_request(&workspace_dir, message, SystemTime::now())
+                .await;
+        let body = serde_json::json!({"response": response, "model": state.model});
+        return (StatusCode::OK, Json(body));
+    }
+
+    if should_handle_product_handoff_request(&workspace_dir, message) {
         let response =
             execute_tenant_app_controller_request(&workspace_dir, message, SystemTime::now())
                 .await;

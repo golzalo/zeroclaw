@@ -111,7 +111,6 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 
 /// Observer wrapper that forwards tool-call events to a channel sender
@@ -2971,6 +2970,11 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let _ = crate::tenant_app_delivery::prime_project_context_for_message(
+        ctx.workspace_dir.as_ref(),
+        &msg.content,
+    );
+
     let llm_result = if let Some(status_response) =
         crate::tenant_app_delivery::tenant_app_status_response(
             ctx.workspace_dir.as_ref(),
@@ -2979,6 +2983,18 @@ async fn process_channel_message(
     {
         LlmExecutionResult::Completed(Ok(Ok(status_response)))
     } else if crate::tenant_app_delivery::should_handle_reference_site_analysis_request(
+        ctx.workspace_dir.as_ref(),
+        &msg.content,
+    ) {
+        tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            response = execute_tenant_app_controller_request(
+                ctx.workspace_dir.as_ref(),
+                &msg.content,
+                started_at_wall,
+            ) => LlmExecutionResult::Completed(Ok(Ok(response))),
+        }
+    } else if crate::tenant_app_delivery::should_handle_product_handoff_request(
         ctx.workspace_dir.as_ref(),
         &msg.content,
     ) {

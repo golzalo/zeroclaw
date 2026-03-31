@@ -5635,13 +5635,18 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Default Workflow\n\n\
          1. If a user gives you a reference site, inspect it first and capture notes in `product/analysis/`.\n\
          2. Keep the current source of truth in `product/specs/current.md`.\n\
-         3. Record each shipped or proposed revision in `product/revisions/`.\n\
-         4. Replace the spec intentionally when the user changes direction entirely.\n\n\
+         3. Choose an explicit approach/style/target before building (`product/approaches/`).\n\
+         4. Create handoffs in `product/handoffs/` when another agent or renderer needs to take over.\n\
+         5. Record each shipped or proposed revision in `product/revisions/`.\n\
+         6. Replace the spec intentionally when the user changes direction entirely.\n\n\
          ## Current Product Snapshot\n\n\
          - Name: \n\
          - Goal: \n\
          - Audience: \n\
          - Current revision: \n\
+         - Current approach: \n\
+         - Current style direction: \n\
+         - Current build target: \n\
          - References: \n\
          - Notes: \n";
 
@@ -5649,17 +5654,36 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          # Current Product Spec\n\n\
          ## Goal\n\n\
          - Describe the product you are currently building.\n\n\
+         ## Analysis Mode\n\n\
+         - Mode: inspected / inferred\n\
+         - Confidence: \n\
+         - Known gaps: \n\n\
          ## Reference Inputs\n\n\
          - Existing site URLs:\n\
          - Files or docs:\n\
          - Notes from user:\n\n\
+         ## Build Approach\n\n\
+         - Approach: corporate_marketing / editorial_brand / minimal_landing / dashboard / storefront / raw_custom\n\
+         - Style direction: \n\
+         - Build target: static_html / react_app / next_app / portable_handoff\n\
+         - Renderer/template mode if any: \n\n\
          ## Audience\n\n\
          - Primary user:\n\
          - Secondary user:\n\n\
+         ## Product Decomposition\n\n\
+         - Screens:\n\
+         - States:\n\
+         - Entities:\n\
+         - Flows:\n\
+         - Rules:\n\n\
          ## Core Capabilities\n\n\
          - \n\n\
          ## Constraints\n\n\
          - \n\n\
+         ## Visual Criteria\n\n\
+         - Preserve:\n\
+         - Reinterpret:\n\
+         - Avoid:\n\n\
          ## Accepted Decisions\n\n\
          - \n\n\
          ## Open Questions\n\n\
@@ -5672,12 +5696,43 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          # Reference Site Analysis\n\n\
          Store one file per reference source here.\n\n\
          Suggested sections:\n\
+         - Analysis mode (`inspected` or `inferred`)\n\
+         - Confidence and missing evidence\n\
          - URL or source\n\
          - Information architecture\n\
          - Visual system\n\
+         - Components to preserve\n\
+         - Components to reinterpret\n\
          - Notable modules and flows\n\
          - Content tone\n\
          - Reuse vs avoid\n";
+
+    let approaches_readme = "\
+         # Product Approaches\n\n\
+         Use this directory to keep approach/style notes that inform how the product should be built.\n\n\
+         Suggested approach names:\n\
+         - `corporate_marketing`\n\
+         - `editorial_brand`\n\
+         - `minimal_landing`\n\
+         - `dashboard`\n\
+         - `storefront`\n\
+         - `raw_custom`\n\n\
+         Each note should explain:\n\
+         - When to use the approach\n\
+         - What makes it feel premium vs generic\n\
+         - Which layout/component patterns belong to it\n\
+         - Which renderer or target it prefers\n";
+
+    let handoffs_readme = "\
+         # Product Handoffs\n\n\
+         Create one file per handoff when another agent or renderer needs to take over.\n\n\
+         Suggested sections:\n\
+         - Spec summary\n\
+         - Tasklist\n\
+         - Component map\n\
+         - Visual criteria\n\
+         - Engineering decisions\n\
+         - Risks and open questions\n";
 
     let revisions_readme = "\
          # Product Revisions\n\n\
@@ -5687,6 +5742,15 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          - Why it changed\n\
          - Whether it replaced the previous direction or iterated on it\n\
          - What you verified\n";
+
+    let services_readme = "\
+         # Project Services\n\n\
+         Use this directory for background workers, sync jobs, webhook handlers, cron tasks, or small APIs that belong to the current project.\n\n\
+         Suggested conventions:\n\
+         - one directory per service\n\
+         - a short README with install/run commands\n\
+         - standard dependencies only unless the project really needs more\n\
+         - keep public-site code separate from service code\n";
 
     let files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
@@ -5700,7 +5764,21 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         ("PRODUCT.md", product.to_string()),
         ("product/specs/current.md", current_spec.to_string()),
         ("product/analysis/README.md", analysis_readme.to_string()),
+        (
+            "product/approaches/README.md",
+            approaches_readme.to_string(),
+        ),
+        ("product/handoffs/README.md", handoffs_readme.to_string()),
         ("product/revisions/README.md", revisions_readme.to_string()),
+        ("services/README.md", services_readme.to_string()),
+        (
+            "services/services.json",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "services": []
+            }))
+            .unwrap_or_else(|_| "{\n  \"schemaVersion\": 1,\n  \"services\": []\n}".to_string()),
+        ),
     ];
 
     // Create subdirectories
@@ -5712,8 +5790,11 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         "skills",
         "product",
         "product/analysis",
+        "product/approaches",
+        "product/handoffs",
         "product/specs",
         "product/revisions",
+        "services",
     ];
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir)).await?;
@@ -6316,6 +6397,8 @@ mod tests {
             "PRODUCT.md",
             "product/specs/current.md",
             "product/analysis/README.md",
+            "product/approaches/README.md",
+            "product/handoffs/README.md",
             "product/revisions/README.md",
         ];
         for f in &expected {
@@ -6337,6 +6420,8 @@ mod tests {
             "skills",
             "product",
             "product/analysis",
+            "product/approaches",
+            "product/handoffs",
             "product/specs",
             "product/revisions",
         ] {
@@ -6715,11 +6800,14 @@ mod tests {
             .unwrap();
         assert!(product.contains("product/analysis/"));
         assert!(product.contains("product/specs/current.md"));
+        assert!(product.contains("product/approaches/"));
+        assert!(product.contains("product/handoffs/"));
 
         let spec = tokio::fs::read_to_string(tmp.path().join("product/specs/current.md"))
             .await
             .unwrap();
         assert!(spec.contains("## Goal"));
+        assert!(spec.contains("## Build Approach"));
         assert!(spec.contains("## Current Delivery Target"));
     }
 
