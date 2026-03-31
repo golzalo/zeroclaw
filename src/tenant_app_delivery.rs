@@ -162,8 +162,33 @@ enum TenantAppControllerMode {
     Replace,
 }
 
+fn strip_attachment_payloads(text: &str) -> String {
+    let supported_markers = ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"];
+    let mut cleaned = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = text[cursor..].find('[') {
+        let start = cursor + rel_start;
+        cleaned.push_str(&text[cursor..start]);
+        let remaining = &text[start..];
+        if supported_markers.iter().any(|marker| remaining.starts_with(marker)) {
+            if let Some(rel_end) = remaining.find(']') {
+                cursor = start + rel_end + 1;
+                continue;
+            }
+        }
+
+        cleaned.push('[');
+        cursor = start + '['.len_utf8();
+    }
+
+    cleaned.push_str(&text[cursor..]);
+    cleaned
+}
+
 fn normalize_tenant_intent_text(text: &str) -> String {
-    text.to_lowercase()
+    strip_attachment_payloads(text)
+        .to_lowercase()
         .replace(['á', 'à', 'ä', 'â'], "a")
         .replace(['é', 'è', 'ë', 'ê'], "e")
         .replace(['í', 'ì', 'ï', 'î'], "i")
@@ -4166,7 +4191,8 @@ fn tenant_app_controller_mode(workspace_dir: &Path, user_message: &str) -> Tenan
 }
 
 fn tenant_app_request_summary(message: &str) -> String {
-    let trimmed = message.trim();
+    let sanitized = collapse_whitespace(&strip_attachment_payloads(message));
+    let trimmed = sanitized.trim();
     let lower = normalize_tenant_intent_text(trimmed);
 
     for prefix in [
@@ -4178,11 +4204,11 @@ fn tenant_app_request_summary(message: &str) -> String {
                 .nth(prefix.chars().count())
                 .map(|(idx, _)| idx)
                 .unwrap_or(trimmed.len());
-            return trimmed[cut..].trim().to_string();
+            return truncate_with_ellipsis(trimmed[cut..].trim(), 8_000);
         }
     }
 
-    trimmed.to_string()
+    truncate_with_ellipsis(trimmed, 8_000)
 }
 
 fn is_extractable_requirement_attachment(path: &Path) -> bool {
@@ -5477,12 +5503,13 @@ mod tests {
         controller_mode_hint_for_approach,
         ensure_project_context_for_message, extract_reference_url, infer_new_project_title,
         is_direct_process_design_request, is_direct_service_build_request,
+        normalize_tenant_intent_text,
         is_tenant_app_delivery_request, is_tenant_app_replace_request,
         is_tenant_app_status_request, is_tenant_app_truthful_blocker_response,
         load_project_registry_anytime, product_dir, should_handle_product_handoff_request,
         should_handle_reference_site_analysis_request,
         should_handle_tenant_app_planning_request, should_handle_tenant_app_request,
-        tenant_app_status_response,
+        tenant_app_request_summary, tenant_app_status_response,
         user_message_mentions_requirements_document,
     };
     use std::fs;
@@ -5561,6 +5588,40 @@ mod tests {
         assert!(!user_message_mentions_requirements_document(
             "Quiero una app para gestionar documentos PDF."
         ));
+    }
+
+    #[test]
+    fn normalize_tenant_intent_text_strips_attachment_markers_before_routing() {
+        let normalized = normalize_tenant_intent_text(
+            "[IMAGE:data:image/jpeg;base64,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]\n\nNecesito un WORD y un EXCEL con el analisis.",
+        );
+        assert!(!normalized.contains("data:image"));
+        assert!(normalized.contains("necesito un word y un excel con el analisis"));
+    }
+
+    #[test]
+    fn image_only_attachment_message_does_not_trigger_tenant_app_routing() {
+        let dir = tempdir().unwrap();
+        let message = "[IMAGE:data:image/jpeg;base64,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]";
+        assert!(!should_handle_tenant_app_request(dir.path(), message));
+        assert!(!is_tenant_app_delivery_request(message));
+    }
+
+    #[test]
+    fn attachment_plus_word_excel_request_does_not_trigger_tenant_app_routing() {
+        let dir = tempdir().unwrap();
+        let message = "Te paso los números del CRM [IMAGE:data:image/jpeg;base64,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] con eso quiero que me devuelvas un WORD y un EXCEL con el análisis.";
+        assert!(!should_handle_tenant_app_request(dir.path(), message));
+        assert!(!is_tenant_app_delivery_request(message));
+    }
+
+    #[test]
+    fn tenant_app_request_summary_drops_inline_attachment_payloads() {
+        let summary = tenant_app_request_summary(
+            "Hola: usá estas imágenes [IMAGE:data:image/png;base64,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] para armar el informe.",
+        );
+        assert!(!summary.contains("data:image"));
+        assert_eq!(summary, "usá estas imágenes para armar el informe.");
     }
 
     #[test]

@@ -723,7 +723,7 @@ impl WhatsAppWebChannel {
             }
         };
 
-        Self::image_bytes_to_marker(bytes, image.mimetype.as_deref(), "image_message")
+        Self::image_bytes_to_marker(bytes, image.mimetype.as_deref(), "image_message", None).await
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -754,7 +754,13 @@ impl WhatsAppWebChannel {
             }
         };
 
-        Self::image_bytes_to_marker(bytes, document.mimetype.as_deref(), "document_image")
+        Self::image_bytes_to_marker(
+            bytes,
+            document.mimetype.as_deref(),
+            "document_image",
+            document.file_name.as_deref().or_else(|| document.title.as_deref()),
+        )
+        .await
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -822,10 +828,11 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
-    fn image_bytes_to_marker(
+    async fn image_bytes_to_marker(
         bytes: Vec<u8>,
         declared_mime: Option<&str>,
         source: &str,
+        suggested_name: Option<&str>,
     ) -> Option<String> {
         if bytes.is_empty() {
             tracing::warn!(
@@ -857,8 +864,25 @@ impl WhatsAppWebChannel {
             }
         };
 
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
+        let attachments_dir = Self::workspace_dir().join("attachments").join("whatsapp");
+        if let Err(err) = fs::create_dir_all(&attachments_dir).await {
+            tracing::warn!("WhatsApp Web: failed to create image attachments dir: {err}");
+            return None;
+        }
+
+        let base_name = suggested_name.unwrap_or(source);
+        let safe_name = Self::unique_attachment_name(Self::sanitize_attachment_name(
+            base_name,
+            Some(mime),
+        ));
+        let target_path = attachments_dir.join(&safe_name);
+
+        if let Err(err) = fs::write(&target_path, &bytes).await {
+            tracing::warn!("WhatsApp Web: failed to persist image attachment: {err}");
+            return None;
+        }
+
+        Some(format!("[IMAGE:{}]", target_path.display()))
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -987,9 +1011,33 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn unique_attachment_name(candidate: String) -> String {
+        let suffix = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect::<String>();
+        let path = Path::new(&candidate);
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("attachment");
+        match path.extension().and_then(|value| value.to_str()) {
+            Some(ext) if !ext.is_empty() => format!("{stem}-{suffix}.{ext}"),
+            _ => format!("{stem}-{suffix}"),
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     fn extension_from_mime(mime: Option<&str>) -> Option<&'static str> {
         let normalized = mime?.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
         match normalized.as_str() {
+            "image/jpeg" => Some("jpg"),
+            "image/png" => Some("png"),
+            "image/webp" => Some("webp"),
+            "image/gif" => Some("gif"),
             "application/pdf" => Some("pdf"),
             "application/msword" => Some("doc"),
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
@@ -3019,6 +3067,35 @@ mod tests {
         std::env::remove_var("ZEROCLAW_WORKSPACE");
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn whatsapp_web_image_bytes_to_marker_persists_local_workspace_file() {
+        let _guard = env_lock().lock().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::env::set_var("ZEROCLAW_WORKSPACE", workspace.path());
+
+        let bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let marker = WhatsAppWebChannel::image_bytes_to_marker(
+            bytes.clone(),
+            Some("image/png"),
+            "image_message",
+            Some("crm.png"),
+        )
+        .await
+        .expect("image marker");
+
+        assert!(marker.starts_with("[IMAGE:"));
+        let path = marker
+            .trim_start_matches("[IMAGE:")
+            .trim_end_matches(']')
+            .to_string();
+        assert!(path.contains("/attachments/whatsapp/"));
+        let saved = std::fs::read(&path).expect("saved image bytes");
+        assert_eq!(saved, bytes);
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
     }
 
     #[test]
