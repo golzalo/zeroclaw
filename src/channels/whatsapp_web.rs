@@ -2203,6 +2203,11 @@ impl Channel for WhatsAppWebChannel {
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
+                .with_device_props(
+                    Some("macOS".to_string()),
+                    None,
+                    Some(wa_rs_proto::whatsapp::device_props::PlatformType::Safari),
+                )
                 .on_event(move |event, client| {
                     let tx_inner = tx_clone.clone();
                     let allowed_numbers = allowed_numbers.clone();
@@ -2457,6 +2462,8 @@ impl Channel for WhatsAppWebChannel {
                 builder = builder.with_pair_code(PairCodeOptions {
                     phone_number: phone.clone(),
                     custom_code: self.pair_code.clone(),
+                    platform_id: wa_rs::pair_code::PlatformId::Safari,
+                    platform_display: "super86.app".to_string(),
                     ..Default::default()
                 });
             } else if self.pair_code.is_some() {
