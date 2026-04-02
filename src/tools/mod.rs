@@ -153,13 +153,14 @@ pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
 
-use crate::config::{Config, DelegateAgentConfig};
+use crate::config::{Config, DelegateAgentConfig, SkillsPromptInjectionMode};
+use crate::i18n::ToolDescriptions;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::{create_sandbox, SecurityPolicy};
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Shared handle to the delegate tool's parent-tools list.
@@ -220,6 +221,91 @@ impl Tool for ArcDelegatingTool {
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+}
+
+const SKILL_GATED_TOOL_NAMES: &[&str] = &[
+    "web_fetch",
+    "cron_add",
+    "cron_list",
+    "cron_remove",
+    "cron_update",
+    "cron_run",
+    "cron_runs",
+    "schedule",
+    "pdf_read",
+    "screenshot",
+    "image_info",
+    "image_generate",
+];
+
+pub fn is_skill_gated_tool(name: &str) -> bool {
+    SKILL_GATED_TOOL_NAMES.contains(&name)
+}
+
+pub fn is_tool_active_by_default(name: &str, skills_mode: SkillsPromptInjectionMode) -> bool {
+    if name == "read_skill" {
+        return matches!(skills_mode, SkillsPromptInjectionMode::Compact);
+    }
+
+    !is_skill_gated_tool(name)
+}
+
+fn tool_spec_with_description(
+    tool: &dyn Tool,
+    tool_descriptions: Option<&ToolDescriptions>,
+) -> ToolSpec {
+    ToolSpec {
+        name: tool.name().to_string(),
+        description: tool_descriptions
+            .and_then(|descs| descs.get(tool.name()))
+            .unwrap_or_else(|| tool.description())
+            .to_string(),
+        parameters: tool.parameters_schema(),
+    }
+}
+
+pub fn active_tool_specs(
+    tools_registry: &[Box<dyn Tool>],
+    activation_sets: &[&Arc<std::sync::Mutex<ActivatedToolSet>>],
+    excluded_tools: &[String],
+    skills_mode: SkillsPromptInjectionMode,
+    tool_descriptions: Option<&ToolDescriptions>,
+) -> Vec<ToolSpec> {
+    let excluded: HashSet<&str> = excluded_tools.iter().map(String::as_str).collect();
+    let mut specs = Vec::new();
+    let mut seen = HashSet::new();
+
+    for tool in tools_registry {
+        let name = tool.name();
+        let is_activated = activation_sets
+            .iter()
+            .any(|set| set.lock().unwrap().is_activated(name));
+        if excluded.contains(name) || (!is_tool_active_by_default(name, skills_mode) && !is_activated)
+        {
+            continue;
+        }
+
+        seen.insert(name.to_string());
+        specs.push(tool_spec_with_description(tool.as_ref(), tool_descriptions));
+    }
+
+    for set in activation_sets {
+        for spec in set.lock().unwrap().tool_specs() {
+            if excluded.contains(spec.name.as_str()) || !seen.insert(spec.name.clone()) {
+                continue;
+            }
+
+            specs.push(ToolSpec {
+                description: tool_descriptions
+                    .and_then(|descs| descs.get(&spec.name))
+                    .unwrap_or(&spec.description)
+                    .to_string(),
+                ..spec
+            });
+        }
+    }
+
+    specs
 }
 
 /// Create the default tool registry
@@ -763,7 +849,33 @@ pub fn all_tools_with_runtime(
 mod tests {
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig};
+    use async_trait::async_trait;
     use tempfile::TempDir;
+
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: self.0.to_string(),
+                error: None,
+            })
+        }
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         Config {
@@ -1077,6 +1189,61 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
+    }
+
+    #[test]
+    fn active_tool_specs_hide_skill_gated_tools_until_enabled() {
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedTool("shell")),
+            Box::new(NamedTool("web_fetch")),
+            Box::new(NamedTool("read_skill")),
+        ];
+
+        let inactive = active_tool_specs(
+            &tools_registry,
+            &[],
+            &[],
+            SkillsPromptInjectionMode::Compact,
+            None,
+        );
+        let inactive_names: Vec<&str> = inactive.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(inactive_names.contains(&"shell"));
+        assert!(inactive_names.contains(&"read_skill"));
+        assert!(!inactive_names.contains(&"web_fetch"));
+
+        let activated = Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()));
+        activated
+            .lock()
+            .unwrap()
+            .enable_tool_name("web_fetch".to_string());
+        let active = active_tool_specs(
+            &tools_registry,
+            &[&activated],
+            &[],
+            SkillsPromptInjectionMode::Compact,
+            None,
+        );
+        let active_names: Vec<&str> = active.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(active_names.contains(&"web_fetch"));
+    }
+
+    #[test]
+    fn active_tool_specs_hide_read_skill_outside_compact_mode() {
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedTool("shell")),
+            Box::new(NamedTool("read_skill")),
+        ];
+
+        let active = active_tool_specs(
+            &tools_registry,
+            &[],
+            &[],
+            SkillsPromptInjectionMode::Full,
+            None,
+        );
+        let active_names: Vec<&str> = active.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(active_names.contains(&"shell"));
+        assert!(!active_names.contains(&"read_skill"));
     }
 
     #[test]

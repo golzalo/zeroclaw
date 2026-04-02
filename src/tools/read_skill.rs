@@ -31,7 +31,7 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read the full source file for an available skill by name. Use this in compact skills mode when you need the complete skill instructions without remembering file paths."
+        "Read the full source file for an available skill by name. Use this in compact skills mode when you need the complete skill instructions; successful reads also activate any tools mapped to that skill for the current conversation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

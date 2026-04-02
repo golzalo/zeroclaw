@@ -416,6 +416,7 @@ mod tests {
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![crate::skills::SkillTool {
                 name: "release_checklist".into(),
                 description: "Validate release readiness".into(),
@@ -456,6 +457,7 @@ mod tests {
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![crate::skills::SkillTool {
                 name: "release_checklist".into(),
                 description: "Validate release readiness".into(),
@@ -544,6 +546,7 @@ mod tests {
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![crate::skills::SkillTool {
                 name: "run\"linter\"".into(),
                 description: "Run <lint> & report".into(),
