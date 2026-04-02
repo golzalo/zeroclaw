@@ -73,10 +73,6 @@ const ARTIFACT_FILE_EXTENSIONS: &[&str] = &[
 ];
 
 const SCHEDULING_REQUEST_HINTS: &[&str] = &[
-    "agenda",
-    "agend",
-    "calendar",
-    "calendariz",
     "cron",
     "delay",
     "delayed",
@@ -96,10 +92,8 @@ const SCHEDULING_REQUEST_HINTS: &[&str] = &[
 ];
 
 const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
-    "agend",
     "avisar",
     "avisare",
-    "calendar",
     "cumpl",
     "en cuanto se cumpla",
     "i'll send",
@@ -111,9 +105,10 @@ const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
     "llegará",
     "lo recibiras",
     "lo recibirás",
+    "programada",
+    "programado",
     "recibiras",
     "recibirás",
-    "recordatorio",
     "scheduled",
     "te avisare",
     "te avisaré",
@@ -128,10 +123,17 @@ const SCHEDULING_FAILURE_HINTS: &[&str] = &[
     "fallo",
     "falló",
     "failed",
+    "no he programado",
+    "no hay ningun recordatorio",
+    "no hay ningún recordatorio",
+    "no hay ninguna tarea",
     "no pude",
     "no puedo",
+    "no se ha programado",
     "no se pudo",
     "not created",
+    "todavia no he programado",
+    "todavía no he programado",
     "unable",
 ];
 
@@ -490,6 +492,38 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
             }
         })
         .to_string()
+}
+
+fn format_prompt_messages_for_trace(messages: &[ChatMessage]) -> String {
+    let mut formatted = String::new();
+
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            formatted.push('\n');
+        }
+
+        let _ = writeln!(
+            formatted,
+            "[{index}] {}",
+            message.role.to_ascii_uppercase()
+        );
+
+        let scrubbed = scrub_credentials(&message.content)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+
+        if scrubbed.is_empty() {
+            let _ = writeln!(formatted, "  <empty>");
+            continue;
+        }
+
+        for line in scrubbed.split('\n') {
+            let _ = writeln!(formatted, "  {line}");
+        }
+    }
+
+    formatted.trim_end().to_string()
 }
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
@@ -2945,27 +2979,18 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let prompt_messages: Vec<serde_json::Value> = prepared_messages
-            .messages
-            .iter()
-            .map(|message| {
-                serde_json::json!({
-                    "role": message.role,
-                    "content": scrub_credentials(&message.content),
-                })
-            })
-            .collect();
         let prompt_tools: Vec<&str> = request_tools
             .map(|tools| tools.iter().map(|tool| tool.name.as_str()).collect())
             .unwrap_or_default();
+        let prompt_trace = format_prompt_messages_for_trace(&prepared_messages.messages);
         tracing::trace!(
             provider = provider_name,
             model,
             iteration = iteration + 1,
             native_tools = use_native_tools,
-            prompt_messages = ?prompt_messages,
             prompt_tools = ?prompt_tools,
-            "Dispatching prompt to LLM"
+            "Dispatching prompt to LLM\n{}",
+            prompt_trace
         );
 
         let chat_future = provider.chat(
@@ -6754,6 +6779,36 @@ Tail"#;
     }
 
     #[test]
+    fn user_requested_scheduling_ignores_calendar_lookup_requests() {
+        let history = vec![ChatMessage::user(
+            "podrias chequear que eventos tengo en mi agenda hoy?",
+        )];
+
+        assert!(!user_requested_scheduling(&history));
+    }
+
+    #[test]
+    fn response_claims_schedule_success_ignores_calendar_access_explanations() {
+        let response = "No tengo acceso directo a tu agenda real, pero puedo consultar los eventos de hoy en una agenda de demostracion conectada a Google Calendar.";
+
+        assert!(!response_claims_schedule_success(response));
+    }
+
+    #[test]
+    fn response_claims_schedule_success_ignores_unscheduled_denials() {
+        let response = "No se ha programado ningun recordatorio ni tarea en tu agenda real en este momento.";
+
+        assert!(!response_claims_schedule_success(response));
+    }
+
+    #[test]
+    fn response_claims_schedule_success_detects_actual_schedule_confirmation() {
+        let response = "Ya esta programado y te avisare manana.";
+
+        assert!(response_claims_schedule_success(response));
+    }
+
+    #[test]
     fn apply_compaction_summary_replaces_old_segment() {
         let mut history = vec![
             ChatMessage::system("sys"),
@@ -7463,6 +7518,35 @@ Let me check the result."#;
         let input = r#"api_key="short""#;
         let result = scrub_credentials(input);
         assert_eq!(result, input, "short values should not be redacted");
+    }
+
+    #[test]
+    fn format_prompt_messages_for_trace_renders_multiline_content() {
+        let messages = vec![
+            ChatMessage::system("line 1\n\tline 2"),
+            ChatMessage::user(""),
+        ];
+
+        let formatted = format_prompt_messages_for_trace(&messages);
+
+        assert!(formatted.contains("[0] SYSTEM"));
+        assert!(formatted.contains("  line 1"));
+        assert!(
+            formatted.contains("      line 2"),
+            "tabs should be expanded for terminal readability: {formatted}"
+        );
+        assert!(formatted.contains("[1] USER"));
+        assert!(formatted.contains("  <empty>"));
+    }
+
+    #[test]
+    fn format_prompt_messages_for_trace_scrubs_credentials() {
+        let messages = vec![ChatMessage::user(r#"api_key="supersecretvalue""#)];
+
+        let formatted = format_prompt_messages_for_trace(&messages);
+
+        assert!(formatted.contains("[REDACTED]"));
+        assert!(!formatted.contains("supersecretvalue"));
     }
 
     // ─────────────────────────────────────────────────────────────────────
