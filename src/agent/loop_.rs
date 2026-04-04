@@ -508,7 +508,8 @@ fn format_prompt_messages_for_trace(messages: &[ChatMessage]) -> String {
             message.role.to_ascii_uppercase()
         );
 
-        let scrubbed = scrub_credentials(&message.content)
+        let scrubbed = scrub_credentials(&message.content);
+        let scrubbed = unescape_trace_text(&scrubbed)
             .replace("\r\n", "\n")
             .replace('\r', "\n")
             .replace('\t', "    ");
@@ -524,6 +525,35 @@ fn format_prompt_messages_for_trace(messages: &[ChatMessage]) -> String {
     }
 
     formatted.trim_end().to_string()
+}
+
+fn unescape_trace_text(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('0') => output.push('\0'),
+            Some('\\') => output.push('\\'),
+            Some('"') => output.push('"'),
+            Some('\'') => output.push('\''),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+
+    output
 }
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
@@ -7803,6 +7833,20 @@ Let me check the result."#;
         );
         assert!(formatted.contains("[1] USER"));
         assert!(formatted.contains("  <empty>"));
+    }
+
+    #[test]
+    fn format_prompt_messages_for_trace_unescapes_visible_sequences() {
+        let messages = vec![ChatMessage::system("line 1\\n\\tline 2")];
+
+        let formatted = format_prompt_messages_for_trace(&messages);
+
+        assert!(formatted.contains("[0] SYSTEM"));
+        assert!(formatted.contains("  line 1"));
+        assert!(
+            formatted.contains("      line 2"),
+            "escaped tab should be expanded for terminal readability: {formatted}"
+        );
     }
 
     #[test]
