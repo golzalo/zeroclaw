@@ -24,7 +24,7 @@ impl Tool for ModelSwitchTool {
     }
 
     fn description(&self) -> &str {
-        "Switch the AI model at runtime. Use 'get' to see current model, 'list_providers' to see available providers, 'list_models' to see models for a provider, or 'set' to switch to a different model. The switch takes effect immediately for the current conversation."
+        "Switch the AI model at runtime. Use 'get' to see current model, 'list_providers' to see available providers, 'list_models' to see models for a provider, or 'set' to switch to a different model. The switch takes effect before the next model response in the current conversation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -152,7 +152,7 @@ impl ModelSwitchTool {
                 "message": "Model switch requested",
                 "provider": provider,
                 "model": model,
-                "note": "The agent will switch to this model on the next turn. Use 'get' to check pending switch."
+                "note": "The agent will switch before the next model response in this conversation. Use 'get' to check pending switch."
             }))?,
             error: None,
         })

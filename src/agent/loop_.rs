@@ -1063,6 +1063,8 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     let tool_call_id = parse_tool_call_id(value, None);
     let name = value
         .get("name")
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("tool_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
@@ -1072,8 +1074,13 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments =
-        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
+    let arguments = parse_arguments_value(
+        value
+            .get("arguments")
+            .or_else(|| value.get("parameters"))
+            .or_else(|| value.get("args"))
+            .or_else(|| value.get("params")),
+    );
     Some(ParsedToolCall {
         name,
         arguments,
@@ -2699,6 +2706,23 @@ pub(crate) fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, 
         .next()
 }
 
+fn pending_model_switch_request(
+    callback: Option<&ModelSwitchCallback>,
+    provider_name: &str,
+    model: &str,
+) -> Option<ModelSwitchRequested> {
+    let callback = callback?;
+    let guard = callback.lock().ok()?;
+    let (new_provider, new_model) = guard.as_ref()?;
+    if new_provider == provider_name && new_model == model {
+        return None;
+    }
+    Some(ModelSwitchRequested {
+        provider: new_provider.clone(),
+        model: new_model.clone(),
+    })
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -3113,26 +3137,20 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        // Check if model switch was requested via model_switch tool
-        if let Some(ref callback) = model_switch_callback {
-            if let Ok(guard) = callback.lock() {
-                if let Some((new_provider, new_model)) = guard.as_ref() {
-                    if new_provider != provider_name || new_model != model {
-                        tracing::info!(
-                            "Model switch detected: {} {} -> {} {}",
-                            provider_name,
-                            model,
-                            new_provider,
-                            new_model
-                        );
-                        return Err(ModelSwitchRequested {
-                            provider: new_provider.clone(),
-                            model: new_model.clone(),
-                        }
-                        .into());
-                    }
-                }
-            }
+        // Check if model switch was requested via model_switch tool.
+        // This lets a pending request from the previous iteration rebind the
+        // provider before we send another LLM request on the old model.
+        if let Some(requested_switch) =
+            pending_model_switch_request(model_switch_callback.as_ref(), provider_name, model)
+        {
+            tracing::info!(
+                "Model switch detected: {} {} -> {} {}",
+                provider_name,
+                model,
+                requested_switch.provider,
+                requested_switch.model
+            );
+            return Err(requested_switch.into());
         }
 
         // Rebuild tool_specs each iteration so newly activated deferred tools appear.
@@ -3890,6 +3908,23 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        // A model switch can be requested by a tool in the same batch as file
+        // edits or capture work. Re-check after persisting this iteration's
+        // assistant/tool history so the outer loop can immediately rebind the
+        // provider before the next model response, without losing progress.
+        if let Some(requested_switch) =
+            pending_model_switch_request(model_switch_callback.as_ref(), provider_name, model)
+        {
+            tracing::info!(
+                "Model switch detected after tool execution: {} {} -> {} {}",
+                provider_name,
+                model,
+                requested_switch.provider,
+                requested_switch.model
+            );
+            return Err(requested_switch.into());
         }
     }
 
@@ -5241,6 +5276,54 @@ mod tests {
         }
     }
 
+    struct SwitchModelTool {
+        provider: String,
+        model: String,
+    }
+
+    impl SwitchModelTool {
+        fn new(provider: &str, model: &str) -> Self {
+            Self {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for SwitchModelTool {
+        fn name(&self) -> &str {
+            "switch_model"
+        }
+
+        fn description(&self) -> &str {
+            "Requests a model switch for loop regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let switch_state = get_model_switch_state();
+            *switch_state
+                .lock()
+                .expect("model switch state lock should be valid") =
+                Some((self.provider.clone(), self.model.clone()));
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!("requested:{}:{}", self.provider, self.model),
+                error: None,
+            })
+        }
+    }
+
     struct DelayTool {
         name: String,
         delay_ms: u64,
@@ -5655,6 +5738,74 @@ mod tests {
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_surfaces_model_switch_after_tool_execution() {
+        clear_model_switch_request();
+
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"switch_model","arguments":{}}
+</tool_call>"#,
+            "this second response should never be used",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(SwitchModelTool::new("openai", "gpt-5.4"))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("switch now"),
+        ];
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "openai",
+            "gpt-5.1",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            Some(get_model_switch_state()),
+        )
+        .await
+        .expect_err("model switch should interrupt the loop before another LLM response");
+
+        let (new_provider, new_model) =
+            is_model_switch_requested(&err).expect("error should carry requested model switch");
+        assert_eq!(new_provider, "openai");
+        assert_eq!(new_model, "gpt-5.4");
+        assert!(
+            history.iter().any(|message| {
+                message.role == "assistant"
+                    && message.content.contains("\"name\":\"switch_model\"")
+            }),
+            "assistant tool-call history should be preserved before switching"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message.role == "user" && message.content.contains("requested:openai:gpt-5.4")),
+            "tool results should be preserved before switching"
+        );
+
+        clear_model_switch_request();
     }
 
     #[tokio::test]
@@ -6416,6 +6567,22 @@ After text."#;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "file_read");
         assert_eq!(calls[1].name, "file_read");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_and_args_aliases() {
+        let response = r#"<tool_call>
+{"tool":"shell","args":{"command":"pwd"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(serde_json::Value::as_str),
+            Some("pwd")
+        );
     }
 
     #[test]
