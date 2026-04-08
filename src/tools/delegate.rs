@@ -618,6 +618,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         agents.insert(
@@ -634,6 +636,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         agents
@@ -789,6 +793,8 @@ mod tests {
             max_iterations,
             timeout_secs: None,
             agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
         }
     }
 
@@ -899,6 +905,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1007,6 +1015,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1044,6 +1054,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1335,6 +1347,8 @@ mod tests {
             max_iterations: 10,
             timeout_secs: None,
             agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -1416,6 +1430,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: Some(0),
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -1468,6 +1484,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: Some(7200),
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -1542,6 +1560,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         assert!(config.validate().is_ok());

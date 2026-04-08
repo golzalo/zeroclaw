@@ -1108,6 +1108,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
 
