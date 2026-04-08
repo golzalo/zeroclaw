@@ -511,6 +511,14 @@ pub struct DelegateAgentConfig {
     /// When `None`, falls back to `[delegate].agentic_timeout_secs` (default: 300).
     #[serde(default)]
     pub agentic_timeout_secs: Option<u64>,
+    /// Skills to pre-load into the sub-agent context at spawn time (by name,
+    /// resolved from workspace/skills/). Eliminates bootstrap read_skill calls.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Workspace-relative file paths to pre-load into the sub-agent context
+    /// at spawn time (e.g. "MEMORY.md"). Eliminates bootstrap file_read calls.
+    #[serde(default)]
+    pub context_files: Vec<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
