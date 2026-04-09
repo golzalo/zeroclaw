@@ -3701,14 +3701,6 @@ pub fn build_system_prompt_with_mode_and_autonomy(
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
-    let mut append_extra_context_files = |max_chars: usize| {
-        if extra_context_files.is_empty() {
-            return;
-        }
-        for filename in extra_context_files {
-            inject_workspace_file(&mut prompt, workspace_dir, filename, max_chars);
-        }
-    };
 
     // ── 0. Anti-narration (top priority) ───────────────────────
     prompt.push_str(
@@ -3839,14 +3831,24 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         prompt.push_str("\n\n");
                     }
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    append_extra_context_files(max_chars);
+                    append_extra_context_files(
+                        &mut prompt,
+                        workspace_dir,
+                        extra_context_files,
+                        max_chars,
+                    );
                 }
                 Ok(None) => {
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
                     // Fall back to OpenClaw bootstrap files
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
                     load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-                    append_extra_context_files(max_chars);
+                    append_extra_context_files(
+                        &mut prompt,
+                        workspace_dir,
+                        extra_context_files,
+                        max_chars,
+                    );
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
@@ -3855,20 +3857,35 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                     );
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
                     load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-                    append_extra_context_files(max_chars);
+                    append_extra_context_files(
+                        &mut prompt,
+                        workspace_dir,
+                        extra_context_files,
+                        max_chars,
+                    );
                 }
             }
         } else {
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
             load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-            append_extra_context_files(max_chars);
+            append_extra_context_files(
+                &mut prompt,
+                workspace_dir,
+                extra_context_files,
+                max_chars,
+            );
         }
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
         load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-        append_extra_context_files(max_chars);
+        append_extra_context_files(
+            &mut prompt,
+            workspace_dir,
+            extra_context_files,
+            max_chars,
+        );
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -3962,6 +3979,20 @@ fn inject_workspace_file(
             // Missing-file marker (matches OpenClaw behavior)
             let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
         }
+    }
+}
+
+fn append_extra_context_files(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    extra_context_files: &[String],
+    max_chars: usize,
+) {
+    if extra_context_files.is_empty() {
+        return;
+    }
+    for filename in extra_context_files {
+        inject_workspace_file(prompt, workspace_dir, filename, max_chars);
     }
 }
 
