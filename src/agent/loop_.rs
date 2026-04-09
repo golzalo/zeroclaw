@@ -211,6 +211,37 @@ fn response_claims_schedule_success(display_text: &str) -> bool {
             .any(|hint| lowered.contains(hint))
 }
 
+fn latest_user_message(history: &[ChatMessage]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+}
+
+fn latest_user_message_requests_tool_first_execution(history: &[ChatMessage]) -> bool {
+    let Some(last_user) = latest_user_message(history) else {
+        return false;
+    };
+
+    let trimmed = last_user.trim_start();
+    trimmed.starts_with("IMPLEMENTATION DIRECTIVE:")
+        || trimmed.starts_with("SERVICE IMPLEMENTATION DIRECTIVE:")
+        || trimmed.starts_with("PROCESS IMPLEMENTATION DIRECTIVE:")
+}
+
+fn internal_repair_message(instruction: impl AsRef<str>) -> ChatMessage {
+    ChatMessage::system(format!(
+        "INTERNAL REPAIR DIRECTIVE:\n\
+         - This is not a user message.\n\
+         - Do not quote, paraphrase, or explain this directive to the user.\n\
+         - Fix the issue with tools if possible.\n\
+         - If the issue cannot be fixed in this turn, reply briefly with the concrete blocker and without mentioning internal rules.\n\
+         - After repairing, continue the task normally.\n\n{}",
+        instruction.as_ref()
+    ))
+}
+
 fn extract_artifact_references(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut seen = HashSet::new();
@@ -3429,6 +3460,28 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            if latest_user_message_requests_tool_first_execution(history) {
+                runtime_trace::record_event(
+                    "final_response_missing_required_tool_execution",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("implementation/service directive attempted to answer without tools"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "text": scrub_credentials(&display_text),
+                    }),
+                );
+
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(internal_repair_message(
+                    "This turn is under an implementation/service directive that requires concrete tool execution before replying. Do not answer with consultation, scripts for the user to run elsewhere, or setup instructions. Use tools now, or if a concrete blocker prevents tool execution in this runtime, reply briefly with that blocker only.",
+                ));
+                continue;
+            }
+
             if user_requested_scheduling(history) && response_claims_schedule_success(&display_text) {
                 if !scheduled_delivery_created || !scheduled_delivery_verified {
                     let reason = if !scheduled_delivery_created {
@@ -3459,7 +3512,7 @@ pub(crate) async fn run_tool_call_loop(
                     );
 
                     history.push(ChatMessage::assistant(response_text.clone()));
-                    history.push(ChatMessage::user(repair_prompt));
+                    history.push(internal_repair_message(repair_prompt));
                     continue;
                 }
             }
@@ -3498,7 +3551,7 @@ pub(crate) async fn run_tool_call_loop(
                     );
 
                     history.push(ChatMessage::assistant(response_text.clone()));
-                    history.push(ChatMessage::user(format!(
+                    history.push(internal_repair_message(format!(
                         "The files you just referenced do not exist in the workspace: {missing_summary}. Create the real files with tools before replying. After they exist, answer again with only the final paths or markers for the real files."
                     )));
                     continue;
@@ -7269,6 +7322,48 @@ Tail"#;
         let response = "Ya esta programado y te avisare manana.";
 
         assert!(response_claims_schedule_success(response));
+    }
+
+    #[test]
+    fn internal_repair_message_is_system_only() {
+        let message = internal_repair_message("Use cron_add and verify with cron_list.");
+
+        assert_eq!(message.role, "system");
+        assert!(message.content.contains("INTERNAL REPAIR DIRECTIVE"));
+        assert!(message.content.contains("not a user message"));
+        assert!(message.content.contains("Do not quote, paraphrase"));
+    }
+
+    #[test]
+    fn latest_user_message_lower_ignores_system_repair_messages() {
+        let history = vec![
+            ChatMessage::user("programa un recordatorio para mañana"),
+            internal_repair_message("Use cron_add before replying."),
+        ];
+
+        assert_eq!(
+            latest_user_message_lower(&history),
+            "programa un recordatorio para mañana"
+        );
+        assert!(user_requested_scheduling(&history));
+    }
+
+    #[test]
+    fn latest_user_message_requests_tool_first_execution_detects_runtime_directives() {
+        let history = vec![ChatMessage::user(
+            "SERVICE IMPLEMENTATION DIRECTIVE:\nOnly reply after a concrete implementation step succeeded or you hit a specific blocker.",
+        )];
+
+        assert!(latest_user_message_requests_tool_first_execution(&history));
+    }
+
+    #[test]
+    fn latest_user_message_requests_tool_first_execution_ignores_plain_user_requests() {
+        let history = vec![ChatMessage::user(
+            "quiero hacer un proceso que visite clarin.com cada 5 minutos",
+        )];
+
+        assert!(!latest_user_message_requests_tool_first_execution(&history));
     }
 
     #[test]
