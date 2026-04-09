@@ -27,6 +27,8 @@ pub struct Skill {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
+    pub requires_tools: Vec<String>,
+    #[serde(default)]
     pub tools: Vec<SkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
@@ -67,6 +69,8 @@ struct SkillMeta {
     author: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    requires_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -77,6 +81,8 @@ struct SkillMarkdownMeta {
     author: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    requires_tools: Vec<String>,
 }
 
 fn default_version() -> String {
@@ -509,6 +515,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         version: manifest.skill.version,
         author: manifest.skill.author,
         tags: manifest.skill.tags,
+        requires_tools: manifest.skill.requires_tools,
         tools: manifest.tools,
         prompts: manifest.prompts,
         location: Some(path.to_path_buf()),
@@ -535,6 +542,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         version: parsed.meta.version.unwrap_or_else(default_version),
         author: parsed.meta.author,
         tags: parsed.meta.tags,
+        requires_tools: parsed.meta.requires_tools,
         tools: Vec::new(),
         prompts: vec![parsed.body],
         location: Some(path.to_path_buf()),
@@ -574,6 +582,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
             .author
             .or_else(|| Some("besoeasy/open-skills".to_string())),
         tags: parsed.meta.tags,
+        requires_tools: parsed.meta.requires_tools,
         tools: Vec::new(),
         prompts: vec![parsed.body],
         location: Some(path.to_path_buf()),
@@ -697,7 +706,7 @@ pub fn skills_to_prompt_with_mode(
         crate::config::SkillsPromptInjectionMode::Compact => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
+             Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file or need to activate that skill's mapped tools for this conversation.\n\
              The `location` field is included for reference.\n\n\
              <available_skills>\n",
         ),
@@ -713,6 +722,13 @@ pub fn skills_to_prompt_with_mode(
             matches!(mode, crate::config::SkillsPromptInjectionMode::Compact),
         );
         write_xml_text_element(&mut prompt, 4, "location", &location);
+        if !skill.requires_tools.is_empty() {
+            let _ = writeln!(prompt, "    <activates_tools>");
+            for tool_name in &skill.requires_tools {
+                write_xml_text_element(&mut prompt, 6, "tool", tool_name);
+            }
+            let _ = writeln!(prompt, "    </activates_tools>");
+        }
 
         // In Full mode, inline both instructions and tools.
         // In Compact mode, skip instructions (loaded on demand) but keep tools
@@ -769,7 +785,8 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
              description = \"What this skill does\"\n\
              version = \"0.1.0\"\n\
              author = \"your-name\"\n\
-             tags = [\"productivity\", \"automation\"]\n\n\
+             tags = [\"productivity\", \"automation\"]\n\
+             requires_tools = [\"web_fetch\"]\n\n\
              [[tools]]\n\
              name = \"my_tool\"\n\
              description = \"What this tool does\"\n\
@@ -778,7 +795,7 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
              ```\n\n\
              ## SKILL.md format (simpler)\n\n\
              Just write a markdown file with instructions for the agent.\n\
-             Optional YAML frontmatter is supported for `name`, `description`, `version`, `author`, and `tags`.\n\
+             Optional YAML frontmatter is supported for `name`, `description`, `version`, `author`, `tags`, and `requires_tools`.\n\
              The agent will read it and follow the instructions.\n\n\
              ## Installing community skills\n\n\
              ```bash\n\
@@ -1204,6 +1221,7 @@ name = "test-skill"
 description = "A test skill"
 version = "1.0.0"
 tags = ["test"]
+requires_tools = ["web_fetch", "cron_add"]
 
 [[tools]]
 name = "hello"
@@ -1217,6 +1235,7 @@ command = "echo hello"
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "test-skill");
+        assert_eq!(skills[0].requires_tools, vec!["web_fetch", "cron_add"]);
         assert_eq!(skills[0].tools.len(), 1);
         assert_eq!(skills[0].tools[0].name, "hello");
     }
@@ -1249,7 +1268,7 @@ command = "echo hello"
 
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: pdf\ndescription: Use this skill for PDFs\nversion: 1.2.3\nauthor: maintainer\ntags:\n  - docs\n  - pdf\n---\n# PDF Processing Guide\nExtract text carefully.\n",
+            "---\nname: pdf\ndescription: Use this skill for PDFs\nversion: 1.2.3\nauthor: maintainer\ntags:\n  - docs\n  - pdf\nrequires_tools:\n  - pdf_read\n  - image_info\n---\n# PDF Processing Guide\nExtract text carefully.\n",
         )
         .unwrap();
 
@@ -1260,6 +1279,7 @@ command = "echo hello"
         assert_eq!(skills[0].version, "1.2.3");
         assert_eq!(skills[0].author.as_deref(), Some("maintainer"));
         assert_eq!(skills[0].tags, vec!["docs", "pdf"]);
+        assert_eq!(skills[0].requires_tools, vec!["pdf_read", "image_info"]);
         assert!(skills[0].prompts[0].contains("# PDF Processing Guide"));
         assert!(!skills[0].prompts[0].contains("name: pdf"));
     }
@@ -1278,6 +1298,7 @@ command = "echo hello"
             version: "1.0.0".to_string(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![],
             prompts: vec!["Do the thing.".to_string()],
             location: None,
@@ -1296,6 +1317,7 @@ command = "echo hello"
             version: "1.0.0".to_string(),
             author: None,
             tags: vec![],
+            requires_tools: vec!["web_fetch".to_string()],
             tools: vec![SkillTool {
                 name: "run".to_string(),
                 description: "Run task".to_string(),
@@ -1317,6 +1339,9 @@ command = "echo hello"
         assert!(prompt.contains("<location>skills/test/SKILL.md</location>"));
         assert!(prompt.contains("loaded on demand"));
         assert!(prompt.contains("read_skill(name)"));
+        assert!(prompt.contains("activate that skill's mapped tools"));
+        assert!(prompt.contains("<activates_tools>"));
+        assert!(prompt.contains("<tool>web_fetch</tool>"));
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
         // Compact mode should still include tools so the LLM knows about them
@@ -1500,6 +1525,7 @@ description = "Bare minimum"
             version: "1.0.0".to_string(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![SkillTool {
                 name: "get_weather".to_string(),
                 description: "Fetch forecast".to_string(),
@@ -1525,6 +1551,7 @@ description = "Bare minimum"
             version: "1.0.0".to_string(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![],
             prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
             location: None,

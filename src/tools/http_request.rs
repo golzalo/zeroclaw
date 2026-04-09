@@ -249,6 +249,8 @@ impl Tool for HttpRequestTool {
 
         let request_headers = self.parse_headers(&headers_val);
 
+        tracing::info!(method = method_str, url = %url, "http_request");
+
         match self
             .execute_request(&url, method, request_headers, body)
             .await
@@ -256,6 +258,8 @@ impl Tool for HttpRequestTool {
             Ok(response) => {
                 let status = response.status();
                 let status_code = status.as_u16();
+
+                tracing::info!(method = method_str, url = %url, status = status_code, "http_request done");
 
                 // Get response headers (redact sensitive ones)
                 let response_headers = response.headers().iter();
@@ -295,11 +299,14 @@ impl Tool for HttpRequestTool {
                     },
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("HTTP request failed: {e}")),
-            }),
+            Err(e) => {
+                tracing::warn!(method = method_str, url = %url, error = %e, "http_request failed");
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("HTTP request failed: {e}")),
+                })
+            }
         }
     }
 }

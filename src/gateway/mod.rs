@@ -50,8 +50,9 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request timeout (15m) — long-running agentic webhook turns may perform
+/// capture, delegated coding, builds, and publish steps before responding.
+pub const REQUEST_TIMEOUT_SECS: u64 = 900;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -1019,6 +1020,8 @@ async fn run_gateway_chat_with_tools(
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    #[serde(default)]
+    pub agentic: bool,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -1079,7 +1082,7 @@ async fn handle_webhook(
         Err(e) => {
             tracing::warn!("Webhook JSON parse error: {e}");
             let err = serde_json::json!({
-                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
+                "error": "Invalid JSON body. Expected: {\"message\": \"...\"} (optional: \"agentic\": true)"
             });
             return (StatusCode::BAD_REQUEST, Json(err));
         }
@@ -1142,7 +1145,13 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, message).await {
+    let response_result = if webhook_body.agentic {
+        run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await
+    } else {
+        run_gateway_chat_simple(&state, message).await
+    };
+
+    match response_result {
         Ok(response) => {
             let duration = started_at.elapsed();
             state

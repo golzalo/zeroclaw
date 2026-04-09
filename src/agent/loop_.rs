@@ -14,7 +14,7 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -73,10 +73,6 @@ const ARTIFACT_FILE_EXTENSIONS: &[&str] = &[
 ];
 
 const SCHEDULING_REQUEST_HINTS: &[&str] = &[
-    "agenda",
-    "agend",
-    "calendar",
-    "calendariz",
     "cron",
     "delay",
     "delayed",
@@ -96,10 +92,8 @@ const SCHEDULING_REQUEST_HINTS: &[&str] = &[
 ];
 
 const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
-    "agend",
     "avisar",
     "avisare",
-    "calendar",
     "cumpl",
     "en cuanto se cumpla",
     "i'll send",
@@ -111,9 +105,10 @@ const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
     "llegará",
     "lo recibiras",
     "lo recibirás",
+    "programada",
+    "programado",
     "recibiras",
     "recibirás",
-    "recordatorio",
     "scheduled",
     "te avisare",
     "te avisaré",
@@ -128,10 +123,17 @@ const SCHEDULING_FAILURE_HINTS: &[&str] = &[
     "fallo",
     "falló",
     "failed",
+    "no he programado",
+    "no hay ningun recordatorio",
+    "no hay ningún recordatorio",
+    "no hay ninguna tarea",
     "no pude",
     "no puedo",
+    "no se ha programado",
     "no se pudo",
     "not created",
+    "todavia no he programado",
+    "todavía no he programado",
     "unable",
 ];
 
@@ -492,6 +494,68 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+fn format_prompt_messages_for_trace(messages: &[ChatMessage]) -> String {
+    let mut formatted = String::new();
+
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            formatted.push('\n');
+        }
+
+        let _ = writeln!(
+            formatted,
+            "[{index}] {}",
+            message.role.to_ascii_uppercase()
+        );
+
+        let scrubbed = scrub_credentials(&message.content);
+        let scrubbed = unescape_trace_text(&scrubbed)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+
+        if scrubbed.is_empty() {
+            let _ = writeln!(formatted, "  <empty>");
+            continue;
+        }
+
+        for line in scrubbed.split('\n') {
+            let _ = writeln!(formatted, "  {line}");
+        }
+    }
+
+    formatted.trim_end().to_string()
+}
+
+fn unescape_trace_text(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('0') => output.push('\0'),
+            Some('\\') => output.push('\\'),
+            Some('"') => output.push('"'),
+            Some('\'') => output.push('\''),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+
+    output
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -812,6 +876,114 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+fn extract_read_skill_name(arguments: &serde_json::Value) -> Option<String> {
+    arguments
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+pub(crate) fn activate_skill_tool_requirements(
+    skill_name: &str,
+    skills: &[crate::skills::Skill],
+    tools_registry: &[Box<dyn Tool>],
+    skill_activations: &Arc<Mutex<crate::tools::ActivatedToolSet>>,
+) -> Vec<String> {
+    let Some(skill) = skills
+        .iter()
+        .find(|skill| skill.name.eq_ignore_ascii_case(skill_name))
+    else {
+        tracing::warn!(skill = skill_name, "Skipping activation for unknown skill");
+        return Vec::new();
+    };
+
+    let available_tool_names: HashSet<&str> = tools_registry.iter().map(|tool| tool.name()).collect();
+    let mut activated = skill_activations.lock().unwrap_or_else(|e| e.into_inner());
+    activated.activate_skill(skill.name.clone());
+
+    let mut activated_tool_names = Vec::new();
+    for tool_name in &skill.requires_tools {
+        if !available_tool_names.contains(tool_name.as_str()) {
+            tracing::warn!(
+                skill = skill.name,
+                tool = tool_name,
+                "Skipping skill-required tool that is not registered in this runtime"
+            );
+            continue;
+        }
+        if !activated.is_activated(tool_name) {
+            activated_tool_names.push(tool_name.clone());
+        }
+        activated.enable_tool_name(tool_name.clone());
+    }
+
+    activated_tool_names
+}
+
+pub(crate) fn restore_skill_activations_from_history(
+    history: &[ChatMessage],
+    skills: &[crate::skills::Skill],
+    tools_registry: &[Box<dyn Tool>],
+    skill_activations: &Arc<Mutex<crate::tools::ActivatedToolSet>>,
+) {
+    let mut pending_reads: HashMap<String, String> = HashMap::new();
+    let mut restored_skills = HashSet::new();
+
+    for message in history {
+        match message.role.as_str() {
+            "assistant" => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+                    continue;
+                };
+
+                for call in parse_tool_calls_from_json_value(&value) {
+                    if call.name != "read_skill" {
+                        continue;
+                    }
+                    let Some(tool_call_id) = call.tool_call_id else {
+                        continue;
+                    };
+                    let Some(skill_name) = extract_read_skill_name(&call.arguments) else {
+                        continue;
+                    };
+                    pending_reads.insert(tool_call_id, skill_name);
+                }
+            }
+            "tool" => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+                    continue;
+                };
+                let Some(tool_call_id) = value
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                let Some(skill_name) = pending_reads.remove(tool_call_id) else {
+                    continue;
+                };
+                let result_content = value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if result_content.starts_with("Error:") {
+                    continue;
+                }
+                restored_skills.insert(skill_name);
+            }
+            _ => {}
+        }
+    }
+
+    for skill_name in restored_skills {
+        activate_skill_tool_requirements(&skill_name, skills, tools_registry, skill_activations);
+    }
+}
+
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
@@ -891,6 +1063,8 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     let tool_call_id = parse_tool_call_id(value, None);
     let name = value
         .get("name")
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("tool_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
@@ -900,8 +1074,13 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments =
-        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
+    let arguments = parse_arguments_value(
+        value
+            .get("arguments")
+            .or_else(|| value.get("parameters"))
+            .or_else(|| value.get("args"))
+            .or_else(|| value.get("params")),
+    );
     Some(ParsedToolCall {
         name,
         arguments,
@@ -2235,6 +2414,86 @@ fn strip_tool_result_blocks(text: &str) -> String {
     result.trim().to_string()
 }
 
+fn render_tools_prompt_section(tool_specs: &[crate::tools::ToolSpec]) -> String {
+    if tool_specs.is_empty() {
+        return String::new();
+    }
+
+    let mut prompt = String::from("## Tools\n\n");
+    prompt.push_str("You have access to the following tools:\n\n");
+    for tool in tool_specs {
+        let _ = writeln!(prompt, "- **{}**: {}", tool.name, tool.description);
+    }
+    prompt.push('\n');
+    prompt
+}
+
+fn replace_prompt_section(
+    base_prompt: &str,
+    header: &str,
+    next_headers: &[&str],
+    replacement: Option<&str>,
+) -> String {
+    let Some(start) = base_prompt.find(header) else {
+        return match replacement {
+            Some(content) if !content.is_empty() => format!("{base_prompt}\n\n{content}"),
+            _ => base_prompt.to_string(),
+        };
+    };
+
+    let section_end = next_headers
+        .iter()
+        .filter_map(|next_header| base_prompt[start + header.len()..].find(next_header))
+        .map(|offset| start + header.len() + offset)
+        .min()
+        .unwrap_or(base_prompt.len());
+
+    let tail = base_prompt[section_end..]
+        .strip_prefix("\n\n")
+        .unwrap_or(&base_prompt[section_end..]);
+
+    let mut refreshed = String::new();
+    refreshed.push_str(&base_prompt[..start]);
+    if let Some(content) = replacement.filter(|content| !content.is_empty()) {
+        refreshed.push_str(content);
+        if !tail.is_empty() {
+            refreshed.push_str("\n\n");
+        }
+    }
+    refreshed.push_str(tail);
+    refreshed
+}
+
+fn refresh_system_prompt_tool_sections(
+    base_prompt: &str,
+    tool_specs: &[crate::tools::ToolSpec],
+    native_tools: bool,
+) -> String {
+    let prompt = replace_prompt_section(
+        base_prompt,
+        "## Tools\n\n",
+        &["## Hardware Access\n\n", "## Your Task\n\n"],
+        Some(&render_tools_prompt_section(tool_specs)),
+    );
+
+    if native_tools {
+        replace_prompt_section(
+            &prompt,
+            "## Tool Use Protocol\n\n",
+            &["<available-deferred-tools>\n"],
+            None,
+        )
+    } else {
+        let instructions = build_tool_instructions(tool_specs);
+        replace_prompt_section(
+            &prompt,
+            "## Tool Use Protocol\n\n",
+            &["<available-deferred-tools>\n"],
+            Some(&instructions),
+        )
+    }
+}
+
 fn detect_tool_call_parse_issue(response: &str, parsed_calls: &[ParsedToolCall]) -> Option<String> {
     if !parsed_calls.is_empty() {
         return None;
@@ -2447,6 +2706,23 @@ pub(crate) fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, 
         .next()
 }
 
+fn pending_model_switch_request(
+    callback: Option<&ModelSwitchCallback>,
+    provider_name: &str,
+    model: &str,
+) -> Option<ModelSwitchRequested> {
+    let callback = callback?;
+    let guard = callback.lock().ok()?;
+    let (new_provider, new_model) = guard.as_ref()?;
+    if new_provider == provider_name && new_model == model {
+        return None;
+    }
+    Some(ModelSwitchRequested {
+        provider: new_provider.clone(),
+        model: new_model.clone(),
+    })
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -2455,6 +2731,9 @@ pub(crate) async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
+    skills: &[crate::skills::Skill],
+    tool_descriptions: Option<&ToolDescriptions>,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -2468,12 +2747,16 @@ pub(crate) async fn agent_turn(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    skill_activations: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
         history,
         tools_registry,
+        skills,
+        tool_descriptions,
+        skills_prompt_mode,
         observer,
         provider_name,
         model,
@@ -2490,6 +2773,7 @@ pub(crate) async fn agent_turn(
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
+        skill_activations,
         model_switch_callback,
     )
     .await
@@ -2811,6 +3095,9 @@ pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
+    skills: &[crate::skills::Skill],
+    tool_descriptions: Option<&ToolDescriptions>,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -2827,6 +3114,7 @@ pub(crate) async fn run_tool_call_loop(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    skill_activations: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
@@ -2849,42 +3137,45 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        // Check if model switch was requested via model_switch tool
-        if let Some(ref callback) = model_switch_callback {
-            if let Ok(guard) = callback.lock() {
-                if let Some((new_provider, new_model)) = guard.as_ref() {
-                    if new_provider != provider_name || new_model != model {
-                        tracing::info!(
-                            "Model switch detected: {} {} -> {} {}",
-                            provider_name,
-                            model,
-                            new_provider,
-                            new_model
-                        );
-                        return Err(ModelSwitchRequested {
-                            provider: new_provider.clone(),
-                            model: new_model.clone(),
-                        }
-                        .into());
-                    }
-                }
-            }
+        // Check if model switch was requested via model_switch tool.
+        // This lets a pending request from the previous iteration rebind the
+        // provider before we send another LLM request on the old model.
+        if let Some(requested_switch) =
+            pending_model_switch_request(model_switch_callback.as_ref(), provider_name, model)
+        {
+            tracing::info!(
+                "Model switch detected: {} {} -> {} {}",
+                provider_name,
+                model,
+                requested_switch.provider,
+                requested_switch.model
+            );
+            return Err(requested_switch.into());
         }
 
         // Rebuild tool_specs each iteration so newly activated deferred tools appear.
-        let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-            .iter()
-            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-            .map(|tool| tool.spec())
-            .collect();
-        if let Some(at) = activated_tools {
-            for spec in at.lock().unwrap().tool_specs() {
-                if !excluded_tools.iter().any(|ex| ex == &spec.name) {
-                    tool_specs.push(spec);
-                }
-            }
-        }
+        let activation_sets = [activated_tools, skill_activations]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let activated_skill_names = skill_activations
+            .map(|set| set.lock().unwrap().activated_skill_names())
+            .unwrap_or_default();
+        let tool_specs = crate::tools::active_tool_specs(
+            tools_registry,
+            &activation_sets,
+            excluded_tools,
+            skills_prompt_mode,
+            tool_descriptions,
+        );
         let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+        if let Some(system_prompt) = history.first_mut().filter(|message| message.role == "system") {
+            system_prompt.content = refresh_system_prompt_tool_sections(
+                &system_prompt.content,
+                &tool_specs,
+                use_native_tools,
+            );
+        }
 
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
@@ -2927,6 +3218,11 @@ pub(crate) async fn run_tool_call_loop(
             serde_json::json!({
                 "iteration": iteration + 1,
                 "messages_count": history.len(),
+                "prompt_tools": tool_specs
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect::<Vec<_>>(),
+                "activated_skills": activated_skill_names,
             }),
         );
 
@@ -2945,27 +3241,19 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let prompt_messages: Vec<serde_json::Value> = prepared_messages
-            .messages
-            .iter()
-            .map(|message| {
-                serde_json::json!({
-                    "role": message.role,
-                    "content": scrub_credentials(&message.content),
-                })
-            })
-            .collect();
         let prompt_tools: Vec<&str> = request_tools
             .map(|tools| tools.iter().map(|tool| tool.name.as_str()).collect())
             .unwrap_or_default();
+        let prompt_trace = format_prompt_messages_for_trace(&prepared_messages.messages);
         tracing::trace!(
             provider = provider_name,
             model,
             iteration = iteration + 1,
             native_tools = use_native_tools,
-            prompt_messages = ?prompt_messages,
+            activated_skills = ?activated_skill_names,
             prompt_tools = ?prompt_tools,
-            "Dispatching prompt to LLM"
+            "Dispatching prompt to LLM\n{}",
+            prompt_trace
         );
 
         let chat_future = provider.chat(
@@ -3510,6 +3798,24 @@ pub(crate) async fn run_tool_call_loop(
                 if call.name == "cron_list" {
                     scheduled_delivery_verified = true;
                 }
+                if call.name == "read_skill" {
+                    if let (Some(skill_name), Some(skill_activations)) = (
+                        extract_read_skill_name(&call.arguments),
+                        skill_activations,
+                    ) {
+                        let activated_tool_names = activate_skill_tool_requirements(
+                            &skill_name,
+                            skills,
+                            tools_registry,
+                            skill_activations,
+                        );
+                        tracing::info!(
+                            skill = skill_name,
+                            activated_tools = ?activated_tool_names,
+                            "Activated skill-scoped tools after read_skill"
+                        );
+                    }
+                }
             }
 
             runtime_trace::record_event(
@@ -3603,6 +3909,23 @@ pub(crate) async fn run_tool_call_loop(
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
         }
+
+        // A model switch can be requested by a tool in the same batch as file
+        // edits or capture work. Re-check after persisting this iteration's
+        // assistant/tool history so the outer loop can immediately rebind the
+        // provider before the next model response, without losing progress.
+        if let Some(requested_switch) =
+            pending_model_switch_request(model_switch_callback.as_ref(), provider_name, model)
+        {
+            tracing::info!(
+                "Model switch detected after tool execution: {} {} -> {} {}",
+                provider_name,
+                model,
+                requested_switch.provider,
+                requested_switch.model
+            );
+            return Err(requested_switch.into());
+        }
     }
 
     runtime_trace::record_event(
@@ -3623,8 +3946,7 @@ pub(crate) async fn run_tool_call_loop(
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
 pub(crate) fn build_tool_instructions(
-    tools_registry: &[Box<dyn Tool>],
-    tool_descriptions: Option<&ToolDescriptions>,
+    tool_specs: &[crate::tools::ToolSpec],
 ) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
@@ -3640,16 +3962,13 @@ pub(crate) fn build_tool_instructions(
         .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
-    for tool in tools_registry {
-        let desc = tool_descriptions
-            .and_then(|td| td.get(tool.name()))
-            .unwrap_or_else(|| tool.description());
+    for tool in tool_specs {
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
-            tool.name(),
-            desc,
-            tool.parameters_schema()
+            tool.name,
+            tool.description,
+            tool.parameters
         );
     }
 
@@ -3886,123 +4205,14 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
-    ];
-    if matches!(
+    let activation_sets = activated_handle.iter().collect::<Vec<_>>();
+    let active_tool_specs = crate::tools::active_tool_specs(
+        &tools_registry,
+        &activation_sets,
+        &[],
         config.skills.prompt_injection_mode,
-        crate::config::SkillsPromptInjectionMode::Compact
-    ) {
-        tool_descs.push((
-            "read_skill",
-            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
-        ));
-    }
-    tool_descs.push((
-        "cron_add",
-        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
-    ));
-    tool_descs.push((
-        "cron_list",
-        "List all cron jobs with schedule, status, and metadata.",
-    ));
-    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
-    tool_descs.push((
-        "cron_update",
-        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
-    ));
-    tool_descs.push((
-        "cron_run",
-        "Force-run a cron job immediately and record a run history entry.",
-    ));
-    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
-    tool_descs.push((
-        "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
-    ));
-    tool_descs.push((
-        "image_info",
-        "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
-    ));
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
-        ));
-    }
-    if config.composio.enabled {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
-        ));
-    }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
-    tool_descs.push((
-        "model_routing_config",
-        "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
-    ));
-    if !config.agents.is_empty() {
-        tool_descs.push((
-            "delegate",
-            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
-        ));
-    }
-    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push((
-            "gpio_read",
-            "Read GPIO pin value (0 or 1) on connected hardware (STM32, Arduino). Use when: checking sensor/button state, LED status.",
-        ));
-        tool_descs.push((
-            "gpio_write",
-            "Set GPIO pin high (1) or low (0) on connected hardware. Use when: turning LED on/off, controlling actuators.",
-        ));
-        tool_descs.push((
-            "arduino_upload",
-            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; ZeroClaw compiles and uploads it. Pin 13 = built-in LED on Uno.",
-        ));
-        tool_descs.push((
-            "hardware_memory_map",
-            "Return flash and RAM address ranges for connected hardware. Use when: user asks for 'upper and lower memory addresses', 'memory map', or 'readable addresses'.",
-        ));
-        tool_descs.push((
-            "hardware_board_info",
-            "Return full board info (chip, architecture, memory map) for connected hardware. Use when: user asks for 'board info', 'what board do I have', 'connected hardware', 'chip info', or 'what hardware'.",
-        ));
-        tool_descs.push((
-            "hardware_memory_read",
-            "Read actual memory/register values from Nucleo via USB. Use when: user asks to 'read register values', 'read memory', 'dump lower memory 0-126', 'give address and value'. Params: address (hex, default 0x20000000), length (bytes, default 128).",
-        ));
-        tool_descs.push((
-            "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
-        ));
-    }
+        Some(&i18n_descs),
+    );
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -4012,7 +4222,7 @@ pub async fn run(
     let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
-        &tool_descs,
+        &active_tool_specs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
@@ -4023,7 +4233,7 @@ pub async fn run(
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -4090,6 +4300,7 @@ pub async fn run(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+        let skill_activations = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
         let excluded_tools =
@@ -4102,6 +4313,9 @@ pub async fn run(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
+                &skills,
+                Some(&i18n_descs),
+                config.skills.prompt_injection_mode,
                 observer.as_ref(),
                 &provider_name,
                 &model_name,
@@ -4118,6 +4332,7 @@ pub async fn run(
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
                 activated_handle.as_ref(),
+                Some(&skill_activations),
                 Some(model_switch_callback.clone()),
             )
             .await
@@ -4197,6 +4412,13 @@ pub async fn run(
         } else {
             vec![ChatMessage::system(&system_prompt)]
         };
+        let skill_activations = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+        restore_skill_activations_from_history(
+            &history,
+            &skills,
+            &tools_registry,
+            &skill_activations,
+        );
 
         loop {
             print!("> ");
@@ -4255,6 +4477,8 @@ pub async fn run(
 
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
+                    *skill_activations.lock().unwrap_or_else(|e| e.into_inner()) =
+                        crate::tools::ActivatedToolSet::new();
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -4329,6 +4553,9 @@ pub async fn run(
                     provider.as_ref(),
                     &mut history,
                     &tools_registry,
+                    &skills,
+                    Some(&i18n_descs),
+                    config.skills.prompt_injection_mode,
                     observer.as_ref(),
                     &provider_name,
                     &model_name,
@@ -4345,6 +4572,7 @@ pub async fn run(
                     &excluded_tools,
                     &config.agent.tool_call_dedup_exempt,
                     activated_handle.as_ref(),
+                    Some(&skill_activations),
                     Some(model_switch_callback.clone()),
                 )
                 .await
@@ -4594,71 +4822,19 @@ pub async fn process_message(
     let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-        (
-            "model_routing_config",
-            "Configure default model, scenario routing, and delegate agents.",
-        ),
-        ("screenshot", "Capture a screenshot."),
-        ("image_info", "Read image metadata."),
-    ];
-    if matches!(
+    let excluded_tools = if config.autonomy.level == AutonomyLevel::Full {
+        Vec::new()
+    } else {
+        config.autonomy.non_cli_excluded_tools.clone()
+    };
+    let activation_sets = activated_handle_pm.iter().collect::<Vec<_>>();
+    let active_tool_specs = crate::tools::active_tool_specs(
+        &tools_registry,
+        &activation_sets,
+        &excluded_tools,
         config.skills.prompt_injection_mode,
-        crate::config::SkillsPromptInjectionMode::Compact
-    ) {
-        tool_descs.push((
-            "read_skill",
-            "Load the full source for an available skill by name.",
-        ));
-    }
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
-    if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
-    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
-        tool_descs.push((
-            "gpio_write",
-            "Set GPIO pin high or low on connected hardware.",
-        ));
-        tool_descs.push((
-            "arduino_upload",
-            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
-        ));
-        tool_descs.push((
-            "hardware_memory_map",
-            "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
-        ));
-        tool_descs.push((
-            "hardware_board_info",
-            "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
-        ));
-        tool_descs.push((
-            "hardware_memory_read",
-            "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
-        ));
-        tool_descs.push((
-            "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
-        ));
-    }
-
-    // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
-    // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
-    if config.autonomy.level != AutonomyLevel::Full {
-        let excluded = &config.autonomy.non_cli_excluded_tools;
-        if !excluded.is_empty() {
-            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
-        }
-    }
+        Some(&i18n_descs),
+    );
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -4669,7 +4845,7 @@ pub async fn process_message(
     let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
-        &tool_descs,
+        &active_tool_specs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
@@ -4678,7 +4854,7 @@ pub async fn process_message(
         config.skills.prompt_injection_mode,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -4709,6 +4885,7 @@ pub async fn process_message(
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
+    let skill_activations = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
     let mut excluded_tools =
         compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, message);
     if config.autonomy.level != AutonomyLevel::Full {
@@ -4719,6 +4896,9 @@ pub async fn process_message(
         provider.as_ref(),
         &mut history,
         &tools_registry,
+        &skills,
+        Some(&i18n_descs),
+        config.skills.prompt_injection_mode,
         observer.as_ref(),
         provider_name,
         &model_name,
@@ -4732,6 +4912,7 @@ pub async fn process_message(
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
+        Some(&skill_activations),
         None,
     )
     .await
@@ -5095,6 +5276,54 @@ mod tests {
         }
     }
 
+    struct SwitchModelTool {
+        provider: String,
+        model: String,
+    }
+
+    impl SwitchModelTool {
+        fn new(provider: &str, model: &str) -> Self {
+            Self {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for SwitchModelTool {
+        fn name(&self) -> &str {
+            "switch_model"
+        }
+
+        fn description(&self) -> &str {
+            "Requests a model switch for loop regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let switch_state = get_model_switch_state();
+            *switch_state
+                .lock()
+                .expect("model switch state lock should be valid") =
+                Some((self.provider.clone(), self.model.clone()));
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!("requested:{}:{}", self.provider, self.model),
+                error: None,
+            })
+        }
+    }
+
     struct DelayTool {
         name: String,
         delay_ms: u64,
@@ -5226,6 +5455,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5241,6 +5473,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5276,6 +5509,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5291,6 +5527,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5320,6 +5557,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5335,6 +5575,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5450,6 +5691,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5465,6 +5709,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5496,6 +5741,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_surfaces_model_switch_after_tool_execution() {
+        clear_model_switch_request();
+
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"switch_model","arguments":{}}
+</tool_call>"#,
+            "this second response should never be used",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(SwitchModelTool::new("openai", "gpt-5.4"))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("switch now"),
+        ];
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "openai",
+            "gpt-5.1",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            Some(get_model_switch_state()),
+        )
+        .await
+        .expect_err("model switch should interrupt the loop before another LLM response");
+
+        let (new_provider, new_model) =
+            is_model_switch_requested(&err).expect("error should carry requested model switch");
+        assert_eq!(new_provider, "openai");
+        assert_eq!(new_model, "gpt-5.4");
+        assert!(
+            history.iter().any(|message| {
+                message.role == "assistant"
+                    && message.content.contains("\"name\":\"switch_model\"")
+            }),
+            "assistant tool-call history should be preserved before switching"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message.role == "user" && message.content.contains("requested:openai:gpt-5.4")),
+            "tool results should be preserved before switching"
+        );
+
+        clear_model_switch_request();
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_injects_channel_delivery_defaults_for_cron_add() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -5520,6 +5833,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5535,6 +5851,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5582,6 +5899,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5597,6 +5917,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5639,6 +5960,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5654,6 +5978,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5708,6 +6033,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5723,6 +6051,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5768,6 +6097,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5783,6 +6115,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
             None,
             None,
         )
@@ -5848,6 +6181,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5863,6 +6199,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
             None,
             None,
         )
@@ -5905,6 +6242,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -5920,6 +6260,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -5986,6 +6327,9 @@ mod tests {
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -6001,6 +6345,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -6072,6 +6417,9 @@ mod tests {
                 &provider,
                 &mut history,
                 &tools_registry,
+                &[],
+                None,
+                crate::config::SkillsPromptInjectionMode::Full,
                 &observer,
                 "mock-provider",
                 "mock-model",
@@ -6085,6 +6433,7 @@ mod tests {
                 &[],
                 &[],
                 Some(&activated),
+                None,
                 None,
             )
             .await
@@ -6218,6 +6567,22 @@ After text."#;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "file_read");
         assert_eq!(calls[1].name, "file_read");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_and_args_aliases() {
+        let response = r#"<tool_call>
+{"tool":"shell","args":{"command":"pwd"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(serde_json::Value::as_str),
+            Some("pwd")
+        );
     }
 
     #[test]
@@ -6672,13 +7037,136 @@ Tail"#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools, None);
+        let tool_specs = tools.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
+        let instructions = build_tool_instructions(&tool_specs);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    #[test]
+    fn activate_skill_tool_requirements_enables_registered_tools_only() {
+        use crate::skills::Skill;
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "web_fetch",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+        let skill_activations = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let skills = vec![Skill {
+            name: "google_external_tools".to_string(),
+            description: "Calendar access".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            requires_tools: vec!["web_fetch".to_string(), "missing_tool".to_string()],
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+        }];
+
+        let activated = activate_skill_tool_requirements(
+            "google_external_tools",
+            &skills,
+            &tools_registry,
+            &skill_activations,
+        );
+
+        assert_eq!(activated, vec!["web_fetch"]);
+        let state = skill_activations.lock().unwrap();
+        assert!(state.is_activated("web_fetch"));
+        assert!(!state.is_activated("missing_tool"));
+        assert_eq!(state.activated_skill_names(), vec!["google_external_tools"]);
+    }
+
+    #[test]
+    fn restore_skill_activations_from_history_replays_successful_read_skill_calls() {
+        use crate::skills::Skill;
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new(
+                "web_fetch",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(CountingTool::new(
+                "cron_add",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+        ];
+        let skill_activations = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let history = vec![
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "loading skill",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_skill",
+                            "arguments": "{\"name\":\"google_external_tools\"}"
+                        },
+                        {
+                            "id": "call_2",
+                            "name": "read_skill",
+                            "arguments": "{\"name\":\"reminder_orchestration\"}"
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_1",
+                    "content": "# google skill"
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_2",
+                    "content": "Error: Unknown skill"
+                })
+                .to_string(),
+            ),
+        ];
+        let skills = vec![
+            Skill {
+                name: "google_external_tools".to_string(),
+                description: "Calendar access".to_string(),
+                version: "1.0.0".to_string(),
+                author: None,
+                tags: vec![],
+                requires_tools: vec!["web_fetch".to_string()],
+                tools: vec![],
+                prompts: vec![],
+                location: None,
+            },
+            Skill {
+                name: "reminder_orchestration".to_string(),
+                description: "Reminder access".to_string(),
+                version: "1.0.0".to_string(),
+                author: None,
+                tags: vec![],
+                requires_tools: vec!["cron_add".to_string()],
+                tools: vec![],
+                prompts: vec![],
+                location: None,
+            },
+        ];
+
+        restore_skill_activations_from_history(
+            &history,
+            &skills,
+            &tools_registry,
+            &skill_activations,
+        );
+
+        let state = skill_activations.lock().unwrap();
+        assert_eq!(state.activated_skill_names(), vec!["google_external_tools"]);
+        assert!(state.is_activated("web_fetch"));
+        assert!(!state.is_activated("cron_add"));
     }
 
     #[test]
@@ -6751,6 +7239,36 @@ Tail"#;
         let transcript = build_compaction_transcript(&messages);
         assert!(transcript.contains("USER: I like dark mode"));
         assert!(transcript.contains("ASSISTANT: Got it"));
+    }
+
+    #[test]
+    fn user_requested_scheduling_ignores_calendar_lookup_requests() {
+        let history = vec![ChatMessage::user(
+            "podrias chequear que eventos tengo en mi agenda hoy?",
+        )];
+
+        assert!(!user_requested_scheduling(&history));
+    }
+
+    #[test]
+    fn response_claims_schedule_success_ignores_calendar_access_explanations() {
+        let response = "No tengo acceso directo a tu agenda real, pero puedo consultar los eventos de hoy en una agenda de demostracion conectada a Google Calendar.";
+
+        assert!(!response_claims_schedule_success(response));
+    }
+
+    #[test]
+    fn response_claims_schedule_success_ignores_unscheduled_denials() {
+        let response = "No se ha programado ningun recordatorio ni tarea en tu agenda real en este momento.";
+
+        assert!(!response_claims_schedule_success(response));
+    }
+
+    #[test]
+    fn response_claims_schedule_success_detects_actual_schedule_confirmation() {
+        let response = "Ya esta programado y te avisare manana.";
+
+        assert!(response_claims_schedule_success(response));
     }
 
     #[test]
@@ -7465,6 +7983,49 @@ Let me check the result."#;
         assert_eq!(result, input, "short values should not be redacted");
     }
 
+    #[test]
+    fn format_prompt_messages_for_trace_renders_multiline_content() {
+        let messages = vec![
+            ChatMessage::system("line 1\n\tline 2"),
+            ChatMessage::user(""),
+        ];
+
+        let formatted = format_prompt_messages_for_trace(&messages);
+
+        assert!(formatted.contains("[0] SYSTEM"));
+        assert!(formatted.contains("  line 1"));
+        assert!(
+            formatted.contains("      line 2"),
+            "tabs should be expanded for terminal readability: {formatted}"
+        );
+        assert!(formatted.contains("[1] USER"));
+        assert!(formatted.contains("  <empty>"));
+    }
+
+    #[test]
+    fn format_prompt_messages_for_trace_unescapes_visible_sequences() {
+        let messages = vec![ChatMessage::system("line 1\\n\\tline 2")];
+
+        let formatted = format_prompt_messages_for_trace(&messages);
+
+        assert!(formatted.contains("[0] SYSTEM"));
+        assert!(formatted.contains("  line 1"));
+        assert!(
+            formatted.contains("      line 2"),
+            "escaped tab should be expanded for terminal readability: {formatted}"
+        );
+    }
+
+    #[test]
+    fn format_prompt_messages_for_trace_scrubs_credentials() {
+        let messages = vec![ChatMessage::user(r#"api_key="supersecretvalue""#)];
+
+        let formatted = format_prompt_messages_for_trace(&messages);
+
+        assert!(formatted.contains("[REDACTED]"));
+        assert!(!formatted.contains("supersecretvalue"));
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // TG4 (inline): trim_history edge cases
     // ─────────────────────────────────────────────────────────────────────
@@ -7518,9 +8079,17 @@ Let me check the result."#;
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::channels::build_system_prompt_with_mode;
 
-        let tool_summaries: Vec<(&str, &str)> = vec![
-            ("shell", "Execute shell commands"),
-            ("file_read", "Read files"),
+        let tool_summaries = vec![
+            crate::tools::ToolSpec {
+                name: "shell".to_string(),
+                description: "Execute shell commands".to_string(),
+                parameters: serde_json::json!({}),
+            },
+            crate::tools::ToolSpec {
+                name: "file_read".to_string(),
+                description: "Read files".to_string(),
+                parameters: serde_json::json!({}),
+            },
         ];
 
         let system_prompt = build_system_prompt_with_mode(
@@ -7979,6 +8548,9 @@ Let me check the result."#;
             &provider,
             &mut history,
             &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
             &observer,
             "mock-provider",
             "mock-model",
@@ -7994,6 +8566,7 @@ Let me check the result."#;
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )

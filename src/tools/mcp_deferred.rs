@@ -6,7 +6,7 @@
 //! `tool_search` tool to fetch full schemas, which moves them into the
 //! [`ActivatedToolSet`] for the current conversation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::tools::mcp_client::McpRegistry;
@@ -162,21 +162,46 @@ impl DeferredMcpToolSet {
 /// to include in the LLM request.
 pub struct ActivatedToolSet {
     tools: HashMap<String, Arc<dyn Tool>>,
+    enabled_tool_names: HashSet<String>,
+    activated_skills: HashSet<String>,
 }
 
 impl ActivatedToolSet {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            enabled_tool_names: HashSet::new(),
+            activated_skills: HashSet::new(),
         }
     }
 
     pub fn activate(&mut self, name: String, tool: Arc<dyn Tool>) {
+        self.enabled_tool_names.insert(name.clone());
         self.tools.insert(name, tool);
     }
 
+    pub fn enable_tool_name(&mut self, name: impl Into<String>) {
+        self.enabled_tool_names.insert(name.into());
+    }
+
+    pub fn activate_skill(&mut self, name: impl Into<String>) {
+        self.activated_skills.insert(name.into());
+    }
+
     pub fn is_activated(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.enabled_tool_names.contains(name)
+    }
+
+    pub fn activated_skill_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.activated_skills.iter().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    pub fn activated_tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.enabled_tool_names.iter().cloned().collect();
+        names.sort_unstable();
+        names
     }
 
     /// Clone the Arc so the caller can drop the mutex guard before awaiting.
@@ -219,7 +244,7 @@ impl ActivatedToolSet {
     }
 
     pub fn tool_names(&self) -> Vec<&str> {
-        self.tools.keys().map(|s| s.as_str()).collect()
+        self.enabled_tool_names.iter().map(|s| s.as_str()).collect()
     }
 }
 

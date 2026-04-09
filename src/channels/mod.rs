@@ -35,6 +35,7 @@ pub mod nostr;
 pub mod notion;
 pub mod qq;
 pub mod reddit;
+mod runtime_router;
 pub mod session_backend;
 pub mod session_sqlite;
 pub mod session_store;
@@ -1657,6 +1658,151 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ServiceDirectiveProgress {
+    scaffolded_service: bool,
+    delegated_to_coder: bool,
+    scheduled_with_cron: bool,
+    cancelled_with_cron: bool,
+}
+
+impl ServiceDirectiveProgress {
+    fn has_required_action(self) -> bool {
+        self.scaffolded_service
+            || self.delegated_to_coder
+            || self.scheduled_with_cron
+            || self.cancelled_with_cron
+    }
+}
+
+fn collect_service_directive_progress(
+    history: &[ChatMessage],
+    start_index: usize,
+) -> ServiceDirectiveProgress {
+    fn normalized_contains(haystack: &str, needle: &str) -> bool {
+        haystack.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+    }
+
+    fn inspect_tool_call(
+        name: &str,
+        arguments: Option<&serde_json::Value>,
+        progress: &mut ServiceDirectiveProgress,
+    ) {
+        let tool_name = name.trim().to_ascii_lowercase();
+        match tool_name.as_str() {
+            "shell" => {
+                if let Some(command) = arguments
+                    .and_then(|args| args.get("command"))
+                    .and_then(|value| value.as_str())
+                {
+                    if normalized_contains(command, "tenant_service_builder.py init") {
+                        progress.scaffolded_service = true;
+                    }
+                }
+            }
+            "delegate" => {
+                let delegated_to_coder = arguments
+                    .and_then(|args| args.get("agent"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|agent| agent.eq_ignore_ascii_case("coder"));
+                if delegated_to_coder {
+                    progress.delegated_to_coder = true;
+                }
+            }
+            "cron_add" => {
+                progress.scheduled_with_cron = true;
+            }
+            "cron_remove" => {
+                progress.cancelled_with_cron = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn parse_tool_arguments(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+        match value {
+            Some(serde_json::Value::String(json)) => serde_json::from_str(json).ok(),
+            Some(other) => Some(other.clone()),
+            None => None,
+        }
+    }
+
+    fn inspect_tool_call_value(
+        value: &serde_json::Value,
+        progress: &mut ServiceDirectiveProgress,
+    ) {
+        let name = value
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|name| name.as_str())
+            .or_else(|| value.get("name").and_then(|name| name.as_str()));
+        let arguments = if let Some(function) = value.get("function") {
+            parse_tool_arguments(function.get("arguments"))
+        } else {
+            parse_tool_arguments(value.get("arguments"))
+        };
+        if let Some(name) = name {
+            inspect_tool_call(name, arguments.as_ref(), progress);
+        }
+    }
+
+    fn inspect_tool_calls_from_content(content: &str, progress: &mut ServiceDirectiveProgress) {
+        const TAG_PAIRS: [(&str, &str); 4] = [
+            ("<tool_call>", "</tool_call>"),
+            ("<toolcall>", "</toolcall>"),
+            ("<tool-call>", "</tool-call>"),
+            ("<invoke>", "</invoke>"),
+        ];
+
+        for (open_tag, close_tag) in TAG_PAIRS {
+            for segment in content.split(open_tag) {
+                if let Some(json_end) = segment.find(close_tag) {
+                    let json_str = segment[..json_end].trim();
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        inspect_tool_call_value(&val, progress);
+                    }
+                }
+            }
+        }
+
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(calls) = val.get("tool_calls").and_then(|calls| calls.as_array()) {
+                for call in calls {
+                    inspect_tool_call_value(call, progress);
+                }
+            }
+        }
+    }
+
+    fn inspect_tool_results_from_content(
+        content: &str,
+        progress: &mut ServiceDirectiveProgress,
+    ) {
+        let lower = content.to_ascii_lowercase();
+        if lower.contains("<tool_result name=\"delegate\">") {
+            progress.delegated_to_coder = true;
+        }
+        if lower.contains("<tool_result name=\"cron_add\">") {
+            progress.scheduled_with_cron = true;
+        }
+        if lower.contains("<tool_result name=\"cron_remove\">") {
+            progress.cancelled_with_cron = true;
+        }
+    }
+
+    let mut progress = ServiceDirectiveProgress::default();
+
+    for msg in history.iter().skip(start_index) {
+        match msg.role.as_str() {
+            "assistant" => inspect_tool_calls_from_content(&msg.content, &mut progress),
+            "user" => inspect_tool_results_from_content(&msg.content, &mut progress),
+            _ => {}
+        }
+    }
+
+    progress
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2577,7 +2723,25 @@ async fn process_channel_message(
             .cloned()
             .unwrap_or_default()
     };
+    let skills =
+        crate::skills::load_skills_with_config(ctx.workspace_dir.as_ref(), ctx.prompt_config.as_ref());
+    let skill_activations = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+    crate::agent::loop_::restore_skill_activations_from_history(
+        &prior_turns_raw,
+        &skills,
+        ctx.tools_registry.as_ref(),
+        &skill_activations,
+    );
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+    let i18n_locale = ctx
+        .prompt_config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(ctx.workspace_dir.as_ref());
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
     // sees a `<tool_result>` without a preceding `<tool_call>`, which
@@ -2646,8 +2810,19 @@ async fn process_channel_message(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let system_prompt =
+    let mut system_prompt =
         build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
+    let runtime_directive = runtime_router::build_runtime_directive(&msg.content);
+    if let Some(directive) = runtime_directive.as_ref() {
+        tracing::info!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            directive_kind = ?directive.kind,
+            "Applied dedicated runtime routing directive"
+        );
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&directive.content);
+    }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -2781,7 +2956,7 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
-    let llm_result = tokio::select! {
+    let mut llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
@@ -2789,6 +2964,9 @@ async fn process_channel_message(
                 active_provider.as_ref(),
                 &mut history,
                 ctx.tools_registry.as_ref(),
+                &skills,
+                Some(&i18n_descs),
+                ctx.prompt_config.skills.prompt_injection_mode,
                 notify_observer.as_ref() as &dyn Observer,
                 route.provider.as_str(),
                 route.model.as_str(),
@@ -2800,7 +2978,7 @@ async fn process_channel_message(
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
-                delta_tx,
+                delta_tx.clone(),
                 ctx.hooks.as_deref(),
                 if msg.channel == "cli"
                     || ctx.autonomy_level == AutonomyLevel::Full
@@ -2811,10 +2989,87 @@ async fn process_channel_message(
                 },
                 ctx.tool_call_dedup_exempt.as_ref(),
                 ctx.activated_tools.as_ref(),
+                Some(&skill_activations),
                 None,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
+
+    if matches!(
+        runtime_directive.as_ref().map(|directive| &directive.kind),
+        Some(&runtime_router::RuntimeDirectiveKind::Service)
+    ) {
+        let service_progress = collect_service_directive_progress(&history, history_len_before_tools);
+        if let LlmExecutionResult::Completed(Ok(Ok(response))) = &llm_result {
+            if !service_progress.has_required_action() {
+                let elapsed_secs = started_at.elapsed().as_secs();
+                let remaining_budget_secs = timeout_budget_secs.saturating_sub(elapsed_secs);
+                if remaining_budget_secs > 0 {
+                    tracing::warn!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        elapsed_secs,
+                        remaining_budget_secs,
+                        response = scrub_credentials(response),
+                        "Service directive replied before scaffold/delegate/cron action; forcing one internal retry"
+                    );
+                    if let Some(tx) = delta_tx.as_ref() {
+                        let _ = tx
+                            .send(crate::agent::loop_::DRAFT_CLEAR_SENTINEL.to_string())
+                            .await;
+                    }
+                    history.push(ChatMessage::user(
+                        "INTERNAL PROCESS ENFORCEMENT:\nYou attempted to reply before doing required recurring job work. Continue immediately. Before replying, you must do at least one concrete action in this runtime: scaffold the tenant job with python3 tools/tenant_service_builder.py init ..., delegate the substantive implementation with delegate(agent=\"coder\", ...), schedule recurring execution with cron_add and confirm it with cron_list, or cancel a matching recurring job with cron_remove and confirm it with cron_list. Do not ask clarifying questions or provide documentation handoff before one of those actions succeeds, unless you hit a specific blocker such as a missing tool, unavailable delegate, or missing credential that you can name explicitly.",
+                    ));
+                    llm_result = tokio::select! {
+                        () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+                        result = tokio::time::timeout(
+                            Duration::from_secs(remaining_budget_secs),
+                            run_tool_call_loop(
+                                active_provider.as_ref(),
+                                &mut history,
+                                ctx.tools_registry.as_ref(),
+                                &skills,
+                                Some(&i18n_descs),
+                                ctx.prompt_config.skills.prompt_injection_mode,
+                                notify_observer.as_ref() as &dyn Observer,
+                                route.provider.as_str(),
+                                route.model.as_str(),
+                                runtime_defaults.temperature,
+                                true,
+                                Some(&*ctx.approval_manager),
+                                msg.channel.as_str(),
+                                Some(msg.reply_target.as_str()),
+                                &ctx.multimodal,
+                                ctx.max_tool_iterations,
+                                Some(cancellation_token.clone()),
+                                delta_tx.clone(),
+                                ctx.hooks.as_deref(),
+                                if msg.channel == "cli"
+                                    || ctx.autonomy_level == AutonomyLevel::Full
+                                {
+                                    &[]
+                                } else {
+                                    ctx.non_cli_excluded_tools.as_ref()
+                                },
+                                ctx.tool_call_dedup_exempt.as_ref(),
+                                ctx.activated_tools.as_ref(),
+                                Some(&skill_activations),
+                                None,
+                            ),
+                        ) => LlmExecutionResult::Completed(result),
+                    };
+                } else {
+                    tracing::warn!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        elapsed_secs,
+                        "Service directive replied too early but no timeout budget remained for an internal retry"
+                    );
+                }
+            }
+        }
+    }
 
     if let Some(handle) = draft_updater {
         let _ = handle.await;
@@ -3385,7 +3640,7 @@ fn load_openclaw_bootstrap_files(
 pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
-    tools: &[(&str, &str)],
+    tools: &[crate::tools::ToolSpec],
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
@@ -3406,7 +3661,7 @@ pub fn build_system_prompt(
 pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
-    tools: &[(&str, &str)],
+    tools: &[crate::tools::ToolSpec],
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
@@ -3434,7 +3689,7 @@ pub fn build_system_prompt_with_mode(
 pub fn build_system_prompt_with_mode_and_autonomy(
     workspace_dir: &std::path::Path,
     model_name: &str,
-    tools: &[(&str, &str)],
+    tools: &[crate::tools::ToolSpec],
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
@@ -3471,21 +3726,21 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     if !tools.is_empty() {
         prompt.push_str("## Tools\n\n");
         prompt.push_str("You have access to the following tools:\n\n");
-        for (name, desc) in tools {
-            let _ = writeln!(prompt, "- **{name}**: {desc}");
+        for tool in tools {
+            let _ = writeln!(prompt, "- **{}**: {}", tool.name, tool.description);
         }
         prompt.push('\n');
     }
 
     // ── 1b. Hardware (when gpio/arduino tools present) ───────────
-    let has_hardware = tools.iter().any(|(name, _)| {
-        *name == "gpio_read"
-            || *name == "gpio_write"
-            || *name == "arduino_upload"
-            || *name == "hardware_memory_map"
-            || *name == "hardware_board_info"
-            || *name == "hardware_memory_read"
-            || *name == "hardware_capabilities"
+    let has_hardware = tools.iter().any(|tool| {
+        tool.name == "gpio_read"
+            || tool.name == "gpio_write"
+            || tool.name == "arduino_upload"
+            || tool.name == "hardware_memory_map"
+            || tool.name == "hardware_board_info"
+            || tool.name == "hardware_memory_read"
+            || tool.name == "hardware_capabilities"
     });
     if has_hardware {
         prompt.push_str(
@@ -4646,79 +4901,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let i18n_search_dirs = crate::i18n::default_search_dirs(&workspace);
     let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
 
-    // Collect tool descriptions for the prompt
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
-    ];
-
-    if matches!(
+    let excluded = if config.autonomy.level == AutonomyLevel::Full {
+        Vec::new()
+    } else {
+        config.autonomy.non_cli_excluded_tools.clone()
+    };
+    let activation_sets = ch_activated_handle.iter().collect::<Vec<_>>();
+    let active_tool_specs = crate::tools::active_tool_specs(
+        tools_registry.as_ref(),
+        &activation_sets,
+        &excluded,
         config.skills.prompt_injection_mode,
-        crate::config::SkillsPromptInjectionMode::Compact
-    ) {
-        tool_descs.push((
-            "read_skill",
-            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
-        ));
-    }
-
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
-        ));
-    }
-    if config.composio.enabled {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
-        ));
-    }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
-    tool_descs.push((
-        "pushover",
-        "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
-    ));
-    if !config.agents.is_empty() {
-        tool_descs.push((
-            "delegate",
-            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
-        ));
-    }
-
-    // Filter out tools excluded for non-CLI channels so the system prompt
-    // does not advertise them for channel-driven runs.
-    // Skip this filter when autonomy is `Full` — full-autonomy agents keep
-    // all tools available regardless of channel.
-    let excluded = &config.autonomy.non_cli_excluded_tools;
-    if !excluded.is_empty() && config.autonomy.level != AutonomyLevel::Full {
-        tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
-    }
+        Some(&i18n_descs),
+    );
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -4729,7 +4924,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
         &workspace,
         &model,
-        &tool_descs,
+        &active_tool_specs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
@@ -4738,10 +4933,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.skills.prompt_injection_mode,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(
-            tools_registry.as_ref(),
-            Some(&i18n_descs),
-        ));
+        system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -7584,7 +7776,18 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
-        let tools = vec![("shell", "Run commands"), ("file_read", "Read files")];
+        let tools = vec![
+            crate::tools::ToolSpec {
+                name: "shell".to_string(),
+                description: "Run commands".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+            crate::tools::ToolSpec {
+                name: "file_read".to_string(),
+                description: "Read files".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        ];
         let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None, None);
 
         // Section headers
@@ -7606,8 +7809,16 @@ BTC is currently around $65,000 based on latest tool output."#
     fn prompt_injects_tools() {
         let ws = make_workspace();
         let tools = vec![
-            ("shell", "Run commands"),
-            ("memory_recall", "Search memory"),
+            crate::tools::ToolSpec {
+                name: "shell".to_string(),
+                description: "Run commands".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+            crate::tools::ToolSpec {
+                name: "memory_recall".to_string(),
+                description: "Search memory".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
         ];
         let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
 
@@ -7619,7 +7830,11 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_includes_single_tool_protocol_block_after_append() {
         let ws = make_workspace();
-        let tools = vec![("shell", "Run commands")];
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run commands".to_string(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
         let mut prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
 
         assert!(
@@ -7627,7 +7842,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[], None));
+        prompt.push_str(&build_tool_instructions(&[]));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),
@@ -7747,6 +7962,7 @@ BTC is currently around $65,000 based on latest tool output."#
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![crate::skills::SkillTool {
                 name: "lint".into(),
                 description: "Run static checks".into(),
@@ -7782,6 +7998,7 @@ BTC is currently around $65,000 based on latest tool output."#
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![crate::skills::SkillTool {
                 name: "lint".into(),
                 description: "Run static checks".into(),
@@ -7827,6 +8044,7 @@ BTC is currently around $65,000 based on latest tool output."#
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
+            requires_tools: vec![],
             tools: vec![crate::skills::SkillTool {
                 name: "run\"linter\"".into(),
                 description: "Run <lint> & report".into(),
@@ -8815,6 +9033,85 @@ Mon Feb 20
 
         let summary = extract_tool_context_summary(&history, 1);
         assert_eq!(summary, "[Used tools: fresh_tool]");
+    }
+
+    #[test]
+    fn collect_service_directive_progress_detects_scaffold_delegate_and_cron() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"shell","arguments":{"command":"python3 tools/tenant_service_builder.py init --name \"montecarlo\" --brief \"report\" --storage sqlite"}}
+</tool_call>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"coder","prompt":"implement the worker"}}
+</tool_call>"#,
+            ),
+            ChatMessage::user(
+                r#"[Tool results]
+<tool_result name="cron_add">
+scheduled
+</tool_result>"#,
+            ),
+        ];
+
+        let progress = collect_service_directive_progress(&history, 1);
+        assert!(progress.scaffolded_service);
+        assert!(progress.delegated_to_coder);
+        assert!(progress.scheduled_with_cron);
+        assert!(!progress.cancelled_with_cron);
+        assert!(progress.has_required_action());
+    }
+
+    #[test]
+    fn collect_service_directive_progress_detects_cron_cancellation() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"cron_list","arguments":{}}
+</tool_call>"#,
+            ),
+            ChatMessage::user(
+                r#"[Tool results]
+<tool_result name="cron_remove">
+removed
+</tool_result>"#,
+            ),
+        ];
+
+        let progress = collect_service_directive_progress(&history, 1);
+        assert!(!progress.scaffolded_service);
+        assert!(!progress.delegated_to_coder);
+        assert!(!progress.scheduled_with_cron);
+        assert!(progress.cancelled_with_cron);
+        assert!(progress.has_required_action());
+    }
+
+    #[test]
+    fn collect_service_directive_progress_ignores_skill_reads_and_search_only() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"read_skill","arguments":{"skill_name":"tenant_service_builder"}}
+</tool_call>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"web_search_tool","arguments":{"query":"ATP Monte Carlo weather API"}}
+</tool_call>"#,
+            ),
+        ];
+
+        let progress = collect_service_directive_progress(&history, 1);
+        assert!(!progress.scaffolded_service);
+        assert!(!progress.delegated_to_coder);
+        assert!(!progress.scheduled_with_cron);
+        assert!(!progress.cancelled_with_cron);
+        assert!(!progress.has_required_action());
     }
 
     #[test]

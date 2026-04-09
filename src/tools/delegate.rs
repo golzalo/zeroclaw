@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,11 @@ pub struct DelegateTool {
     multimodal_config: crate::config::MultimodalConfig,
     /// Global delegate tool config providing default timeout values.
     delegate_config: DelegateToolConfig,
+    /// Workspace directory for pre-loading skills and context files.
+    workspace_dir: Option<PathBuf>,
+    /// Open-skills settings forwarded from root SkillsConfig.
+    open_skills_enabled: bool,
+    open_skills_dir: Option<String>,
 }
 
 impl DelegateTool {
@@ -62,6 +68,9 @@ impl DelegateTool {
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
+            workspace_dir: None,
+            open_skills_enabled: false,
+            open_skills_dir: None,
         }
     }
 
@@ -99,6 +108,9 @@ impl DelegateTool {
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
+            workspace_dir: None,
+            open_skills_enabled: false,
+            open_skills_dir: None,
         }
     }
 
@@ -117,6 +129,20 @@ impl DelegateTool {
     /// Attach global delegate tool configuration for default timeout values.
     pub fn with_delegate_config(mut self, config: DelegateToolConfig) -> Self {
         self.delegate_config = config;
+        self
+    }
+
+    /// Attach workspace directory and open-skills settings for pre-loading
+    /// skills and context files declared in `[agents.*]` config sections.
+    pub fn with_workspace(
+        mut self,
+        workspace_dir: PathBuf,
+        open_skills_enabled: bool,
+        open_skills_dir: Option<String>,
+    ) -> Self {
+        self.workspace_dir = Some(workspace_dir);
+        self.open_skills_enabled = open_skills_enabled;
+        self.open_skills_dir = open_skills_dir;
         self
     }
 
@@ -405,6 +431,46 @@ impl DelegateTool {
         if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }
+
+        // Pre-load skills declared in agent config — eliminates bootstrap read_skill calls.
+        if !agent_config.skills.is_empty() {
+            if let Some(workspace_dir) = &self.workspace_dir {
+                let loaded_skills = crate::skills::load_skills_with_open_skills_settings(
+                    workspace_dir,
+                    self.open_skills_enabled,
+                    self.open_skills_dir.as_deref(),
+                );
+                for skill_name in &agent_config.skills {
+                    if let Some(skill) = loaded_skills
+                        .iter()
+                        .find(|s| s.name.eq_ignore_ascii_case(skill_name))
+                    {
+                        if let Some(location) = skill.location.as_ref() {
+                            if let Ok(content) = std::fs::read_to_string(location) {
+                                history.push(ChatMessage::system(format!(
+                                    "[Skill: {skill_name}]\n{content}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pre-load workspace files declared in agent config — eliminates bootstrap file_read calls.
+        if !agent_config.context_files.is_empty() {
+            if let Some(workspace_dir) = &self.workspace_dir {
+                for file_path in &agent_config.context_files {
+                    let full_path = workspace_dir.join(file_path);
+                    if let Ok(content) = std::fs::read_to_string(&full_path) {
+                        history.push(ChatMessage::system(format!(
+                            "[File: {file_path}]\n{content}"
+                        )));
+                    }
+                }
+            }
+        }
+
         history.push(ChatMessage::user(full_prompt.to_string()));
 
         let noop_observer = NoopObserver;
@@ -418,6 +484,9 @@ impl DelegateTool {
                 provider,
                 &mut history,
                 &sub_tools,
+                &[],
+                None,
+                crate::config::SkillsPromptInjectionMode::Full,
                 &noop_observer,
                 &agent_config.provider,
                 &agent_config.model,
@@ -433,6 +502,7 @@ impl DelegateTool {
                 None,
                 &[],
                 &[],
+                None,
                 None,
                 None,
             ),
@@ -548,6 +618,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         agents.insert(
@@ -564,6 +636,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         agents
@@ -719,6 +793,8 @@ mod tests {
             max_iterations,
             timeout_secs: None,
             agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
         }
     }
 
@@ -829,6 +905,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -937,6 +1015,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -974,6 +1054,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1265,6 +1347,8 @@ mod tests {
             max_iterations: 10,
             timeout_secs: None,
             agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -1346,6 +1430,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: Some(0),
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -1398,6 +1484,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: Some(7200),
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -1472,6 +1560,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         assert!(config.validate().is_ok());
