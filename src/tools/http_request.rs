@@ -207,7 +207,15 @@ impl Tool for HttpRequestTool {
 
         let method_str = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
         let headers_val = args.get("headers").cloned().unwrap_or(json!({}));
-        let body = args.get("body").and_then(|v| v.as_str());
+        // Accept body as either a plain string or a JSON object/array.
+        // Models often pass body as an object even though the schema declares "type": "string".
+        // Serializing objects to JSON here makes the tool work either way.
+        let body_owned: Option<String> = match args.get("body") {
+            Some(v) if v.is_string() => v.as_str().map(|s| s.to_string()),
+            Some(v) if !v.is_null() => Some(v.to_string()),
+            _ => None,
+        };
+        let body = body_owned.as_deref();
 
         if !self.security.can_act() {
             return Ok(ToolResult {
