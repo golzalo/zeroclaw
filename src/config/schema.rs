@@ -1173,6 +1173,18 @@ pub struct AgentConfig {
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
+    /// Main agent tool allowlist. When non-empty, only these tools are registered
+    /// for the main agent. Default: `[]` (no restriction).
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Main agent skill allowlist. When non-empty, only these skills are loaded
+    /// for the main agent. Default: `[]` (no restriction).
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    /// Workspace-relative files to append to the main agent system prompt.
+    /// Default: `[]` (no extra files).
+    #[serde(default)]
+    pub context_files: Vec<String>,
     /// Per-turn MCP tool schema filtering groups.
     ///
     /// When non-empty, only MCP tools matched by an active group are included in the
@@ -1208,6 +1220,9 @@ impl Default for AgentConfig {
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            context_files: Vec::new(),
             tool_filter_groups: Vec::new(),
         }
     }

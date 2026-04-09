@@ -412,7 +412,19 @@ impl DelegateTool {
                 .iter()
                 .filter(|tool| allowed.contains(tool.name()))
                 .filter(|tool| tool.name() != "delegate")
-                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                .map(|tool| {
+                    if tool.name() == "read_skill" {
+                        if let Some(workspace_dir) = &self.workspace_dir {
+                            return Box::new(crate::tools::ReadSkillTool::new(
+                                workspace_dir.clone(),
+                                self.open_skills_enabled,
+                                self.open_skills_dir.clone(),
+                                agent_config.skills.clone(),
+                            )) as Box<dyn Tool>;
+                        }
+                    }
+                    Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                })
                 .collect()
         };
 

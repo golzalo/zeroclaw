@@ -82,6 +82,9 @@ Operational note for container users:
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
 | `tool_call_dedup_exempt` | `[]` | Tool names exempt from within-turn duplicate-call suppression |
+| `allowed_tools` | `[]` | Main agent tool allowlist. When non-empty, only these tools are registered |
+| `allowed_skills` | `[]` | Main agent skill allowlist. When non-empty, only these skills are loaded |
+| `context_files` | `[]` | Workspace-relative files appended to the main system prompt |
 | `tool_filter_groups` | `[]` | Per-turn MCP tool schema filter groups (see below) |
 
 Notes:

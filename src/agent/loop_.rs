@@ -406,6 +406,22 @@ pub(crate) fn filter_by_allowed_tools(
     }
 }
 
+fn filter_skills_by_allowlist(
+    skills: Vec<crate::skills::Skill>,
+    allowed: &[String],
+) -> Vec<crate::skills::Skill> {
+    if allowed.is_empty() {
+        return skills;
+    }
+
+    let allowed_lower: HashSet<String> =
+        allowed.iter().map(|name| name.to_ascii_lowercase()).collect();
+    skills
+        .into_iter()
+        .filter(|skill| allowed_lower.contains(&skill.name.to_ascii_lowercase()))
+        .collect()
+}
+
 /// Computes the list of MCP tool names that should be excluded for a given turn
 /// based on `tool_filter_groups` and the user message.
 ///
@@ -4054,10 +4070,24 @@ pub async fn run(
     }
 
     // ── Capability-based tool access control ─────────────────────
-    // When `allowed_tools` is `Some(list)`, restrict the tool registry to only
-    // those tools whose name appears in the list. Unknown names are silently
-    // ignored. When `None`, all tools remain available (backward compatible).
-    if let Some(ref allow_list) = allowed_tools {
+    // When `allowed_tools` is set (config or CLI/cron), restrict the tool registry
+    // to only those tools whose name appears in the allowlist. Unknown names are
+    // silently ignored. When both are set, intersect (strictest wins). When neither
+    // is set, all tools remain available (backward compatible).
+    let mut effective_allowed_tools: Option<Vec<String>> = None;
+    if !config.agent.allowed_tools.is_empty() {
+        effective_allowed_tools = Some(config.agent.allowed_tools.clone());
+    }
+    if let Some(cli_allowed) = allowed_tools {
+        effective_allowed_tools = Some(match effective_allowed_tools {
+            Some(mut existing) => {
+                existing.retain(|name| cli_allowed.iter().any(|cli| cli == name));
+                existing
+            }
+            None => cli_allowed,
+        });
+    }
+    if let Some(ref allow_list) = effective_allowed_tools {
         tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
         tracing::info!(
             allowed = allow_list.len(),
@@ -4204,7 +4234,10 @@ pub async fn run(
     let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let skills = filter_skills_by_allowlist(
+        crate::skills::load_skills_with_config(&config.workspace_dir, &config),
+        &config.agent.allowed_skills,
+    );
     let activation_sets = activated_handle.iter().collect::<Vec<_>>();
     let active_tool_specs = crate::tools::active_tool_specs(
         &tools_registry,
@@ -4229,6 +4262,7 @@ pub async fn run(
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
+        &config.agent.context_files,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -4821,7 +4855,10 @@ pub async fn process_message(
     let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
     let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
 
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let skills = filter_skills_by_allowlist(
+        crate::skills::load_skills_with_config(&config.workspace_dir, &config),
+        &config.agent.allowed_skills,
+    );
     let excluded_tools = if config.autonomy.level == AutonomyLevel::Full {
         Vec::new()
     } else {
@@ -4852,6 +4889,7 @@ pub async fn process_message(
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
+        &config.agent.context_files,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&active_tool_specs));

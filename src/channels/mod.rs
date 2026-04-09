@@ -3683,6 +3683,7 @@ pub fn build_system_prompt_with_mode(
         Some(&autonomy_cfg),
         native_tools,
         skills_prompt_mode,
+        &[],
     )
 }
 
@@ -3696,9 +3697,18 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     autonomy_config: Option<&crate::config::AutonomyConfig>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    extra_context_files: &[String],
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
+    let mut append_extra_context_files = |max_chars: usize| {
+        if extra_context_files.is_empty() {
+            return;
+        }
+        for filename in extra_context_files {
+            inject_workspace_file(&mut prompt, workspace_dir, filename, max_chars);
+        }
+    };
 
     // ── 0. Anti-narration (top priority) ───────────────────────
     prompt.push_str(
@@ -3828,12 +3838,15 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         prompt.push_str(&aieos_prompt);
                         prompt.push_str("\n\n");
                     }
+                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                    append_extra_context_files(max_chars);
                 }
                 Ok(None) => {
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
                     // Fall back to OpenClaw bootstrap files
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
                     load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    append_extra_context_files(max_chars);
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
@@ -3842,17 +3855,20 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                     );
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
                     load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    append_extra_context_files(max_chars);
                 }
             }
         } else {
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
             load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+            append_extra_context_files(max_chars);
         }
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
         load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+        append_extra_context_files(max_chars);
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -4889,7 +4905,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let tools_registry = Arc::new(built_tools);
 
-    let skills = crate::skills::load_skills_with_config(&workspace, &config);
+    let mut skills = crate::skills::load_skills_with_config(&workspace, &config);
+    if !config.agent.allowed_skills.is_empty() {
+        let allowed_lower: std::collections::HashSet<String> = config
+            .agent
+            .allowed_skills
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        skills.retain(|skill| allowed_lower.contains(&skill.name.to_ascii_lowercase()));
+    }
 
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
@@ -4931,6 +4956,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
+        &config.agent.context_files,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
@@ -8163,6 +8189,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&config),
             false,
             crate::config::SkillsPromptInjectionMode::Full,
+            &[],
         );
 
         assert!(
@@ -8192,6 +8219,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&config),
             false,
             crate::config::SkillsPromptInjectionMode::Full,
+            &[],
         );
 
         assert!(
