@@ -225,12 +225,6 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
 
 const SKILL_GATED_TOOL_NAMES: &[&str] = &[
     "web_fetch",
-    "cron_add",
-    "cron_list",
-    "cron_remove",
-    "cron_update",
-    "cron_run",
-    "cron_runs",
     "schedule",
     "pdf_read",
     "screenshot",
@@ -1204,6 +1198,7 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = vec![
             Box::new(NamedTool("shell")),
             Box::new(NamedTool("web_fetch")),
+            Box::new(NamedTool("cron_add")),
             Box::new(NamedTool("read_skill")),
         ];
 
@@ -1216,6 +1211,7 @@ mod tests {
         );
         let inactive_names: Vec<&str> = inactive.iter().map(|tool| tool.name.as_str()).collect();
         assert!(inactive_names.contains(&"shell"));
+        assert!(inactive_names.contains(&"cron_add"));
         assert!(inactive_names.contains(&"read_skill"));
         assert!(!inactive_names.contains(&"web_fetch"));
 
