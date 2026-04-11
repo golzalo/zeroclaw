@@ -118,6 +118,245 @@ const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
     "ya pasaron",
 ];
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PromptFileUsage {
+    pub path: String,
+    pub injected_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PromptComponentBreakdown {
+    pub system_prompt_chars: usize,
+    pub memory_context_chars: usize,
+    pub hardware_context_chars: usize,
+    pub user_message_chars: usize,
+    pub enriched_user_chars: usize,
+    pub skills_prompt_chars: usize,
+    pub tool_instruction_chars: usize,
+    pub workspace_file_chars: usize,
+    pub workspace_files: Vec<PromptFileUsage>,
+    pub extra_context_file_chars: usize,
+    pub extra_context_files: Vec<PromptFileUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PromptMessageBreakdown {
+    pub total_chars: usize,
+    pub estimated_total_tokens: u64,
+    pub system_chars: usize,
+    pub user_chars: usize,
+    pub assistant_chars: usize,
+    pub tool_chars: usize,
+    pub messages_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmCallUsage {
+    pub iteration: usize,
+    pub duration_ms: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub prompt: PromptMessageBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UsageSummary {
+    pub request_count: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub prompt_components: PromptComponentBreakdown,
+    pub requests: Vec<LlmCallUsage>,
+    #[serde(default)]
+    pub budget_consumed_remotely: bool,
+    #[serde(default)]
+    pub remote_budget: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProcessMessageReport {
+    pub output: String,
+    pub usage: UsageSummary,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgentTurnOutcome {
+    pub(crate) output: String,
+    pub(crate) requests: Vec<LlmCallUsage>,
+}
+
+impl std::ops::Deref for AgentTurnOutcome {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.output.as_str()
+    }
+}
+
+impl From<AgentTurnOutcome> for String {
+    fn from(value: AgentTurnOutcome) -> Self {
+        value.output
+    }
+}
+
+impl PartialEq<&str> for AgentTurnOutcome {
+    fn eq(&self, other: &&str) -> bool {
+        self.output == *other
+    }
+}
+
+impl PartialEq<String> for AgentTurnOutcome {
+    fn eq(&self, other: &String) -> bool {
+        &self.output == other
+    }
+}
+
+fn estimated_tokens_from_chars(chars: usize) -> u64 {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        chars.div_ceil(4) as u64
+    }
+}
+
+fn analyze_prompt_messages(messages: &[ChatMessage]) -> PromptMessageBreakdown {
+    let mut breakdown = PromptMessageBreakdown {
+        messages_count: messages.len(),
+        ..PromptMessageBreakdown::default()
+    };
+
+    for message in messages {
+        let chars = message.content.chars().count();
+        breakdown.total_chars += chars;
+        match message.role.as_str() {
+            "system" => breakdown.system_chars += chars,
+            "user" => breakdown.user_chars += chars,
+            "assistant" => breakdown.assistant_chars += chars,
+            "tool" => breakdown.tool_chars += chars,
+            _ => breakdown.total_chars += 0,
+        }
+    }
+
+    breakdown.estimated_total_tokens = estimated_tokens_from_chars(breakdown.total_chars);
+    breakdown
+}
+
+fn injected_file_chars(path: &Path, max_chars: usize) -> Option<usize> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().count().min(max_chars))
+}
+
+fn collect_prompt_file_usage(
+    workspace_dir: &Path,
+    filenames: &[impl AsRef<str>],
+    max_chars: usize,
+) -> Vec<PromptFileUsage> {
+    filenames
+        .iter()
+        .filter_map(|name| {
+            let path = workspace_dir.join(name.as_ref());
+            injected_file_chars(&path, max_chars).map(|injected_chars| PromptFileUsage {
+                path: path.display().to_string(),
+                injected_chars,
+            })
+        })
+        .collect()
+}
+
+fn build_prompt_component_breakdown(
+    workspace_dir: &Path,
+    system_prompt: &str,
+    memory_context: &str,
+    hardware_context: &str,
+    user_message: &str,
+    enriched_user: &str,
+    skills: &[crate::skills::Skill],
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    tool_instruction_chars: usize,
+    extra_context_files: &[String],
+    max_chars_per_file: usize,
+) -> PromptComponentBreakdown {
+    let workspace_files = collect_prompt_file_usage(
+        workspace_dir,
+        &[
+            "AGENTS.md",
+            "SOUL.md",
+            "TOOLS.md",
+            "IDENTITY.md",
+            "USER.md",
+            "BOOTSTRAP.md",
+            "MEMORY.md",
+        ],
+        max_chars_per_file,
+    );
+    let extra_context_files_usage =
+        collect_prompt_file_usage(workspace_dir, extra_context_files, max_chars_per_file);
+    let skills_prompt_chars = if skills.is_empty() {
+        0
+    } else {
+        crate::skills::skills_to_prompt_with_mode(skills, workspace_dir, skills_prompt_mode)
+            .chars()
+            .count()
+    };
+
+    PromptComponentBreakdown {
+        system_prompt_chars: system_prompt.chars().count(),
+        memory_context_chars: memory_context.chars().count(),
+        hardware_context_chars: hardware_context.chars().count(),
+        user_message_chars: user_message.chars().count(),
+        enriched_user_chars: enriched_user.chars().count(),
+        skills_prompt_chars,
+        tool_instruction_chars,
+        workspace_file_chars: workspace_files.iter().map(|entry| entry.injected_chars).sum(),
+        workspace_files,
+        extra_context_file_chars: extra_context_files_usage
+            .iter()
+            .map(|entry| entry.injected_chars)
+            .sum(),
+        extra_context_files: extra_context_files_usage,
+    }
+}
+
+fn pricing_for_model(
+    prices: &HashMap<String, crate::config::schema::ModelPricing>,
+    model_name: &str,
+) -> crate::config::schema::ModelPricing {
+    prices
+        .get(model_name)
+        .cloned()
+        .or_else(|| {
+            prices.iter().find_map(|(configured_model, pricing)| {
+                if configured_model.eq_ignore_ascii_case(model_name) {
+                    Some(pricing.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(crate::config::schema::ModelPricing {
+            input: 0.0,
+            output: 0.0,
+        })
+}
+
+fn compute_usage_cost_usd(
+    prices: &HashMap<String, crate::config::schema::ModelPricing>,
+    model_name: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> f64 {
+    let pricing = pricing_for_model(prices, model_name);
+    let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input.max(0.0);
+    let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output.max(0.0);
+    input_cost + output_cost
+}
+
 const SCHEDULING_FAILURE_HINTS: &[&str] = &[
     "error",
     "fallo",
@@ -2797,7 +3036,7 @@ pub(crate) async fn agent_turn(
     skill_activations: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
-    run_tool_call_loop(
+    let outcome = run_tool_call_loop(
         provider,
         history,
         tools_registry,
@@ -2823,7 +3062,8 @@ pub(crate) async fn agent_turn(
         skill_activations,
         model_switch_callback,
     )
-    .await
+    .await?;
+    Ok(outcome.output)
 }
 
 fn maybe_inject_channel_delivery_defaults(
@@ -3163,7 +3403,7 @@ pub(crate) async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     skill_activations: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
-) -> Result<String> {
+) -> Result<AgentTurnOutcome> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -3173,6 +3413,7 @@ pub(crate) async fn run_tool_call_loop(
     let turn_id = Uuid::new_v4().to_string();
     let mut scheduled_delivery_created = false;
     let mut scheduled_delivery_verified = false;
+    let mut requests = Vec::new();
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -3292,6 +3533,7 @@ pub(crate) async fn run_tool_call_loop(
             .map(|tools| tools.iter().map(|tool| tool.name.as_str()).collect())
             .unwrap_or_default();
         let prompt_trace = format_prompt_messages_for_trace(&prepared_messages.messages);
+        let prompt_breakdown = analyze_prompt_messages(&prepared_messages.messages);
         tracing::trace!(
             provider = provider_name,
             model,
@@ -3338,6 +3580,18 @@ pub(crate) async fn run_tool_call_loop(
                         error_message: None,
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
+                    });
+                    requests.push(LlmCallUsage {
+                        iteration: iteration + 1,
+                        #[allow(clippy::cast_possible_truncation)]
+                        duration_ms: llm_started_at.elapsed().as_millis() as u64,
+                        input_tokens: resp_input_tokens,
+                        output_tokens: resp_output_tokens,
+                        cached_input_tokens: resp
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.cached_input_tokens),
+                        prompt: prompt_breakdown.clone(),
                     });
 
                     let response_text = resp.text_or_empty().to_string();
@@ -3389,6 +3643,16 @@ pub(crate) async fn run_tool_call_loop(
                             "duration_ms": llm_started_at.elapsed().as_millis(),
                             "input_tokens": resp_input_tokens,
                             "output_tokens": resp_output_tokens,
+                            "cached_input_tokens": resp.usage.as_ref().and_then(|usage| usage.cached_input_tokens),
+                            "prompt": {
+                                "total_chars": prompt_breakdown.total_chars,
+                                "estimated_total_tokens": prompt_breakdown.estimated_total_tokens,
+                                "system_chars": prompt_breakdown.system_chars,
+                                "user_chars": prompt_breakdown.user_chars,
+                                "assistant_chars": prompt_breakdown.assistant_chars,
+                                "tool_chars": prompt_breakdown.tool_chars,
+                                "messages_count": prompt_breakdown.messages_count,
+                            },
                             "raw_response": scrub_credentials(&response_text),
                             "native_tool_calls": resp.tool_calls.len(),
                             "parsed_tool_calls": calls.len(),
@@ -3615,7 +3879,10 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            return Ok(AgentTurnOutcome {
+                output: display_text,
+                requests,
+            });
         }
 
         // Native tool-call providers can return assistant text separately from
@@ -4425,7 +4692,7 @@ pub async fn run(
             .await
             {
                 Ok(resp) => {
-                    response = resp;
+                    response = resp.output;
                     break;
                 }
                 Err(e) => {
@@ -4664,7 +4931,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(resp) => break resp,
+                    Ok(resp) => break resp.output,
                     Err(e) => {
                         if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
                             tracing::info!(
@@ -4755,7 +5022,7 @@ pub async fn process_message(
     config: Config,
     message: &str,
     session_id: Option<&str>,
-) -> Result<String> {
+) -> Result<ProcessMessageReport> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -4947,6 +5214,11 @@ pub async fn process_message(
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
     }
+    let tool_instruction_chars = if native_tools {
+        0
+    } else {
+        build_tool_instructions(&active_tool_specs).chars().count()
+    };
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
         system_prompt.push_str(&deferred_section);
@@ -4971,6 +5243,19 @@ pub async fn process_message(
     } else {
         format!("{context}[{now}] {message}")
     };
+    let prompt_components = build_prompt_component_breakdown(
+        &config.workspace_dir,
+        &system_prompt,
+        &mem_context,
+        &hw_context,
+        message,
+        &enriched,
+        &skills,
+        config.skills.prompt_injection_mode,
+        tool_instruction_chars,
+        &config.agent.context_files,
+        bootstrap_max_chars.unwrap_or(20_000),
+    );
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),
@@ -4983,7 +5268,7 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    agent_turn(
+    let outcome = run_tool_call_loop(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -4995,18 +5280,55 @@ pub async fn process_message(
         &model_name,
         config.default_temperature,
         true,
+        Some(&approval_manager),
         "daemon",
         None,
         &config.multimodal,
         config.agent.max_tool_iterations,
-        Some(&approval_manager),
+        None,
+        None,
+        None,
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         Some(&skill_activations),
         None,
     )
-    .await
+    .await?;
+
+    let input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.input_tokens.unwrap_or(0))
+        .sum();
+    let output_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.output_tokens.unwrap_or(0))
+        .sum();
+    let cached_input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.cached_input_tokens.unwrap_or(0))
+        .sum();
+    let cost_usd =
+        compute_usage_cost_usd(&config.cost.prices, &model_name, input_tokens, output_tokens);
+
+    Ok(ProcessMessageReport {
+        output: outcome.output,
+        usage: UsageSummary {
+            request_count: outcome.requests.len(),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cost_usd,
+            prompt_components,
+            requests: outcome.requests,
+            budget_consumed_remotely: false,
+            remote_budget: None,
+        },
+    })
 }
 
 #[cfg(test)]

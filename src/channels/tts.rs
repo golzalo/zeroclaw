@@ -568,6 +568,41 @@ impl TtsManager {
     }
 }
 
+pub fn estimate_tts_billing(config: &TtsConfig, text: &str) -> Option<(String, String, serde_json::Value)> {
+    let characters = text.chars().count();
+    if characters == 0 {
+        return None;
+    }
+
+    let provider = config.default_provider.trim().to_ascii_lowercase();
+    let model = match provider.as_str() {
+        "openai" => config
+            .openai
+            .as_ref()
+            .map(|cfg| cfg.model.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "tts-1".to_string()),
+        "elevenlabs" => config
+            .elevenlabs
+            .as_ref()
+            .map(|cfg| cfg.model_id.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "eleven_monolingual_v1".to_string()),
+        "google" => "google-cloud-tts".to_string(),
+        "edge" => "edge-tts".to_string(),
+        _ => return None,
+    };
+
+    Some((
+        provider,
+        model,
+        serde_json::json!({
+            "type": "per_character",
+            "characters": characters,
+        }),
+    ))
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]

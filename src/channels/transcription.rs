@@ -738,6 +738,50 @@ pub async fn transcribe_audio(
     }
 }
 
+pub fn estimate_transcription_billing(
+    config: &TranscriptionConfig,
+    duration_secs: Option<u64>,
+) -> Option<(String, String, serde_json::Value)> {
+    let seconds = duration_secs?;
+    if seconds == 0 {
+        return None;
+    }
+
+    let provider = if config.enabled {
+        config.default_provider.trim().to_ascii_lowercase()
+    } else {
+        "groq".to_string()
+    };
+
+    let model = match provider.as_str() {
+        "openai" => config
+            .openai
+            .as_ref()
+            .map(|cfg| cfg.model.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "whisper-1".to_string()),
+        "groq" => config.model.trim().to_string(),
+        "deepgram" => config
+            .deepgram
+            .as_ref()
+            .map(|cfg| cfg.model.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "nova-2".to_string()),
+        "assemblyai" => "default".to_string(),
+        "google" => "google-speech-to-text".to_string(),
+        _ => return None,
+    };
+
+    Some((
+        provider,
+        model,
+        serde_json::json!({
+            "type": "per_second",
+            "seconds": seconds,
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

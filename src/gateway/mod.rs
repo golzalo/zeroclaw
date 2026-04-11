@@ -975,7 +975,10 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
 }
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
+async fn run_gateway_chat_simple(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<crate::agent::loop_::ProcessMessageReport> {
     let user_messages = vec![ChatMessage::user(message)];
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
@@ -993,17 +996,99 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     };
 
     let mut messages = Vec::with_capacity(1 + user_messages.len());
-    messages.push(ChatMessage::system(system_prompt));
+    messages.push(ChatMessage::system(&system_prompt));
     messages.extend(user_messages);
 
     let multimodal_config = state.config.lock().multimodal.clone();
     let prepared =
         crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
 
-    state
+    let prompt_breakdown = crate::agent::loop_::PromptMessageBreakdown {
+        total_chars: prepared
+            .messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum(),
+        estimated_total_tokens: prepared
+            .messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>()
+            .div_ceil(4) as u64,
+        system_chars: prepared
+            .messages
+            .iter()
+            .filter(|message| message.role == "system")
+            .map(|message| message.content.chars().count())
+            .sum(),
+        user_chars: prepared
+            .messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content.chars().count())
+            .sum(),
+        assistant_chars: 0,
+        tool_chars: 0,
+        messages_count: prepared.messages.len(),
+    };
+
+    let response = state
         .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
-        .await
+        .chat(
+            crate::providers::ChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+            },
+            &state.model,
+            state.temperature,
+        )
+        .await?;
+    let input_tokens = response
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.input_tokens)
+        .unwrap_or(0);
+    let output_tokens = response
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.output_tokens)
+        .unwrap_or(0);
+    let cached_input_tokens = response
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.cached_input_tokens)
+        .unwrap_or(0);
+
+    Ok(crate::agent::loop_::ProcessMessageReport {
+        output: response.text_or_empty().to_string(),
+        usage: crate::agent::loop_::UsageSummary {
+            request_count: 1,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cost_usd: 0.0,
+            prompt_components: crate::agent::loop_::PromptComponentBreakdown {
+                system_prompt_chars: system_prompt.chars().count(),
+                user_message_chars: message.chars().count(),
+                enriched_user_chars: message.chars().count(),
+                ..crate::agent::loop_::PromptComponentBreakdown::default()
+            },
+            requests: vec![crate::agent::loop_::LlmCallUsage {
+                iteration: 1,
+                duration_ms: 0,
+                input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),
+                output_tokens: response.usage.as_ref().and_then(|usage| usage.output_tokens),
+                cached_input_tokens: response
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.cached_input_tokens),
+                prompt: prompt_breakdown,
+            }],
+            budget_consumed_remotely: false,
+            remote_budget: None,
+        },
+    })
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
@@ -1011,17 +1096,355 @@ async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<crate::agent::loop_::ProcessMessageReport> {
     let config = state.config.lock().clone();
     Box::pin(crate::agent::process_message(config, message, session_id)).await
 }
 
+fn resolve_model_pricing(
+    prices: &HashMap<String, crate::config::schema::ModelPricing>,
+    model_name: &str,
+) -> crate::config::schema::ModelPricing {
+    prices
+        .get(model_name)
+        .cloned()
+        .or_else(|| {
+            prices.iter().find_map(|(configured_model, pricing)| {
+                if configured_model.eq_ignore_ascii_case(model_name) {
+                    Some(pricing.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(crate::config::schema::ModelPricing {
+            input: 0.0,
+            output: 0.0,
+        })
+}
+
+fn enrich_usage_cost(
+    summary: &mut crate::agent::loop_::UsageSummary,
+    prices: &HashMap<String, crate::config::schema::ModelPricing>,
+    model_name: &str,
+) {
+    let pricing = resolve_model_pricing(prices, model_name);
+    let input_cost = (summary.input_tokens as f64 / 1_000_000.0) * pricing.input.max(0.0);
+    let output_cost = (summary.output_tokens as f64 / 1_000_000.0) * pricing.output.max(0.0);
+    summary.cost_usd = input_cost + output_cost;
+}
+
+fn maybe_record_cost_tracker_usage(
+    state: &AppState,
+    summary: &crate::agent::loop_::UsageSummary,
+    model_name: &str,
+) {
+    let Some(ref tracker) = state.cost_tracker else {
+        return;
+    };
+    if summary.input_tokens == 0 && summary.output_tokens == 0 {
+        return;
+    }
+
+    let pricing = {
+        let config = state.config.lock();
+        resolve_model_pricing(&config.cost.prices, model_name)
+    };
+
+    let usage = crate::cost::types::TokenUsage::new(
+        model_name.to_string(),
+        summary.input_tokens,
+        summary.output_tokens,
+        pricing.input,
+        pricing.output,
+    );
+    if let Err(error) = tracker.record_usage(usage) {
+        tracing::warn!("Failed to record cost tracker usage: {error}");
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct RemoteBudgetSnapshot {
+    #[serde(default)]
+    #[serde(rename = "actorId")]
+    actor_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "monthlyIncludedBudgetUsd")]
+    monthly_included_budget_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "monthlyUsageUsd")]
+    monthly_usage_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "includedRemainingUsd")]
+    included_remaining_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "purchasedCreditBalanceUsd")]
+    purchased_credit_balance_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "availableBudgetUsd")]
+    available_budget_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "hardLimitEnabled")]
+    hard_limit_enabled: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct RemoteBudgetPricing {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "inputPriceUsdPer1M")]
+    input_price_usd_per_1m: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "outputPriceUsdPer1M")]
+    output_price_usd_per_1m: Option<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct RemoteBudgetCheckResponse {
+    #[serde(default)]
+    allowed: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "quoteId")]
+    quote_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "estimatedCostUsd")]
+    estimated_cost_usd: Option<f64>,
+    #[serde(default)]
+    pricing: Option<RemoteBudgetPricing>,
+    #[serde(default)]
+    snapshot: Option<RemoteBudgetSnapshot>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct RemoteBudgetConsumeResponse {
+    #[serde(default)]
+    duplicate: bool,
+    #[serde(default)]
+    #[serde(rename = "quoteId")]
+    quote_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "overflowUsd")]
+    overflow_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "debitedCreditsUsd")]
+    debited_credits_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "costUsd")]
+    cost_usd: Option<f64>,
+    #[serde(default)]
+    pricing: Option<RemoteBudgetPricing>,
+    #[serde(default)]
+    snapshot: Option<RemoteBudgetSnapshot>,
+}
+
+fn build_remote_budget_endpoint(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let suffix = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    format!("{base}{suffix}")
+}
+
+fn extract_instance_id_from_webhook(webhook_body: &WebhookBody) -> Option<String> {
+    webhook_body
+        .subscription
+        .as_ref()
+        .and_then(|value| value.get("instanceId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            webhook_body
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("targetInstanceId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn estimate_webhook_request_tokens(message: &str, agentic: bool) -> (u64, u64) {
+    let base_prompt_chars = if agentic { 8_000 } else { 4_000 };
+    let estimated_input_tokens = (message.chars().count() + base_prompt_chars).div_ceil(4) as u64;
+    let estimated_output_tokens = if agentic { 1_200 } else { 600 };
+    (estimated_input_tokens, estimated_output_tokens)
+}
+
+async fn remote_budget_check(
+    state: &AppState,
+    webhook_body: &WebhookBody,
+    provider_label: &str,
+    model_label: &str,
+) -> anyhow::Result<Option<RemoteBudgetCheckResponse>> {
+    let actor_id = webhook_body
+        .actor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(actor_id) = actor_id else {
+        return Ok(None);
+    };
+
+    let remote_budget = {
+        let config = state.config.lock();
+        config.cost.remote_budget.clone()
+    };
+    if !remote_budget.enabled || remote_budget.api_base_url.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let (estimated_input_tokens, estimated_output_tokens) =
+        estimate_webhook_request_tokens(&webhook_body.message, webhook_body.agentic);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(remote_budget.timeout_ms.max(1)))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let url = build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.check_path);
+    let mut request = client.post(url).json(&serde_json::json!({
+        "actorId": actor_id,
+        "scopeId": webhook_body.scope_id.clone(),
+        "instanceId": extract_instance_id_from_webhook(webhook_body),
+        "agentType": if webhook_body.agentic { "instance" } else { "instance_simple" },
+        "provider": provider_label,
+        "model": model_label,
+        "estimatedInputTokens": estimated_input_tokens,
+        "estimatedOutputTokens": estimated_output_tokens,
+    }));
+    if !remote_budget.api_token.trim().is_empty() {
+        request = request.bearer_auth(remote_budget.api_token.trim());
+    }
+
+    let response = request.send().await;
+    match response {
+        Ok(resp) => {
+            if resp.status().is_success() || resp.status() == StatusCode::PAYMENT_REQUIRED {
+                let payload = resp
+                    .json::<RemoteBudgetCheckResponse>()
+                    .await
+                    .context("Failed to parse remote budget check response")?;
+                Ok(Some(payload))
+            } else if remote_budget.fail_open {
+                tracing::warn!("Remote budget check failed with status {}", resp.status());
+                Ok(None)
+            } else {
+                anyhow::bail!("Remote budget check failed with status {}", resp.status());
+            }
+        }
+        Err(error) if remote_budget.fail_open => {
+            tracing::warn!("Remote budget check unavailable: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(anyhow::anyhow!("Remote budget check failed: {error}")),
+    }
+}
+
+async fn remote_budget_consume(
+    state: &AppState,
+    webhook_body: &WebhookBody,
+    provider_label: &str,
+    model_label: &str,
+    summary: &crate::agent::loop_::UsageSummary,
+    duration: Duration,
+    quote_id: Option<&str>,
+) -> anyhow::Result<Option<RemoteBudgetConsumeResponse>> {
+    let actor_id = webhook_body
+        .actor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(actor_id) = actor_id else {
+        return Ok(None);
+    };
+
+    let remote_budget = {
+        let config = state.config.lock();
+        config.cost.remote_budget.clone()
+    };
+    if !remote_budget.enabled || remote_budget.api_base_url.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(remote_budget.timeout_ms.max(1)))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let url = build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.consume_path);
+    let mut request = client.post(url).json(&serde_json::json!({
+        "eventId": format!("zeroclaw:{}:{}:{}", actor_id, webhook_body.scope_id.clone().unwrap_or_else(|| "scope".to_string()), Uuid::new_v4()),
+        "actorId": actor_id,
+        "instanceId": extract_instance_id_from_webhook(webhook_body),
+        "scopeId": webhook_body.scope_id.clone(),
+        "agentType": if webhook_body.agentic { "instance" } else { "instance_simple" },
+        "provider": provider_label,
+        "model": model_label,
+        "quoteId": quote_id,
+        "inputTokens": summary.input_tokens,
+        "outputTokens": summary.output_tokens,
+        "cachedInputTokens": summary.cached_input_tokens,
+        "totalTokens": summary.total_tokens,
+        "durationMs": duration.as_millis().min(u128::from(u64::MAX)) as u64,
+        "metadata": {
+            "requests": summary.requests,
+            "promptComponents": summary.prompt_components,
+        }
+    }));
+    if !remote_budget.api_token.trim().is_empty() {
+        request = request.bearer_auth(remote_budget.api_token.trim());
+    }
+
+    let response = request.send().await;
+    match response {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                let payload = resp
+                    .json::<RemoteBudgetConsumeResponse>()
+                    .await
+                    .context("Failed to parse remote budget consume response")?;
+                Ok(Some(payload))
+            } else if remote_budget.fail_open {
+                tracing::warn!("Remote budget consume failed with status {}", resp.status());
+                Ok(None)
+            } else {
+                anyhow::bail!("Remote budget consume failed with status {}", resp.status());
+            }
+        }
+        Err(error) if remote_budget.fail_open => {
+            tracing::warn!("Remote budget consume unavailable: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(anyhow::anyhow!("Remote budget consume failed: {error}")),
+    }
+}
+
 /// Webhook request body
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 pub struct WebhookBody {
     pub message: String,
     #[serde(default)]
     pub agentic: bool,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    #[serde(default)]
+    pub subscription: Option<serde_json::Value>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -1129,6 +1552,26 @@ async fn handle_webhook(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let model_label = state.model.clone();
+
+    let remote_budget_check_result =
+        match remote_budget_check(&state, &webhook_body, &provider_label, &model_label).await {
+        Ok(Some(check)) if !check.allowed => {
+            let body = serde_json::json!({
+                "error": "LLM budget exceeded",
+                "budget": check,
+            });
+            return (StatusCode::PAYMENT_REQUIRED, Json(body));
+        }
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!("Remote budget precheck failed: {error}");
+            let body = serde_json::json!({
+                "error": "Remote budget check failed",
+            });
+            return (StatusCode::BAD_GATEWAY, Json(body));
+        }
+    };
+
     let started_at = Instant::now();
 
     state
@@ -1152,8 +1595,38 @@ async fn handle_webhook(
     };
 
     match response_result {
-        Ok(response) => {
+        Ok(mut report) => {
             let duration = started_at.elapsed();
+            {
+                let config = state.config.lock();
+                enrich_usage_cost(&mut report.usage, &config.cost.prices, &state.model);
+            }
+            maybe_record_cost_tracker_usage(&state, &report.usage, &state.model);
+            match remote_budget_consume(
+                &state,
+                &webhook_body,
+                &provider_label,
+                &model_label,
+                &report.usage,
+                duration,
+                remote_budget_check_result
+                    .as_ref()
+                    .and_then(|check| check.quote_id.as_deref()),
+            )
+            .await
+            {
+                Ok(Some(remote_budget)) => {
+                    report.usage.budget_consumed_remotely = true;
+                    if let Some(cost_usd) = remote_budget.cost_usd {
+                        report.usage.cost_usd = cost_usd;
+                    }
+                    report.usage.remote_budget = serde_json::to_value(&remote_budget).ok();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!("Remote budget consume failed: {error}");
+                }
+            }
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::LlmResponse {
@@ -1162,8 +1635,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens: Some(report.usage.input_tokens),
+                    output_tokens: Some(report.usage.output_tokens),
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -1174,11 +1647,15 @@ async fn handle_webhook(
                     provider: provider_label,
                     model: model_label,
                     duration,
-                    tokens_used: None,
-                    cost_usd: None,
+                    tokens_used: Some(report.usage.total_tokens),
+                    cost_usd: Some(report.usage.cost_usd),
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({
+                "response": report.output,
+                "model": state.model,
+                "usage": report.usage,
+            });
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -1371,7 +1848,7 @@ async fn handle_whatsapp_message(
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(response.output, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
@@ -1491,7 +1968,7 @@ async fn handle_linq_webhook(
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(response.output, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send Linq reply: {e}");
@@ -1595,7 +2072,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
             Ok(response) => {
                 // Send reply via WATI
                 if let Err(e) = wati
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(response.output, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send WATI reply: {e}");
@@ -1710,7 +2187,7 @@ async fn handle_nextcloud_talk_webhook(
         {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(response.output, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send Nextcloud Talk reply: {e}");
@@ -2363,6 +2840,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            ..WebhookBody::default()
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -2376,6 +2854,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            ..WebhookBody::default()
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body)
             .await
@@ -2431,6 +2910,7 @@ mod tests {
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            ..WebhookBody::default()
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -2444,6 +2924,7 @@ mod tests {
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            ..WebhookBody::default()
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body2)
             .await
@@ -2514,6 +2995,7 @@ mod tests {
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                ..WebhookBody::default()
             })),
         )
         .await
@@ -2573,6 +3055,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                ..WebhookBody::default()
             })),
         )
         .await
@@ -2628,6 +3111,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                ..WebhookBody::default()
             })),
         )
         .await

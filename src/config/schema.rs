@@ -1397,6 +1397,42 @@ pub struct CostConfig {
     /// Per-model pricing (USD per 1M tokens)
     #[serde(default)]
     pub prices: std::collections::HashMap<String, ModelPricing>,
+
+    /// Optional remote budget API used by dedicated runtimes.
+    #[serde(default)]
+    pub remote_budget: RemoteBudgetConfig,
+}
+
+/// Remote budget API configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct RemoteBudgetConfig {
+    /// Enable remote budget checks/consumption.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Base URL for the marketplace API.
+    #[serde(default)]
+    pub api_base_url: String,
+
+    /// Internal check endpoint path.
+    #[serde(default = "default_remote_budget_check_path")]
+    pub check_path: String,
+
+    /// Internal consume endpoint path.
+    #[serde(default = "default_remote_budget_consume_path")]
+    pub consume_path: String,
+
+    /// Bearer token for authenticating to the internal API.
+    #[serde(default)]
+    pub api_token: String,
+
+    /// HTTP timeout for budget API calls.
+    #[serde(default = "default_remote_budget_timeout_ms")]
+    pub timeout_ms: u64,
+
+    /// Allow requests to proceed when the remote budget API is unavailable.
+    #[serde(default)]
+    pub fail_open: bool,
 }
 
 /// Per-model pricing entry (USD per 1M tokens).
@@ -1423,6 +1459,18 @@ fn default_warn_percent() -> u8 {
     80
 }
 
+fn default_remote_budget_check_path() -> String {
+    "/internal/llm-budget/check".to_string()
+}
+
+fn default_remote_budget_consume_path() -> String {
+    "/internal/llm-budget/consume".to_string()
+}
+
+fn default_remote_budget_timeout_ms() -> u64 {
+    5_000
+}
+
 impl Default for CostConfig {
     fn default() -> Self {
         Self {
@@ -1432,6 +1480,7 @@ impl Default for CostConfig {
             warn_at_percent: default_warn_percent(),
             allow_override: false,
             prices: get_default_pricing(),
+            remote_budget: RemoteBudgetConfig::default(),
         }
     }
 }
