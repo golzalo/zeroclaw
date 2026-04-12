@@ -10,10 +10,12 @@ use crate::cron::{
     reschedule_after_run, update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
     SessionTarget,
 };
+use crate::remote_budget::RemoteBudgetClient;
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
+use serde_json::json;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -220,19 +222,77 @@ async fn run_agent_job(
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
-    let model_override = job.model.clone();
+    let selected_model = resolve_cron_model(config, job.model.as_deref());
+    let model_name = selected_model.clone().unwrap_or_else(|| {
+        config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "gpt-5.1".to_string())
+    });
+    let mut run_config = config.clone();
+    let run_temperature = run_config.default_temperature;
+    run_config.default_model = Some(model_name.clone());
+
+    if job.model.as_deref() != selected_model.as_deref() {
+        let _ = update_job(
+            config,
+            &job.id,
+            CronJobPatch {
+                model: Some(model_name.clone()),
+                ..CronJobPatch::default()
+            },
+        );
+    }
+
+    let scope_id = format!("cron::{}", job.id);
+    let provider_name = config
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "openai".to_string());
+    let remote_budget = RemoteBudgetClient::from_env();
+    let remote_budget_metadata = json!({
+        "source": "cron",
+        "jobId": job.id,
+        "jobName": job.name,
+        "jobType": "agent",
+        "schedule": job.schedule,
+        "sessionTarget": job.session_target.as_str(),
+    });
+    let quote = if let Some(remote_budget) = remote_budget.as_ref() {
+        match remote_budget
+            .check_text_quote(
+                Some(&scope_id),
+                "cron",
+                &provider_name,
+                &model_name,
+                estimate_cron_input_tokens(&prefixed_prompt),
+                512,
+                remote_budget_metadata.clone(),
+            )
+            .await
+        {
+            Ok(check) if !check.allowed => {
+                let reason = check
+                    .reason
+                    .unwrap_or_else(|| "LLM budget exceeded".to_string());
+                return (false, reason);
+            }
+            Ok(check) => check.quote_id,
+            Err(error) => return (false, format!("agent job failed: remote budget check failed: {error}")),
+        }
+    } else {
+        None
+    };
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(crate::agent::run(
-                config.clone(),
-                Some(prefixed_prompt),
+            Box::pin(crate::agent::loop_::run_with_report(
+                run_config,
+                prefixed_prompt,
                 None,
-                model_override,
-                config.default_temperature,
+                selected_model,
+                run_temperature,
                 vec![],
-                false,
-                None,
                 job.allowed_tools.clone(),
             ))
             .await
@@ -240,15 +300,85 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
-        ),
+        Ok(report) => {
+            if let Some(remote_budget) = remote_budget.as_ref() {
+                let duration_ms: u64 = report
+                    .usage
+                    .requests
+                    .iter()
+                    .map(|request| request.duration_ms)
+                    .sum();
+                let event_id = format!("zeroclaw:cron:{}:{}", job.id, Utc::now().timestamp_millis());
+                let consume_metadata = json!({
+                    "source": "cron",
+                    "jobId": job.id,
+                    "jobName": job.name,
+                    "jobType": "agent",
+                    "schedule": job.schedule,
+                    "sessionTarget": job.session_target.as_str(),
+                    "requestCount": report.usage.request_count,
+                    "promptComponents": report.usage.prompt_components,
+                    "requests": report.usage.requests,
+                });
+                if let Err(error) = remote_budget
+                    .consume_text_quote(
+                        Some(&scope_id),
+                        &event_id,
+                        quote.as_deref(),
+                        "cron",
+                        &provider_name,
+                        &model_name,
+                        report.usage.input_tokens,
+                        report.usage.output_tokens,
+                        report.usage.cached_input_tokens,
+                        duration_ms,
+                        consume_metadata,
+                    )
+                    .await
+                {
+                    tracing::warn!(job_id = %job.id, error = %error, "Cron remote budget consume failed");
+                }
+            }
+            (
+                true,
+                if report.output.trim().is_empty() {
+                    "agent job executed".to_string()
+                } else {
+                    report.output
+                },
+            )
+        }
         Err(e) => (false, format!("agent job failed: {e}")),
+    }
+}
+
+fn resolve_cron_model(config: &Config, raw_model: Option<&str>) -> Option<String> {
+    let requested = raw_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let default_provider = config.default_provider.as_deref().unwrap_or("openai");
+
+    if default_provider.eq_ignore_ascii_case("openai") && requested.contains('/') {
+        let fallback_model = config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "gpt-5.1".to_string());
+        tracing::warn!(
+            provider = %default_provider,
+            requested_model = %requested,
+            fallback_model = %fallback_model,
+            "Cron model override is incompatible with provider; falling back to default model"
+        );
+        return Some(fallback_model);
+    }
+
+    Some(requested.to_string())
+}
+
+fn estimate_cron_input_tokens(prompt: &str) -> u64 {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        prompt.chars().count().div_ceil(4) as u64
     }
 }
 
@@ -945,6 +1075,26 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn resolve_cron_model_falls_back_for_openai_namespace_override() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+
+        let resolved = resolve_cron_model(&config, Some("x-ai/grok-4-1-fast"));
+
+        assert_eq!(resolved.as_deref(), config.default_model.as_deref());
+    }
+
+    #[tokio::test]
+    async fn resolve_cron_model_keeps_plain_openai_model() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+
+        let resolved = resolve_cron_model(&config, Some("gpt-5.1"));
+
+        assert_eq!(resolved.as_deref(), Some("gpt-5.1"));
     }
 
     #[tokio::test]

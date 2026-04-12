@@ -188,6 +188,11 @@ pub(crate) struct AgentTurnOutcome {
     pub(crate) requests: Vec<LlmCallUsage>,
 }
 
+struct SingleTurnExecution {
+    output: String,
+    usage: UsageSummary,
+}
+
 impl std::ops::Deref for AgentTurnOutcome {
     type Target = str;
 
@@ -4329,6 +4334,24 @@ pub async fn run(
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
 ) -> Result<String> {
+    if let Some(ref msg) = message {
+        if !interactive {
+            let report = run_single_turn_with_report(
+                config,
+                msg,
+                provider_override,
+                model_override,
+                temperature,
+                peripheral_overrides,
+                allowed_tools,
+                session_state_file,
+            )
+            .await?;
+            println!("{}", report.output);
+            return Ok(report.output);
+        }
+    }
+
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -5016,12 +5039,445 @@ pub async fn run(
     Ok(final_output)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_single_turn_with_report(
+    config: Config,
+    message: &str,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    allowed_tools: Option<Vec<String>>,
+    session_state_file: Option<PathBuf>,
+) -> Result<ProcessMessageReport> {
+    let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?);
+
+    if !peripheral_overrides.is_empty() {
+        tracing::info!(
+            peripherals = ?peripheral_overrides,
+            "Peripheral overrides from CLI (config boards take precedence)"
+        );
+    }
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let (mut tools_registry, delegate_handle) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    );
+
+    let peripheral_tools: Vec<Box<dyn Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    if !peripheral_tools.is_empty() {
+        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
+        tools_registry.extend(peripheral_tools);
+    }
+
+    let mut effective_allowed_tools: Option<Vec<String>> = None;
+    if !config.agent.allowed_tools.is_empty() {
+        effective_allowed_tools = Some(config.agent.allowed_tools.clone());
+    }
+    if let Some(cli_allowed) = allowed_tools {
+        effective_allowed_tools = Some(match effective_allowed_tools {
+            Some(mut existing) => {
+                existing.retain(|name| cli_allowed.iter().any(|cli| cli == name));
+                existing
+            }
+            None => cli_allowed,
+        });
+    }
+    if let Some(ref allow_list) = effective_allowed_tools {
+        tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        tracing::info!(
+            allowed = allow_list.len(),
+            retained = tools_registry.len(),
+            "Applied capability-based tool access filter"
+        );
+    }
+
+    let mut deferred_section = String::new();
+    let mut activated_handle: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            config.mcp.servers.len()
+        );
+        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                if config.mcp.deferred_loading {
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    tracing::info!(
+                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                        deferred_set.len(),
+                        registry.server_count()
+                    );
+                    deferred_section =
+                        crate::tools::mcp_deferred::build_deferred_tools_section(&deferred_set);
+                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::ActivatedToolSet::new(),
+                    ));
+                    activated_handle = Some(std::sync::Arc::clone(&activated));
+                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated,
+                    )));
+                } else {
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                            registered += 1;
+                        }
+                    }
+                    tracing::info!(
+                        "MCP: {} tool(s) registered from {} server(s)",
+                        registered,
+                        registry.server_count()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("MCP registry failed to initialize: {e:#}");
+            }
+        }
+    }
+
+    let mut provider_name = provider_override
+        .as_deref()
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter")
+        .to_string();
+
+    let mut model_name = model_override
+        .as_deref()
+        .or(config.default_model.as_deref())
+        .unwrap_or("anthropic/claude-sonnet-4")
+        .to_string();
+
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
+
+    let mut provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+        &provider_name,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &config.model_routes,
+        &model_name,
+        &provider_runtime_options,
+    )?;
+
+    let model_switch_callback = get_model_switch_state();
+
+    observer.record_event(&ObserverEvent::AgentStart {
+        provider: provider_name.to_string(),
+        model: model_name.to_string(),
+    });
+
+    let hardware_rag: Option<crate::rag::HardwareRag> = config
+        .peripherals
+        .datasheet_dir
+        .as_ref()
+        .filter(|d| !d.trim().is_empty())
+        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+        .and_then(Result::ok)
+        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
+
+    let board_names: Vec<String> = config
+        .peripherals
+        .boards
+        .iter()
+        .map(|b| b.board.clone())
+        .collect();
+
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
+    let skills = filter_skills_by_allowlist(
+        crate::skills::load_skills_with_config(&config.workspace_dir, &config),
+        &config.agent.allowed_skills,
+    );
+    let activation_sets = activated_handle.iter().collect::<Vec<_>>();
+    let active_tool_specs = crate::tools::active_tool_specs(
+        &tools_registry,
+        &activation_sets,
+        &[],
+        config.skills.prompt_injection_mode,
+        Some(&i18n_descs),
+    );
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
+        &config.workspace_dir,
+        &model_name,
+        &active_tool_specs,
+        &skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+        Some(&config.autonomy),
+        native_tools,
+        config.skills.prompt_injection_mode,
+        &config.agent.context_files,
+    );
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
+    }
+    let tool_instruction_chars = if native_tools {
+        0
+    } else {
+        build_tool_instructions(&active_tool_specs).chars().count()
+    };
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
+    }
+
+    let memory_session_id = session_state_file
+        .as_deref()
+        .and_then(memory_session_id_from_state_file);
+
+    if config.memory.auto_save
+        && message.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !memory::should_skip_autosave_content(message)
+    {
+        let user_key = autosave_memory_key("user_msg");
+        let _ = mem
+            .store(
+                &user_key,
+                message,
+                MemoryCategory::Conversation,
+                memory_session_id.as_deref(),
+            )
+            .await;
+    }
+
+    let mem_context = build_context(
+        mem.as_ref(),
+        message,
+        config.memory.min_relevance_score,
+        memory_session_id.as_deref(),
+    )
+    .await;
+    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+    let hw_context = hardware_rag
+        .as_ref()
+        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
+        .unwrap_or_default();
+    let context = format!("{mem_context}{hw_context}");
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let enriched = if context.is_empty() {
+        format!("[{now}] {message}")
+    } else {
+        format!("{context}[{now}] {message}")
+    };
+    let prompt_components = build_prompt_component_breakdown(
+        &config.workspace_dir,
+        &system_prompt,
+        &mem_context,
+        &hw_context,
+        message,
+        &enriched,
+        &skills,
+        config.skills.prompt_injection_mode,
+        tool_instruction_chars,
+        &config.agent.context_files,
+        bootstrap_max_chars.unwrap_or(20_000),
+    );
+
+    let mut history = vec![
+        ChatMessage::system(&system_prompt),
+        ChatMessage::user(&enriched),
+    ];
+    let skill_activations = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+    let excluded_tools =
+        compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, message);
+
+    let outcome = loop {
+        match run_tool_call_loop(
+            provider.as_ref(),
+            &mut history,
+            &tools_registry,
+            &skills,
+            Some(&i18n_descs),
+            config.skills.prompt_injection_mode,
+            observer.as_ref(),
+            &provider_name,
+            &model_name,
+            temperature,
+            false,
+            None,
+            "daemon",
+            None,
+            &config.multimodal,
+            config.agent.max_tool_iterations,
+            None,
+            None,
+            None,
+            &excluded_tools,
+            &config.agent.tool_call_dedup_exempt,
+            activated_handle.as_ref(),
+            Some(&skill_activations),
+            Some(model_switch_callback.clone()),
+        )
+        .await
+        {
+            Ok(outcome) => break outcome,
+            Err(e) => {
+                if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                    tracing::info!(
+                        "Model switch requested, switching from {} {} to {} {}",
+                        provider_name,
+                        model_name,
+                        new_provider,
+                        new_model
+                    );
+
+                    provider = providers::create_routed_provider_with_options(
+                        &new_provider,
+                        config.api_key.as_deref(),
+                        config.api_url.as_deref(),
+                        &config.reliability,
+                        &config.model_routes,
+                        &new_model,
+                        &provider_runtime_options,
+                    )?;
+
+                    provider_name = new_provider;
+                    model_name = new_model;
+                    clear_model_switch_request();
+
+                    observer.record_event(&ObserverEvent::AgentStart {
+                        provider: provider_name.to_string(),
+                        model: model_name.to_string(),
+                    });
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    };
+
+    let input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.input_tokens.unwrap_or(0))
+        .sum();
+    let output_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.output_tokens.unwrap_or(0))
+        .sum();
+    let cached_input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.cached_input_tokens.unwrap_or(0))
+        .sum();
+    let cost_usd =
+        compute_usage_cost_usd(&config.cost.prices, &model_name, input_tokens, output_tokens);
+
+    Ok(ProcessMessageReport {
+        output: outcome.output,
+        usage: UsageSummary {
+            request_count: outcome.requests.len(),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cost_usd,
+            prompt_components,
+            requests: outcome.requests,
+            budget_consumed_remotely: false,
+            remote_budget: None,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_report(
+    config: Config,
+    message: String,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    allowed_tools: Option<Vec<String>>,
+) -> Result<ProcessMessageReport> {
+    run_single_turn_with_report(
+        config,
+        &message,
+        provider_override,
+        model_override,
+        temperature,
+        peripheral_overrides,
+        allowed_tools,
+        None,
+    )
+    .await
+}
+
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(
     config: Config,
     message: &str,
     session_id: Option<&str>,
+    allowed_tools: Option<Vec<String>>,
 ) -> Result<ProcessMessageReport> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -5066,6 +5522,28 @@ pub async fn process_message(
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+
+    let mut effective_allowed_tools: Option<Vec<String>> = None;
+    if !config.agent.allowed_tools.is_empty() {
+        effective_allowed_tools = Some(config.agent.allowed_tools.clone());
+    }
+    if let Some(cli_allowed) = allowed_tools {
+        effective_allowed_tools = Some(match effective_allowed_tools {
+            Some(mut existing) => {
+                existing.retain(|name| cli_allowed.iter().any(|cli| cli == name));
+                existing
+            }
+            None => cli_allowed,
+        });
+    }
+    if let Some(ref allow_list) = effective_allowed_tools {
+        tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        tracing::info!(
+            allowed = allow_list.len(),
+            retained = tools_registry.len(),
+            "Applied capability-based tool access filter"
+        );
+    }
 
     // ── Wire MCP tools (non-fatal) — process_message path ────────
     // NOTE: Same ordering contract as the CLI path above — MCP tools must be
