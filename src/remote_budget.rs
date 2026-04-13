@@ -240,6 +240,37 @@ impl RemoteBudgetClient {
         .await
     }
 
+    pub async fn consume_explicit_usage(
+        &self,
+        scope_id: Option<&str>,
+        event_id: &str,
+        agent_type: &str,
+        provider: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+        duration_ms: u64,
+        cost_usd: f64,
+        metadata: serde_json::Value,
+    ) -> anyhow::Result<RemoteBudgetConsumeResponse> {
+        self.consume_request(
+            event_id,
+            scope_id,
+            None,
+            agent_type,
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            duration_ms,
+            Some(cost_usd.max(0.0)),
+            metadata,
+        )
+        .await
+    }
+
     pub async fn estimate_pricing(
         &self,
         provider: &str,

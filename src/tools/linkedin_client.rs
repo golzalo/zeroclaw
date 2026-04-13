@@ -1765,6 +1765,27 @@ mod tests {
     }
 
     #[test]
+    fn estimate_image_billing_uses_openai_gpt_image_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = LinkedInImageConfig::default();
+        config.dalle.model = "gpt-image-1".into();
+        config.dalle.size = "1024x1536".into();
+
+        let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
+        let (provider, model, billing) = generator
+            .estimate_image_billing("dalle")
+            .expect("dalle billing should be available");
+
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-image-1");
+        assert_eq!(billing.get("type").and_then(|value| value.as_str()), Some("per_image"));
+        assert_eq!(
+            billing.get("size").and_then(|value| value.as_str()),
+            Some("1024x1536")
+        );
+    }
+
+    #[test]
     fn openai_image_request_keeps_response_format_for_legacy_dalle_models() {
         let tmp = TempDir::new().unwrap();
         let mut config = LinkedInImageConfig::default();

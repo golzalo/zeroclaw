@@ -2164,6 +2164,58 @@ fn slugify_image_basename(prompt: &str) -> String {
     base.chars().take(48).collect()
 }
 
+const PERSISTENT_IMAGE_PROVIDER: &str = "openai";
+const PERSISTENT_IMAGE_MODEL: &str = "gpt-image-1";
+const PERSISTENT_IMAGE_SIZE: &str = "1024x1024";
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistentImageUsagePayload {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistentImageUsageSidecar {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    usage: Option<PersistentImageUsagePayload>,
+}
+
+fn persistent_image_billing() -> (String, String, serde_json::Value) {
+    (
+        PERSISTENT_IMAGE_PROVIDER.to_string(),
+        PERSISTENT_IMAGE_MODEL.to_string(),
+        serde_json::json!({
+            "type": "per_image",
+            "imageCount": 1,
+            "size": PERSISTENT_IMAGE_SIZE,
+        }),
+    )
+}
+
+async fn load_persistent_image_usage_sidecar(
+    usage_path: &Path,
+) -> Option<PersistentImageUsageSidecar> {
+    let contents = match tokio::fs::read_to_string(usage_path).await {
+        Ok(contents) => contents,
+        Err(_) => return None,
+    };
+    let parsed = serde_json::from_str::<PersistentImageUsageSidecar>(&contents).ok();
+    let _ = tokio::fs::remove_file(usage_path).await;
+    parsed
+}
+
 async fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) -> Option<String> {
     let script_path = workspace_dir.join("tools").join("persistent_image_generate.py");
     if !script_path.is_file() {
@@ -2180,23 +2232,22 @@ async fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) ->
         .as_secs();
     let output_name = format!("{}-{timestamp}.png", slugify_image_basename(prompt));
     let output_rel = format!("outbox/images/{output_name}");
+    let usage_rel = format!("outbox/images/{output_name}.usage.json");
+    let usage_path = workspace_dir.join(&usage_rel);
 
     let mut budget_charge = None;
     if let Some(remote_budget) = RemoteBudgetClient::from_env() {
-        let billing = serde_json::json!({
-            "type": "per_image",
-            "imageCount": 1,
-            "size": "default",
-        });
+        let (provider, model, billing) = persistent_image_billing();
         match remote_budget
-            .estimate_pricing("python", "persistent-image-generate", billing.clone())
+            .estimate_pricing(&provider, &model, billing.clone())
             .await
         {
             Ok(pricing) => {
                 let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
                 let metadata = serde_json::json!({
                     "modality": "image_generation",
-                    "providerAttempt": "python",
+                    "providerAttempt": provider.clone(),
+                    "executionPath": "python_script",
                     "promptChars": prompt.chars().count(),
                     "billing": billing,
                 });
@@ -2204,15 +2255,16 @@ async fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) ->
                     .check_explicit_cost(
                         Some("image:generate:persistent"),
                         "instance_image",
-                        "python",
-                        "persistent-image-generate",
+                        &provider,
+                        &model,
                         estimated_cost_usd,
                         metadata.clone(),
                     )
                     .await
                 {
                     Ok(check) if check.allowed => {
-                        budget_charge = Some((remote_budget, estimated_cost_usd, metadata));
+                        budget_charge =
+                            Some((remote_budget, provider, model, estimated_cost_usd, metadata));
                     }
                     Ok(_) => {
                         tracing::info!("persistent image generator skipped because budget is exhausted");
@@ -2233,8 +2285,14 @@ async fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) ->
         .arg(&script_path)
         .arg("--prompt")
         .arg(prompt)
+        .arg("--model")
+        .arg(PERSISTENT_IMAGE_MODEL)
+        .arg("--size")
+        .arg(PERSISTENT_IMAGE_SIZE)
         .arg("--output")
         .arg(&output_rel)
+        .arg("--usage-output")
+        .arg(&usage_rel)
         .current_dir(workspace_dir)
         .env("ZEROCLAW_WORKSPACE", workspace_dir)
         .output()
@@ -2257,24 +2315,74 @@ async fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) ->
 
     let marker = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if marker.starts_with("[IMAGE:") && marker.ends_with(']') {
-        if let Some((remote_budget, estimated_cost_usd, metadata)) = budget_charge {
-            let _ = remote_budget
-                .consume_explicit_cost(
-                    Some("image:generate:persistent"),
-                    &format!("zeroclaw:image:generate:persistent:{}", uuid::Uuid::new_v4()),
-                    "instance_image",
-                    "python",
-                    "persistent-image-generate",
-                    estimated_cost_usd,
-                    0,
-                    serde_json::json!({
-                        "modality": "image_generation",
-                        "providerAttempt": "python",
-                        "marker": marker,
-                        "base": metadata,
-                    }),
-                )
-                .await;
+        let usage_sidecar = load_persistent_image_usage_sidecar(&usage_path).await;
+        if let Some((remote_budget, provider, model, estimated_cost_usd, metadata)) = budget_charge
+        {
+            let event_id = format!(
+                "zeroclaw:image:generate:persistent:{}",
+                uuid::Uuid::new_v4()
+            );
+            let result = if let Some(usage) = usage_sidecar.and_then(|entry| entry.usage) {
+                let total_tokens = if usage.total_tokens > 0 {
+                    usage.total_tokens
+                } else {
+                    usage.input_tokens.saturating_add(usage.output_tokens)
+                };
+                remote_budget
+                    .consume_explicit_usage(
+                        Some("image:generate:persistent"),
+                        &event_id,
+                        "instance_image",
+                        &provider,
+                        &model,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cached_input_tokens,
+                        0,
+                        estimated_cost_usd,
+                        serde_json::json!({
+                            "modality": "image_generation",
+                            "providerAttempt": provider,
+                            "executionPath": "python_script",
+                            "marker": marker,
+                            "base": metadata,
+                            "usage": {
+                                "inputTokens": usage.input_tokens,
+                                "outputTokens": usage.output_tokens,
+                                "cachedInputTokens": usage.cached_input_tokens,
+                                "totalTokens": total_tokens,
+                            }
+                        }),
+                    )
+                    .await
+            } else {
+                remote_budget
+                    .consume_explicit_cost(
+                        Some("image:generate:persistent"),
+                        &event_id,
+                        "instance_image",
+                        &provider,
+                        &model,
+                        estimated_cost_usd,
+                        0,
+                        serde_json::json!({
+                            "modality": "image_generation",
+                            "providerAttempt": provider,
+                            "executionPath": "python_script",
+                            "marker": marker,
+                            "base": metadata,
+                        }),
+                    )
+                    .await
+            };
+
+            if let Err(error) = result {
+                tracing::warn!(
+                    err = %error,
+                    marker = %marker,
+                    "failed to record persistent image budget consumption"
+                );
+            }
         }
         Some(marker)
     } else {
@@ -10874,6 +10982,18 @@ This is an example JSON object for profile settings."#;
             sent_messages.len(),
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_image_billing_targets_openai_gpt_image() {
+        let (provider, model, billing) = persistent_image_billing();
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-image-1");
+        assert_eq!(billing.get("type").and_then(|value| value.as_str()), Some("per_image"));
+        assert_eq!(
+            billing.get("size").and_then(|value| value.as_str()),
+            Some("1024x1024")
         );
     }
 }
