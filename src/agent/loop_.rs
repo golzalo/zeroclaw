@@ -3298,6 +3298,8 @@ struct ToolExecutionOutcome {
     duration: Duration,
 }
 
+const TOOL_RESULT_HISTORY_CHAR_LIMIT: usize = 12_000;
+
 fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
     approval: Option<&ApprovalManager>,
@@ -3315,6 +3317,33 @@ fn should_execute_tools_in_parallel(
     }
 
     true
+}
+
+fn compact_tool_output_for_history(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.chars().count() <= TOOL_RESULT_HISTORY_CHAR_LIMIT {
+        return trimmed.to_string();
+    }
+
+    let head_budget = TOOL_RESULT_HISTORY_CHAR_LIMIT * 2 / 3;
+    let tail_budget = TOOL_RESULT_HISTORY_CHAR_LIMIT / 6;
+    let total_chars = trimmed.chars().count();
+    let head = truncate_with_ellipsis(trimmed, head_budget);
+    let tail_chars: String = trimmed
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    format!(
+        "{head}\n\n[tool output truncated for history: kept ~{} of {} chars]\n\n{}",
+        head.chars().count() + tail_chars.chars().count(),
+        total_chars,
+        tail_chars
+    )
 }
 
 async fn execute_tools_parallel(
@@ -4209,11 +4238,12 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            individual_results.push((tool_call_id, outcome.output.clone()));
+            let compact_output = compact_tool_output_for_history(&outcome.output);
+            individual_results.push((tool_call_id, compact_output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
+                tool_name, compact_output
             );
         }
 
