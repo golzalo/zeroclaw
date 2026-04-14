@@ -1,4 +1,5 @@
 use crate::config::LinkedInImageConfig;
+use crate::remote_budget::RemoteBudgetClient;
 use anyhow::Context;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest::Method;
@@ -780,6 +781,7 @@ impl ImageGenerator {
     pub async fn generate(&self, prompt: &str) -> anyhow::Result<PathBuf> {
         let image_dir = self.workspace_dir.join(&self.config.temp_dir);
         tokio::fs::create_dir_all(&image_dir).await?;
+        let remote_budget = RemoteBudgetClient::from_env();
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -789,6 +791,63 @@ impl ImageGenerator {
 
         // Try each configured provider in order
         for provider_name in &self.config.providers {
+            let mut budget_charge = None;
+            if let (Some(remote_budget), Some((provider, model, billing))) = (
+                remote_budget.as_ref(),
+                self.estimate_image_billing(provider_name),
+            ) {
+                match remote_budget
+                    .estimate_pricing(&provider, &model, billing.clone())
+                    .await
+                {
+                    Ok(pricing) => {
+                        let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
+                        let metadata = json!({
+                            "modality": "image_generation",
+                            "providerAttempt": provider_name,
+                            "promptChars": prompt.chars().count(),
+                            "billing": billing,
+                        });
+                        match remote_budget
+                            .check_explicit_cost(
+                                Some("image:generate"),
+                                "instance_image",
+                                &provider,
+                                &model,
+                                estimated_cost_usd,
+                                metadata.clone(),
+                            )
+                            .await
+                        {
+                            Ok(check) if check.allowed => {
+                                budget_charge = Some((
+                                    provider,
+                                    model,
+                                    estimated_cost_usd,
+                                    metadata,
+                                ));
+                            }
+                            Ok(_) => {
+                                tracing::info!(
+                                    "Image provider '{provider_name}' skipped because budget is exhausted"
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Image provider '{provider_name}' budget check failed: {error}"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Image provider '{provider_name}' pricing estimate failed: {error}"
+                        );
+                    }
+                }
+            }
+
             let result = match provider_name.as_str() {
                 "stability" => self.try_stability(prompt, &image_dir, &base_name).await,
                 "imagen" => self.try_imagen(prompt, &image_dir, &base_name).await,
@@ -802,6 +861,27 @@ impl ImageGenerator {
 
             match result {
                 Ok(path) => {
+                    if let (Some(remote_budget), Some((provider, model, estimated_cost_usd, metadata))) =
+                        (remote_budget.as_ref(), budget_charge)
+                    {
+                        let _ = remote_budget
+                            .consume_explicit_cost(
+                                Some("image:generate"),
+                                &format!("zeroclaw:image:generate:{}", uuid::Uuid::new_v4()),
+                                "instance_image",
+                                &provider,
+                                &model,
+                                estimated_cost_usd,
+                                0,
+                                json!({
+                                    "modality": "image_generation",
+                                    "providerAttempt": provider_name,
+                                    "outputPath": path.display().to_string(),
+                                    "base": metadata,
+                                }),
+                            )
+                            .await;
+                    }
                     tracing::info!("Image generated via {provider_name}: {}", path.display());
                     return Ok(path);
                 }
@@ -891,6 +971,48 @@ impl ImageGenerator {
             "webp"
         } else {
             "png"
+        }
+    }
+
+    fn estimate_image_billing(&self, provider_name: &str) -> Option<(String, String, serde_json::Value)> {
+        match provider_name {
+            "stability" => Some((
+                "stability".to_string(),
+                self.config.stability.model.trim().to_string(),
+                json!({
+                    "type": "per_image",
+                    "imageCount": 1,
+                    "size": "1024x1024",
+                }),
+            )),
+            "imagen" => Some((
+                "google".to_string(),
+                "imagen-3.0-generate-001".to_string(),
+                json!({
+                    "type": "per_image",
+                    "imageCount": 1,
+                    "size": "1:1",
+                }),
+            )),
+            "dalle" => Some((
+                "openai".to_string(),
+                self.config.dalle.model.trim().to_string(),
+                json!({
+                    "type": "per_image",
+                    "imageCount": 1,
+                    "size": self.config.dalle.size,
+                }),
+            )),
+            "flux" => Some((
+                "fal".to_string(),
+                self.config.flux.model.trim().to_string(),
+                json!({
+                    "type": "per_image",
+                    "imageCount": 1,
+                    "size": "square_hd",
+                }),
+            )),
+            _ => None,
         }
     }
 
@@ -1640,6 +1762,27 @@ mod tests {
 
         assert_eq!(body.get("model").and_then(|v| v.as_str()), Some("gpt-image-1"));
         assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn estimate_image_billing_uses_openai_gpt_image_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = LinkedInImageConfig::default();
+        config.dalle.model = "gpt-image-1".into();
+        config.dalle.size = "1024x1536".into();
+
+        let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
+        let (provider, model, billing) = generator
+            .estimate_image_billing("dalle")
+            .expect("dalle billing should be available");
+
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-image-1");
+        assert_eq!(billing.get("type").and_then(|value| value.as_str()), Some("per_image"));
+        assert_eq!(
+            billing.get("size").and_then(|value| value.as_str()),
+            Some("1024x1536")
+        );
     }
 
     #[test]

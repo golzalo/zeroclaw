@@ -102,6 +102,7 @@ mod peripherals;
 mod plugins;
 mod providers;
 mod runtime;
+mod remote_budget;
 mod security;
 mod service;
 mod skillforge;

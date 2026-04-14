@@ -1,10 +1,14 @@
 use super::traits::{Tool, ToolResult};
+use crate::remote_budget::RemoteBudgetClient;
 use crate::runtime::RuntimeAdapter;
 use crate::security::traits::Sandbox;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use regex::Regex;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +16,10 @@ use std::time::Duration;
 const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+const PERSISTENT_IMAGE_DEFAULT_MODEL: &str = "gpt-image-1";
+const PERSISTENT_IMAGE_DEFAULT_SIZE: &str = "1024x1024";
+const PERSISTENT_IMAGE_SCOPE_ID: &str = "image:generate:persistent";
+const PERSISTENT_IMAGE_AGENT_TYPE: &str = "instance_image";
 
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
@@ -68,6 +76,86 @@ impl ShellTool {
             sandbox,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistentImageUsagePayload {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistentImageUsageSidecar {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    usage: Option<PersistentImageUsagePayload>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPersistentImageCharge {
+    remote_budget: RemoteBudgetClient,
+    provider: String,
+    model: String,
+    estimated_cost_usd: f64,
+    metadata: serde_json::Value,
+    usage_output_path: PathBuf,
+}
+
+fn parse_shell_flag_value(command: &str, flag: &str) -> Option<String> {
+    let pattern = format!(
+        r#"{}\s+(?:"([^"]+)"|'([^']+)'|([^\s]+))"#,
+        regex::escape(flag)
+    );
+    let regex = Regex::new(&pattern).ok()?;
+    let captures = regex.captures(command)?;
+    captures
+        .get(1)
+        .or_else(|| captures.get(2))
+        .or_else(|| captures.get(3))
+        .map(|value| value.as_str().to_string())
+}
+
+fn is_persistent_image_command(command: &str) -> bool {
+    command.contains("persistent_image_generate.py")
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn append_usage_output_arg(command: &str, usage_output_rel: &str) -> String {
+    if parse_shell_flag_value(command, "--usage-output").is_some() {
+        command.to_string()
+    } else {
+        format!("{command} --usage-output {}", shell_single_quote(usage_output_rel))
+    }
+}
+
+fn extract_image_marker(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("[IMAGE:") && line.ends_with(']'))
+        .map(ToOwned::to_owned)
+}
+
+async fn load_persistent_image_usage_sidecar(
+    usage_output_path: &Path,
+) -> Option<PersistentImageUsageSidecar> {
+    let contents = tokio::fs::read_to_string(usage_output_path).await.ok()?;
+    let _ = tokio::fs::remove_file(usage_output_path).await;
+    serde_json::from_str::<PersistentImageUsageSidecar>(&contents).ok()
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -127,7 +215,7 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let command = args
+        let raw_command = args
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
@@ -144,7 +232,7 @@ impl Tool for ShellTool {
             });
         }
 
-        match self.security.validate_command_execution(command, approved) {
+        match self.security.validate_command_execution(raw_command, approved) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -155,7 +243,7 @@ impl Tool for ShellTool {
             }
         }
 
-        if let Some(path) = self.security.forbidden_path_argument(command) {
+        if let Some(path) = self.security.forbidden_path_argument(raw_command) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -171,12 +259,98 @@ impl Tool for ShellTool {
             });
         }
 
+        let mut command = raw_command.to_string();
+        let mut pending_image_charge = None;
+        if is_persistent_image_command(raw_command) {
+            let usage_output_rel = format!(
+                ".zeroclaw/persistent-image-usage-{}.json",
+                uuid::Uuid::new_v4()
+            );
+            let usage_output_path = self.security.workspace_dir.join(&usage_output_rel);
+            command = append_usage_output_arg(raw_command, &usage_output_rel);
+
+            if let Some(remote_budget) = RemoteBudgetClient::from_env() {
+                let provider = "openai".to_string();
+                let model = parse_shell_flag_value(raw_command, "--model")
+                    .unwrap_or_else(|| PERSISTENT_IMAGE_DEFAULT_MODEL.to_string());
+                let size = parse_shell_flag_value(raw_command, "--size")
+                    .unwrap_or_else(|| PERSISTENT_IMAGE_DEFAULT_SIZE.to_string());
+                let billing = json!({
+                    "type": "per_image",
+                    "imageCount": 1,
+                    "size": size,
+                });
+                let metadata = json!({
+                    "modality": "image_generation",
+                    "providerAttempt": provider.clone(),
+                    "executionPath": "shell_tool",
+                    "command": "python3 tools/persistent_image_generate.py",
+                    "billing": billing.clone(),
+                });
+
+                match remote_budget
+                    .estimate_pricing(&provider, &model, billing.clone())
+                    .await
+                {
+                    Ok(pricing) => {
+                        let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
+                        match remote_budget
+                            .check_explicit_cost(
+                                Some(PERSISTENT_IMAGE_SCOPE_ID),
+                                PERSISTENT_IMAGE_AGENT_TYPE,
+                                &provider,
+                                &model,
+                                estimated_cost_usd,
+                                metadata.clone(),
+                            )
+                            .await
+                        {
+                            Ok(check) if check.allowed => {
+                                pending_image_charge = Some(PendingPersistentImageCharge {
+                                    remote_budget,
+                                    provider,
+                                    model,
+                                    estimated_cost_usd,
+                                    metadata,
+                                    usage_output_path,
+                                });
+                            }
+                            Ok(_) => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(
+                                        "Image generation skipped because budget is exhausted."
+                                            .into(),
+                                    ),
+                                });
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    err = %error,
+                                    command = %raw_command,
+                                    "persistent image budget check failed before shell execution"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            err = %error,
+                            command = %raw_command,
+                            "persistent image pricing estimate failed before shell execution"
+                        );
+                    }
+                }
+            }
+        }
+
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
         let mut cmd = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command(&command, &self.security.workspace_dir)
         {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -227,6 +401,90 @@ impl Tool for ShellTool {
                     }
                     stderr.truncate(b);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
+                }
+
+                if output.status.success() {
+                    if let Some(charge) = pending_image_charge {
+                        if let Some(marker) = extract_image_marker(&stdout) {
+                            let usage_sidecar =
+                                load_persistent_image_usage_sidecar(&charge.usage_output_path).await;
+                            let result = if let Some(usage) =
+                                usage_sidecar.clone().and_then(|entry| entry.usage)
+                            {
+                                let total_tokens = if usage.total_tokens > 0 {
+                                    usage.total_tokens
+                                } else {
+                                    usage.input_tokens.saturating_add(usage.output_tokens)
+                                };
+                                charge
+                                    .remote_budget
+                                    .consume_explicit_usage(
+                                        Some(PERSISTENT_IMAGE_SCOPE_ID),
+                                        &format!(
+                                            "zeroclaw:image:generate:persistent:{}",
+                                            uuid::Uuid::new_v4()
+                                        ),
+                                        PERSISTENT_IMAGE_AGENT_TYPE,
+                                        &charge.provider,
+                                        &charge.model,
+                                        usage.input_tokens,
+                                        usage.output_tokens,
+                                        usage.cached_input_tokens,
+                                        0,
+                                        charge.estimated_cost_usd,
+                                        json!({
+                                            "modality": "image_generation",
+                                            "providerAttempt": charge.provider,
+                                            "executionPath": "shell_tool",
+                                            "marker": marker,
+                                            "base": charge.metadata,
+                                            "usage": {
+                                                "provider": usage_sidecar.as_ref().and_then(|entry| entry.provider.clone()),
+                                                "model": usage_sidecar.as_ref().and_then(|entry| entry.model.clone()),
+                                                "size": usage_sidecar.as_ref().and_then(|entry| entry.size.clone()),
+                                                "inputTokens": usage.input_tokens,
+                                                "outputTokens": usage.output_tokens,
+                                                "cachedInputTokens": usage.cached_input_tokens,
+                                                "totalTokens": total_tokens,
+                                            }
+                                        }),
+                                    )
+                                    .await
+                            } else {
+                                charge
+                                    .remote_budget
+                                    .consume_explicit_cost(
+                                        Some(PERSISTENT_IMAGE_SCOPE_ID),
+                                        &format!(
+                                            "zeroclaw:image:generate:persistent:{}",
+                                            uuid::Uuid::new_v4()
+                                        ),
+                                        PERSISTENT_IMAGE_AGENT_TYPE,
+                                        &charge.provider,
+                                        &charge.model,
+                                        charge.estimated_cost_usd,
+                                        0,
+                                        json!({
+                                            "modality": "image_generation",
+                                            "providerAttempt": charge.provider,
+                                            "executionPath": "shell_tool",
+                                            "marker": marker,
+                                            "base": charge.metadata,
+                                        }),
+                                    )
+                                    .await
+                            };
+
+                            if let Err(error) = result {
+                                tracing::warn!(
+                                    err = %error,
+                                    marker = %marker,
+                                    command = %raw_command,
+                                    "failed to record shell-based persistent image budget consumption"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 Ok(ToolResult {
@@ -770,5 +1028,45 @@ mod tests {
             .expect("command with sandbox should succeed");
         assert!(result.success);
         assert!(result.output.contains("sandbox_test"));
+    }
+
+    #[test]
+    fn parse_shell_flag_value_reads_quoted_and_unquoted_values() {
+        let command = "python3 tools/persistent_image_generate.py --prompt 'hola mundo' --model gpt-image-1 --size \"1024x1536\" --output outbox/images/test.png";
+        assert_eq!(
+            parse_shell_flag_value(command, "--model").as_deref(),
+            Some("gpt-image-1")
+        );
+        assert_eq!(
+            parse_shell_flag_value(command, "--size").as_deref(),
+            Some("1024x1536")
+        );
+        assert_eq!(
+            parse_shell_flag_value(command, "--output").as_deref(),
+            Some("outbox/images/test.png")
+        );
+    }
+
+    #[test]
+    fn append_usage_output_arg_only_adds_sidecar_once() {
+        let base = "python3 tools/persistent_image_generate.py --prompt 'hola' --output outbox/images/test.png";
+        let augmented = append_usage_output_arg(base, ".zeroclaw/image-usage.json");
+        assert!(augmented.contains("--usage-output '.zeroclaw/image-usage.json'"));
+
+        let untouched = append_usage_output_arg(
+            "python3 tools/persistent_image_generate.py --prompt 'hola' --output outbox/images/test.png --usage-output existing.json",
+            ".zeroclaw/ignored.json",
+        );
+        assert!(untouched.contains("--usage-output existing.json"));
+        assert!(!untouched.contains(".zeroclaw/ignored.json"));
+    }
+
+    #[test]
+    fn extract_image_marker_finds_marker_line() {
+        let output = "log line\n[IMAGE:/tmp/example.png]\n";
+        assert_eq!(
+            extract_image_marker(output).as_deref(),
+            Some("[IMAGE:/tmp/example.png]")
+        );
     }
 }

@@ -118,6 +118,250 @@ const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
     "ya pasaron",
 ];
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PromptFileUsage {
+    pub path: String,
+    pub injected_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PromptComponentBreakdown {
+    pub system_prompt_chars: usize,
+    pub memory_context_chars: usize,
+    pub hardware_context_chars: usize,
+    pub user_message_chars: usize,
+    pub enriched_user_chars: usize,
+    pub skills_prompt_chars: usize,
+    pub tool_instruction_chars: usize,
+    pub workspace_file_chars: usize,
+    pub workspace_files: Vec<PromptFileUsage>,
+    pub extra_context_file_chars: usize,
+    pub extra_context_files: Vec<PromptFileUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PromptMessageBreakdown {
+    pub total_chars: usize,
+    pub estimated_total_tokens: u64,
+    pub system_chars: usize,
+    pub user_chars: usize,
+    pub assistant_chars: usize,
+    pub tool_chars: usize,
+    pub messages_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmCallUsage {
+    pub iteration: usize,
+    pub duration_ms: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub prompt: PromptMessageBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UsageSummary {
+    pub request_count: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub prompt_components: PromptComponentBreakdown,
+    pub requests: Vec<LlmCallUsage>,
+    #[serde(default)]
+    pub budget_consumed_remotely: bool,
+    #[serde(default)]
+    pub remote_budget: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProcessMessageReport {
+    pub output: String,
+    pub usage: UsageSummary,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgentTurnOutcome {
+    pub(crate) output: String,
+    pub(crate) requests: Vec<LlmCallUsage>,
+}
+
+struct SingleTurnExecution {
+    output: String,
+    usage: UsageSummary,
+}
+
+impl std::ops::Deref for AgentTurnOutcome {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.output.as_str()
+    }
+}
+
+impl From<AgentTurnOutcome> for String {
+    fn from(value: AgentTurnOutcome) -> Self {
+        value.output
+    }
+}
+
+impl PartialEq<&str> for AgentTurnOutcome {
+    fn eq(&self, other: &&str) -> bool {
+        self.output == *other
+    }
+}
+
+impl PartialEq<String> for AgentTurnOutcome {
+    fn eq(&self, other: &String) -> bool {
+        &self.output == other
+    }
+}
+
+fn estimated_tokens_from_chars(chars: usize) -> u64 {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        chars.div_ceil(4) as u64
+    }
+}
+
+fn analyze_prompt_messages(messages: &[ChatMessage]) -> PromptMessageBreakdown {
+    let mut breakdown = PromptMessageBreakdown {
+        messages_count: messages.len(),
+        ..PromptMessageBreakdown::default()
+    };
+
+    for message in messages {
+        let chars = message.content.chars().count();
+        breakdown.total_chars += chars;
+        match message.role.as_str() {
+            "system" => breakdown.system_chars += chars,
+            "user" => breakdown.user_chars += chars,
+            "assistant" => breakdown.assistant_chars += chars,
+            "tool" => breakdown.tool_chars += chars,
+            _ => breakdown.total_chars += 0,
+        }
+    }
+
+    breakdown.estimated_total_tokens = estimated_tokens_from_chars(breakdown.total_chars);
+    breakdown
+}
+
+fn injected_file_chars(path: &Path, max_chars: usize) -> Option<usize> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().count().min(max_chars))
+}
+
+fn collect_prompt_file_usage(
+    workspace_dir: &Path,
+    filenames: &[impl AsRef<str>],
+    max_chars: usize,
+) -> Vec<PromptFileUsage> {
+    filenames
+        .iter()
+        .filter_map(|name| {
+            let path = workspace_dir.join(name.as_ref());
+            injected_file_chars(&path, max_chars).map(|injected_chars| PromptFileUsage {
+                path: path.display().to_string(),
+                injected_chars,
+            })
+        })
+        .collect()
+}
+
+fn build_prompt_component_breakdown(
+    workspace_dir: &Path,
+    system_prompt: &str,
+    memory_context: &str,
+    hardware_context: &str,
+    user_message: &str,
+    enriched_user: &str,
+    skills: &[crate::skills::Skill],
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    tool_instruction_chars: usize,
+    extra_context_files: &[String],
+    max_chars_per_file: usize,
+) -> PromptComponentBreakdown {
+    let workspace_files = collect_prompt_file_usage(
+        workspace_dir,
+        &[
+            "AGENTS.md",
+            "SOUL.md",
+            "TOOLS.md",
+            "IDENTITY.md",
+            "USER.md",
+            "BOOTSTRAP.md",
+            "MEMORY.md",
+        ],
+        max_chars_per_file,
+    );
+    let extra_context_files_usage =
+        collect_prompt_file_usage(workspace_dir, extra_context_files, max_chars_per_file);
+    let skills_prompt_chars = if skills.is_empty() {
+        0
+    } else {
+        crate::skills::skills_to_prompt_with_mode(skills, workspace_dir, skills_prompt_mode)
+            .chars()
+            .count()
+    };
+
+    PromptComponentBreakdown {
+        system_prompt_chars: system_prompt.chars().count(),
+        memory_context_chars: memory_context.chars().count(),
+        hardware_context_chars: hardware_context.chars().count(),
+        user_message_chars: user_message.chars().count(),
+        enriched_user_chars: enriched_user.chars().count(),
+        skills_prompt_chars,
+        tool_instruction_chars,
+        workspace_file_chars: workspace_files.iter().map(|entry| entry.injected_chars).sum(),
+        workspace_files,
+        extra_context_file_chars: extra_context_files_usage
+            .iter()
+            .map(|entry| entry.injected_chars)
+            .sum(),
+        extra_context_files: extra_context_files_usage,
+    }
+}
+
+fn pricing_for_model(
+    prices: &HashMap<String, crate::config::schema::ModelPricing>,
+    model_name: &str,
+) -> crate::config::schema::ModelPricing {
+    prices
+        .get(model_name)
+        .cloned()
+        .or_else(|| {
+            prices.iter().find_map(|(configured_model, pricing)| {
+                if configured_model.eq_ignore_ascii_case(model_name) {
+                    Some(pricing.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(crate::config::schema::ModelPricing {
+            input: 0.0,
+            output: 0.0,
+        })
+}
+
+fn compute_usage_cost_usd(
+    prices: &HashMap<String, crate::config::schema::ModelPricing>,
+    model_name: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> f64 {
+    let pricing = pricing_for_model(prices, model_name);
+    let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input.max(0.0);
+    let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output.max(0.0);
+    input_cost + output_cost
+}
+
 const SCHEDULING_FAILURE_HINTS: &[&str] = &[
     "error",
     "fallo",
@@ -2797,7 +3041,7 @@ pub(crate) async fn agent_turn(
     skill_activations: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
-    run_tool_call_loop(
+    let outcome = run_tool_call_loop(
         provider,
         history,
         tools_registry,
@@ -2823,7 +3067,8 @@ pub(crate) async fn agent_turn(
         skill_activations,
         model_switch_callback,
     )
-    .await
+    .await?;
+    Ok(outcome.output)
 }
 
 fn maybe_inject_channel_delivery_defaults(
@@ -3053,6 +3298,8 @@ struct ToolExecutionOutcome {
     duration: Duration,
 }
 
+const TOOL_RESULT_HISTORY_CHAR_LIMIT: usize = 12_000;
+
 fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
     approval: Option<&ApprovalManager>,
@@ -3070,6 +3317,33 @@ fn should_execute_tools_in_parallel(
     }
 
     true
+}
+
+fn compact_tool_output_for_history(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.chars().count() <= TOOL_RESULT_HISTORY_CHAR_LIMIT {
+        return trimmed.to_string();
+    }
+
+    let head_budget = TOOL_RESULT_HISTORY_CHAR_LIMIT * 2 / 3;
+    let tail_budget = TOOL_RESULT_HISTORY_CHAR_LIMIT / 6;
+    let total_chars = trimmed.chars().count();
+    let head = truncate_with_ellipsis(trimmed, head_budget);
+    let tail_chars: String = trimmed
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    format!(
+        "{head}\n\n[tool output truncated for history: kept ~{} of {} chars]\n\n{}",
+        head.chars().count() + tail_chars.chars().count(),
+        total_chars,
+        tail_chars
+    )
 }
 
 async fn execute_tools_parallel(
@@ -3163,7 +3437,7 @@ pub(crate) async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     skill_activations: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
-) -> Result<String> {
+) -> Result<AgentTurnOutcome> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -3173,6 +3447,7 @@ pub(crate) async fn run_tool_call_loop(
     let turn_id = Uuid::new_v4().to_string();
     let mut scheduled_delivery_created = false;
     let mut scheduled_delivery_verified = false;
+    let mut requests = Vec::new();
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -3292,6 +3567,7 @@ pub(crate) async fn run_tool_call_loop(
             .map(|tools| tools.iter().map(|tool| tool.name.as_str()).collect())
             .unwrap_or_default();
         let prompt_trace = format_prompt_messages_for_trace(&prepared_messages.messages);
+        let prompt_breakdown = analyze_prompt_messages(&prepared_messages.messages);
         tracing::trace!(
             provider = provider_name,
             model,
@@ -3338,6 +3614,18 @@ pub(crate) async fn run_tool_call_loop(
                         error_message: None,
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
+                    });
+                    requests.push(LlmCallUsage {
+                        iteration: iteration + 1,
+                        #[allow(clippy::cast_possible_truncation)]
+                        duration_ms: llm_started_at.elapsed().as_millis() as u64,
+                        input_tokens: resp_input_tokens,
+                        output_tokens: resp_output_tokens,
+                        cached_input_tokens: resp
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.cached_input_tokens),
+                        prompt: prompt_breakdown.clone(),
                     });
 
                     let response_text = resp.text_or_empty().to_string();
@@ -3389,6 +3677,16 @@ pub(crate) async fn run_tool_call_loop(
                             "duration_ms": llm_started_at.elapsed().as_millis(),
                             "input_tokens": resp_input_tokens,
                             "output_tokens": resp_output_tokens,
+                            "cached_input_tokens": resp.usage.as_ref().and_then(|usage| usage.cached_input_tokens),
+                            "prompt": {
+                                "total_chars": prompt_breakdown.total_chars,
+                                "estimated_total_tokens": prompt_breakdown.estimated_total_tokens,
+                                "system_chars": prompt_breakdown.system_chars,
+                                "user_chars": prompt_breakdown.user_chars,
+                                "assistant_chars": prompt_breakdown.assistant_chars,
+                                "tool_chars": prompt_breakdown.tool_chars,
+                                "messages_count": prompt_breakdown.messages_count,
+                            },
                             "raw_response": scrub_credentials(&response_text),
                             "native_tool_calls": resp.tool_calls.len(),
                             "parsed_tool_calls": calls.len(),
@@ -3615,7 +3913,10 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            return Ok(AgentTurnOutcome {
+                output: display_text,
+                requests,
+            });
         }
 
         // Native tool-call providers can return assistant text separately from
@@ -3937,11 +4238,12 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            individual_results.push((tool_call_id, outcome.output.clone()));
+            let compact_output = compact_tool_output_for_history(&outcome.output);
+            individual_results.push((tool_call_id, compact_output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
+                tool_name, compact_output
             );
         }
 
@@ -4062,6 +4364,24 @@ pub async fn run(
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
 ) -> Result<String> {
+    if let Some(ref msg) = message {
+        if !interactive {
+            let report = run_single_turn_with_report(
+                config,
+                msg,
+                provider_override,
+                model_override,
+                temperature,
+                peripheral_overrides,
+                allowed_tools,
+                session_state_file,
+            )
+            .await?;
+            println!("{}", report.output);
+            return Ok(report.output);
+        }
+    }
+
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -4425,7 +4745,7 @@ pub async fn run(
             .await
             {
                 Ok(resp) => {
-                    response = resp;
+                    response = resp.output;
                     break;
                 }
                 Err(e) => {
@@ -4664,7 +4984,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(resp) => break resp,
+                    Ok(resp) => break resp.output,
                     Err(e) => {
                         if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
                             tracing::info!(
@@ -4749,13 +5069,446 @@ pub async fn run(
     Ok(final_output)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_single_turn_with_report(
+    config: Config,
+    message: &str,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    allowed_tools: Option<Vec<String>>,
+    session_state_file: Option<PathBuf>,
+) -> Result<ProcessMessageReport> {
+    let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?);
+
+    if !peripheral_overrides.is_empty() {
+        tracing::info!(
+            peripherals = ?peripheral_overrides,
+            "Peripheral overrides from CLI (config boards take precedence)"
+        );
+    }
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let (mut tools_registry, delegate_handle) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    );
+
+    let peripheral_tools: Vec<Box<dyn Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    if !peripheral_tools.is_empty() {
+        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
+        tools_registry.extend(peripheral_tools);
+    }
+
+    let mut effective_allowed_tools: Option<Vec<String>> = None;
+    if !config.agent.allowed_tools.is_empty() {
+        effective_allowed_tools = Some(config.agent.allowed_tools.clone());
+    }
+    if let Some(cli_allowed) = allowed_tools {
+        effective_allowed_tools = Some(match effective_allowed_tools {
+            Some(mut existing) => {
+                existing.retain(|name| cli_allowed.iter().any(|cli| cli == name));
+                existing
+            }
+            None => cli_allowed,
+        });
+    }
+    if let Some(ref allow_list) = effective_allowed_tools {
+        tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        tracing::info!(
+            allowed = allow_list.len(),
+            retained = tools_registry.len(),
+            "Applied capability-based tool access filter"
+        );
+    }
+
+    let mut deferred_section = String::new();
+    let mut activated_handle: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            config.mcp.servers.len()
+        );
+        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                if config.mcp.deferred_loading {
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    tracing::info!(
+                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                        deferred_set.len(),
+                        registry.server_count()
+                    );
+                    deferred_section =
+                        crate::tools::mcp_deferred::build_deferred_tools_section(&deferred_set);
+                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::ActivatedToolSet::new(),
+                    ));
+                    activated_handle = Some(std::sync::Arc::clone(&activated));
+                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated,
+                    )));
+                } else {
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                            registered += 1;
+                        }
+                    }
+                    tracing::info!(
+                        "MCP: {} tool(s) registered from {} server(s)",
+                        registered,
+                        registry.server_count()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("MCP registry failed to initialize: {e:#}");
+            }
+        }
+    }
+
+    let mut provider_name = provider_override
+        .as_deref()
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter")
+        .to_string();
+
+    let mut model_name = model_override
+        .as_deref()
+        .or(config.default_model.as_deref())
+        .unwrap_or("anthropic/claude-sonnet-4")
+        .to_string();
+
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
+
+    let mut provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+        &provider_name,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &config.model_routes,
+        &model_name,
+        &provider_runtime_options,
+    )?;
+
+    let model_switch_callback = get_model_switch_state();
+
+    observer.record_event(&ObserverEvent::AgentStart {
+        provider: provider_name.to_string(),
+        model: model_name.to_string(),
+    });
+
+    let hardware_rag: Option<crate::rag::HardwareRag> = config
+        .peripherals
+        .datasheet_dir
+        .as_ref()
+        .filter(|d| !d.trim().is_empty())
+        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+        .and_then(Result::ok)
+        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
+
+    let board_names: Vec<String> = config
+        .peripherals
+        .boards
+        .iter()
+        .map(|b| b.board.clone())
+        .collect();
+
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
+    let skills = filter_skills_by_allowlist(
+        crate::skills::load_skills_with_config(&config.workspace_dir, &config),
+        &config.agent.allowed_skills,
+    );
+    let activation_sets = activated_handle.iter().collect::<Vec<_>>();
+    let active_tool_specs = crate::tools::active_tool_specs(
+        &tools_registry,
+        &activation_sets,
+        &[],
+        config.skills.prompt_injection_mode,
+        Some(&i18n_descs),
+    );
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
+        &config.workspace_dir,
+        &model_name,
+        &active_tool_specs,
+        &skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+        Some(&config.autonomy),
+        native_tools,
+        config.skills.prompt_injection_mode,
+        &config.agent.context_files,
+    );
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
+    }
+    let tool_instruction_chars = if native_tools {
+        0
+    } else {
+        build_tool_instructions(&active_tool_specs).chars().count()
+    };
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
+    }
+
+    let memory_session_id = session_state_file
+        .as_deref()
+        .and_then(memory_session_id_from_state_file);
+
+    if config.memory.auto_save
+        && message.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !memory::should_skip_autosave_content(message)
+    {
+        let user_key = autosave_memory_key("user_msg");
+        let _ = mem
+            .store(
+                &user_key,
+                message,
+                MemoryCategory::Conversation,
+                memory_session_id.as_deref(),
+            )
+            .await;
+    }
+
+    let mem_context = build_context(
+        mem.as_ref(),
+        message,
+        config.memory.min_relevance_score,
+        memory_session_id.as_deref(),
+    )
+    .await;
+    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+    let hw_context = hardware_rag
+        .as_ref()
+        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
+        .unwrap_or_default();
+    let context = format!("{mem_context}{hw_context}");
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let enriched = if context.is_empty() {
+        format!("[{now}] {message}")
+    } else {
+        format!("{context}[{now}] {message}")
+    };
+    let prompt_components = build_prompt_component_breakdown(
+        &config.workspace_dir,
+        &system_prompt,
+        &mem_context,
+        &hw_context,
+        message,
+        &enriched,
+        &skills,
+        config.skills.prompt_injection_mode,
+        tool_instruction_chars,
+        &config.agent.context_files,
+        bootstrap_max_chars.unwrap_or(20_000),
+    );
+
+    let mut history = vec![
+        ChatMessage::system(&system_prompt),
+        ChatMessage::user(&enriched),
+    ];
+    let skill_activations = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+    let excluded_tools =
+        compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, message);
+
+    let outcome = loop {
+        match run_tool_call_loop(
+            provider.as_ref(),
+            &mut history,
+            &tools_registry,
+            &skills,
+            Some(&i18n_descs),
+            config.skills.prompt_injection_mode,
+            observer.as_ref(),
+            &provider_name,
+            &model_name,
+            temperature,
+            false,
+            None,
+            "daemon",
+            None,
+            &config.multimodal,
+            config.agent.max_tool_iterations,
+            None,
+            None,
+            None,
+            &excluded_tools,
+            &config.agent.tool_call_dedup_exempt,
+            activated_handle.as_ref(),
+            Some(&skill_activations),
+            Some(model_switch_callback.clone()),
+        )
+        .await
+        {
+            Ok(outcome) => break outcome,
+            Err(e) => {
+                if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                    tracing::info!(
+                        "Model switch requested, switching from {} {} to {} {}",
+                        provider_name,
+                        model_name,
+                        new_provider,
+                        new_model
+                    );
+
+                    provider = providers::create_routed_provider_with_options(
+                        &new_provider,
+                        config.api_key.as_deref(),
+                        config.api_url.as_deref(),
+                        &config.reliability,
+                        &config.model_routes,
+                        &new_model,
+                        &provider_runtime_options,
+                    )?;
+
+                    provider_name = new_provider;
+                    model_name = new_model;
+                    clear_model_switch_request();
+
+                    observer.record_event(&ObserverEvent::AgentStart {
+                        provider: provider_name.to_string(),
+                        model: model_name.to_string(),
+                    });
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    };
+
+    let input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.input_tokens.unwrap_or(0))
+        .sum();
+    let output_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.output_tokens.unwrap_or(0))
+        .sum();
+    let cached_input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.cached_input_tokens.unwrap_or(0))
+        .sum();
+    let cost_usd =
+        compute_usage_cost_usd(&config.cost.prices, &model_name, input_tokens, output_tokens);
+
+    Ok(ProcessMessageReport {
+        output: outcome.output,
+        usage: UsageSummary {
+            request_count: outcome.requests.len(),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cost_usd,
+            prompt_components,
+            requests: outcome.requests,
+            budget_consumed_remotely: false,
+            remote_budget: None,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_report(
+    config: Config,
+    message: String,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    allowed_tools: Option<Vec<String>>,
+) -> Result<ProcessMessageReport> {
+    run_single_turn_with_report(
+        config,
+        &message,
+        provider_override,
+        model_override,
+        temperature,
+        peripheral_overrides,
+        allowed_tools,
+        None,
+    )
+    .await
+}
+
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(
     config: Config,
     message: &str,
     session_id: Option<&str>,
-) -> Result<String> {
+    allowed_tools: Option<Vec<String>>,
+) -> Result<ProcessMessageReport> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -4799,6 +5552,28 @@ pub async fn process_message(
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+
+    let mut effective_allowed_tools: Option<Vec<String>> = None;
+    if !config.agent.allowed_tools.is_empty() {
+        effective_allowed_tools = Some(config.agent.allowed_tools.clone());
+    }
+    if let Some(cli_allowed) = allowed_tools {
+        effective_allowed_tools = Some(match effective_allowed_tools {
+            Some(mut existing) => {
+                existing.retain(|name| cli_allowed.iter().any(|cli| cli == name));
+                existing
+            }
+            None => cli_allowed,
+        });
+    }
+    if let Some(ref allow_list) = effective_allowed_tools {
+        tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        tracing::info!(
+            allowed = allow_list.len(),
+            retained = tools_registry.len(),
+            "Applied capability-based tool access filter"
+        );
+    }
 
     // ── Wire MCP tools (non-fatal) — process_message path ────────
     // NOTE: Same ordering contract as the CLI path above — MCP tools must be
@@ -4947,6 +5722,11 @@ pub async fn process_message(
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
     }
+    let tool_instruction_chars = if native_tools {
+        0
+    } else {
+        build_tool_instructions(&active_tool_specs).chars().count()
+    };
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
         system_prompt.push_str(&deferred_section);
@@ -4971,6 +5751,19 @@ pub async fn process_message(
     } else {
         format!("{context}[{now}] {message}")
     };
+    let prompt_components = build_prompt_component_breakdown(
+        &config.workspace_dir,
+        &system_prompt,
+        &mem_context,
+        &hw_context,
+        message,
+        &enriched,
+        &skills,
+        config.skills.prompt_injection_mode,
+        tool_instruction_chars,
+        &config.agent.context_files,
+        bootstrap_max_chars.unwrap_or(20_000),
+    );
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),
@@ -4983,7 +5776,7 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    agent_turn(
+    let outcome = run_tool_call_loop(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -4995,18 +5788,55 @@ pub async fn process_message(
         &model_name,
         config.default_temperature,
         true,
+        Some(&approval_manager),
         "daemon",
         None,
         &config.multimodal,
         config.agent.max_tool_iterations,
-        Some(&approval_manager),
+        None,
+        None,
+        None,
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         Some(&skill_activations),
         None,
     )
-    .await
+    .await?;
+
+    let input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.input_tokens.unwrap_or(0))
+        .sum();
+    let output_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.output_tokens.unwrap_or(0))
+        .sum();
+    let cached_input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.cached_input_tokens.unwrap_or(0))
+        .sum();
+    let cost_usd =
+        compute_usage_cost_usd(&config.cost.prices, &model_name, input_tokens, output_tokens);
+
+    Ok(ProcessMessageReport {
+        output: outcome.output,
+        usage: UsageSummary {
+            request_count: outcome.requests.len(),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cost_usd,
+            prompt_components,
+            requests: outcome.requests,
+            budget_consumed_remotely: false,
+            remote_budget: None,
+        },
+    })
 }
 
 #[cfg(test)]
