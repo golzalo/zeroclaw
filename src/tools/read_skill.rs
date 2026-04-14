@@ -8,6 +8,7 @@ pub struct ReadSkillTool {
     workspace_dir: PathBuf,
     open_skills_enabled: bool,
     open_skills_dir: Option<String>,
+    allowed_skills: Option<std::collections::HashSet<String>>,
 }
 
 impl ReadSkillTool {
@@ -15,11 +16,18 @@ impl ReadSkillTool {
         workspace_dir: PathBuf,
         open_skills_enabled: bool,
         open_skills_dir: Option<String>,
+        allowed_skills: Vec<String>,
     ) -> Self {
+        let allowed: std::collections::HashSet<String> = allowed_skills
+            .into_iter()
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
         Self {
             workspace_dir,
             open_skills_enabled,
             open_skills_dir,
+            allowed_skills: if allowed.is_empty() { None } else { Some(allowed) },
         }
     }
 }
@@ -55,17 +63,49 @@ impl Tool for ReadSkillTool {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing 'name' parameter"))?;
 
+        if let Some(allowed) = &self.allowed_skills {
+            let requested_lower = requested.to_ascii_lowercase();
+            if !allowed.contains(&requested_lower) {
+                let mut names: Vec<&str> = allowed.iter().map(String::as_str).collect();
+                names.sort_unstable();
+                let allowed_str = if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                };
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Skill '{requested}' is not allowed in this agent. Allowed skills: {allowed_str}"
+                    )),
+                });
+            }
+        }
+
         let skills = crate::skills::load_skills_with_open_skills_settings(
             &self.workspace_dir,
             self.open_skills_enabled,
             self.open_skills_dir.as_deref(),
         );
 
-        let Some(skill) = skills
+        let filtered_skills: Vec<&crate::skills::Skill> = match &self.allowed_skills {
+            Some(allowed) => skills
+                .iter()
+                .filter(|skill| allowed.contains(&skill.name.to_ascii_lowercase()))
+                .collect(),
+            None => skills.iter().collect(),
+        };
+
+        let Some(skill) = filtered_skills
             .iter()
+            .copied()
             .find(|skill| skill.name.eq_ignore_ascii_case(requested))
         else {
-            let mut names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+            let mut names: Vec<&str> = filtered_skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect();
             names.sort_unstable();
             let available = if names.is_empty() {
                 "none".to_string()
@@ -118,7 +158,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_tool(tmp: &TempDir) -> ReadSkillTool {
-        ReadSkillTool::new(tmp.path().join("workspace"), false, None)
+        ReadSkillTool::new(tmp.path().join("workspace"), false, None, Vec::new())
     }
 
     #[tokio::test]

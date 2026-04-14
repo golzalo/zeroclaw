@@ -2,7 +2,8 @@ use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
-use crate::providers::{self, ChatMessage, Provider};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider};
+use crate::remote_budget::RemoteBudgetClient;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -312,6 +313,7 @@ impl Tool for DelegateTool {
         };
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
+        let remote_budget = RemoteBudgetClient::from_env();
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agent_config.agentic {
@@ -322,9 +324,44 @@ impl Tool for DelegateTool {
                     &*provider,
                     &full_prompt,
                     temperature,
+                    remote_budget.as_ref(),
                 )
                 .await;
         }
+
+        let messages = build_delegate_messages(agent_config.system_prompt.as_deref(), &full_prompt);
+        let quote = if let Some(remote_budget) = remote_budget.as_ref() {
+            let (estimated_input_tokens, estimated_output_tokens) = estimate_delegate_tokens(
+                agent_config.system_prompt.as_deref(),
+                &full_prompt,
+                false,
+                1,
+            );
+            let check = remote_budget
+                .check_text_quote(
+                    Some(&format!("delegate:{agent_name}")),
+                    &format!("delegate:{agent_name}"),
+                    &agent_config.provider,
+                    &agent_config.model,
+                    estimated_input_tokens,
+                    estimated_output_tokens,
+                    json!({
+                        "delegateAgent": agent_name,
+                        "agentic": false,
+                    }),
+                )
+                .await?;
+            if !check.allowed {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("LLM budget exceeded for delegated agent.".into()),
+                });
+            }
+            check.quote_id
+        } else {
+            None
+        };
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
         let timeout_secs = agent_config
@@ -332,9 +369,11 @@ impl Tool for DelegateTool {
             .unwrap_or(self.delegate_config.timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            provider.chat_with_system(
-                agent_config.system_prompt.as_deref(),
-                &full_prompt,
+            provider.chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
                 &agent_config.model,
                 temperature,
             ),
@@ -356,9 +395,37 @@ impl Tool for DelegateTool {
 
         match result {
             Ok(response) => {
-                let mut rendered = response;
+                let mut rendered = response.text_or_empty().to_string();
                 if rendered.trim().is_empty() {
                     rendered = "[Empty response]".to_string();
+                }
+                if let Some(remote_budget) = remote_budget.as_ref() {
+                    let usage = response.usage.unwrap_or_default();
+                    let input_tokens = usage.input_tokens.unwrap_or(0);
+                    let output_tokens = usage.output_tokens.unwrap_or(0);
+                    let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
+                    let _ = remote_budget
+                        .consume_text_quote(
+                            Some(&format!("delegate:{agent_name}")),
+                            &format!(
+                                "zeroclaw:delegate:{}:{}",
+                                agent_name,
+                                uuid::Uuid::new_v4()
+                            ),
+                            quote.as_deref(),
+                            &format!("delegate:{agent_name}"),
+                            &agent_config.provider,
+                            &agent_config.model,
+                            input_tokens,
+                            output_tokens,
+                            cached_input_tokens,
+                            0,
+                            json!({
+                                "delegateAgent": agent_name,
+                                "agentic": false,
+                            }),
+                        )
+                        .await;
                 }
 
                 Ok(ToolResult {
@@ -388,6 +455,7 @@ impl DelegateTool {
         provider: &dyn Provider,
         full_prompt: &str,
         temperature: f64,
+        remote_budget: Option<&RemoteBudgetClient>,
     ) -> anyhow::Result<ToolResult> {
         if agent_config.allowed_tools.is_empty() {
             return Ok(ToolResult {
@@ -412,7 +480,19 @@ impl DelegateTool {
                 .iter()
                 .filter(|tool| allowed.contains(tool.name()))
                 .filter(|tool| tool.name() != "delegate")
-                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                .map(|tool| {
+                    if tool.name() == "read_skill" {
+                        if let Some(workspace_dir) = &self.workspace_dir {
+                            return Box::new(crate::tools::ReadSkillTool::new(
+                                workspace_dir.clone(),
+                                self.open_skills_enabled,
+                                self.open_skills_dir.clone(),
+                                agent_config.skills.clone(),
+                            )) as Box<dyn Tool>;
+                        }
+                    }
+                    Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                })
                 .collect()
         };
 
@@ -473,6 +553,40 @@ impl DelegateTool {
 
         history.push(ChatMessage::user(full_prompt.to_string()));
 
+        let quote = if let Some(remote_budget) = remote_budget {
+            let (estimated_input_tokens, estimated_output_tokens) = estimate_delegate_tokens(
+                agent_config.system_prompt.as_deref(),
+                full_prompt,
+                true,
+                agent_config.max_iterations,
+            );
+            let check = remote_budget
+                .check_text_quote(
+                    Some(&format!("delegate:{agent_name}")),
+                    &format!("delegate:{agent_name}"),
+                    &agent_config.provider,
+                    &agent_config.model,
+                    estimated_input_tokens,
+                    estimated_output_tokens,
+                    json!({
+                        "delegateAgent": agent_name,
+                        "agentic": true,
+                        "maxIterations": agent_config.max_iterations,
+                    }),
+                )
+                .await?;
+            if !check.allowed {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("LLM budget exceeded for delegated agent.".into()),
+                });
+            }
+            check.quote_id
+        } else {
+            None
+        };
+
         let noop_observer = NoopObserver;
 
         let agentic_timeout_secs = agent_config
@@ -511,11 +625,56 @@ impl DelegateTool {
 
         match result {
             Ok(Ok(response)) => {
-                let rendered = if response.trim().is_empty() {
+                let rendered = if response.output.trim().is_empty() {
                     "[Empty response]".to_string()
                 } else {
-                    response
+                    response.output.clone()
                 };
+                if let Some(remote_budget) = remote_budget {
+                    let input_tokens = response
+                        .requests
+                        .iter()
+                        .map(|request| request.input_tokens.unwrap_or(0))
+                        .sum();
+                    let output_tokens = response
+                        .requests
+                        .iter()
+                        .map(|request| request.output_tokens.unwrap_or(0))
+                        .sum();
+                    let cached_input_tokens = response
+                        .requests
+                        .iter()
+                        .map(|request| request.cached_input_tokens.unwrap_or(0))
+                        .sum();
+                    let duration_ms = response
+                        .requests
+                        .iter()
+                        .map(|request| request.duration_ms)
+                        .sum();
+                    let _ = remote_budget
+                        .consume_text_quote(
+                            Some(&format!("delegate:{agent_name}")),
+                            &format!(
+                                "zeroclaw:delegate:{}:{}",
+                                agent_name,
+                                uuid::Uuid::new_v4()
+                            ),
+                            quote.as_deref(),
+                            &format!("delegate:{agent_name}"),
+                            &agent_config.provider,
+                            &agent_config.model,
+                            input_tokens,
+                            output_tokens,
+                            cached_input_tokens,
+                            duration_ms,
+                            json!({
+                                "delegateAgent": agent_name,
+                                "agentic": true,
+                                "requests": response.requests,
+                            }),
+                        )
+                        .await;
+                }
 
                 Ok(ToolResult {
                     success: true,
@@ -541,6 +700,33 @@ impl DelegateTool {
             }),
         }
     }
+}
+
+fn build_delegate_messages(system_prompt: Option<&str>, prompt: &str) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    if let Some(system_prompt) = system_prompt {
+        if !system_prompt.trim().is_empty() {
+            messages.push(ChatMessage::system(system_prompt));
+        }
+    }
+    messages.push(ChatMessage::user(prompt));
+    messages
+}
+
+fn estimate_delegate_tokens(
+    system_prompt: Option<&str>,
+    prompt: &str,
+    agentic: bool,
+    max_iterations: usize,
+) -> (u64, u64) {
+    let input_chars = system_prompt.unwrap_or_default().chars().count() + prompt.chars().count();
+    let estimated_input_tokens = input_chars.div_ceil(4) as u64;
+    let estimated_output_tokens = if agentic {
+        600 + (max_iterations as u64 * 300)
+    } else {
+        800
+    };
+    (estimated_input_tokens, estimated_output_tokens)
 }
 
 struct ToolArcRef {
@@ -1376,6 +1562,8 @@ mod tests {
             max_iterations: 10,
             timeout_secs: Some(60),
             agentic_timeout_secs: Some(600),
+            skills: Vec::new(),
+            context_files: Vec::new(),
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -1458,6 +1646,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: Some(0),
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -1512,6 +1702,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: Some(5000),
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -1538,6 +1730,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: Some(3600),
                 agentic_timeout_secs: Some(3600),
+                skills: Vec::new(),
+                context_files: Vec::new(),
             },
         );
         assert!(config.validate().is_ok());

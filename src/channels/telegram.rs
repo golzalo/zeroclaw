@@ -1,11 +1,13 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::{Config, StreamMode};
+use crate::remote_budget::RemoteBudgetClient;
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
+use serde_json::json;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -579,6 +581,37 @@ impl TelegramChannel {
         text: &str,
         tts_config: &crate::config::TtsConfig,
     ) -> anyhow::Result<()> {
+        let mut budget_charge = None;
+        if let (Some(remote_budget), Some((provider, model, billing))) = (
+            RemoteBudgetClient::from_env(),
+            super::tts::estimate_tts_billing(tts_config, text),
+        ) {
+            let pricing = remote_budget.estimate_pricing(&provider, &model, billing.clone()).await?;
+            let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
+            let metadata = json!({
+                "channel": "telegram",
+                "modality": "text_to_speech",
+                "chatId": chat_id,
+                "threadId": thread_id,
+                "textChars": text.chars().count(),
+                "billing": billing,
+            });
+            let check = remote_budget
+                .check_explicit_cost(
+                    Some("voice:tts:telegram"),
+                    "instance_tts",
+                    &provider,
+                    &model,
+                    estimated_cost_usd,
+                    metadata.clone(),
+                )
+                .await?;
+            if !check.allowed {
+                anyhow::bail!("LLM budget exceeded for TTS.");
+            }
+            budget_charge = Some((remote_budget, provider, model, estimated_cost_usd, metadata));
+        }
+
         let tts_manager = super::tts::TtsManager::new(tts_config)?;
         let audio_bytes = tts_manager.synthesize(text).await?;
         let audio_len = audio_bytes.len();
@@ -609,6 +642,27 @@ impl TelegramChannel {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("sendVoice failed: status={status}, body={body}");
+        }
+
+        if let Some((remote_budget, provider, model, estimated_cost_usd, metadata)) = budget_charge
+        {
+            let _ = remote_budget
+                .consume_explicit_cost(
+                    Some("voice:tts:telegram"),
+                    &format!("zeroclaw:voice:tts:telegram:{}", uuid::Uuid::new_v4()),
+                    "instance_tts",
+                    &provider,
+                    &model,
+                    estimated_cost_usd,
+                    0,
+                    json!({
+                        "channel": "telegram",
+                        "modality": "text_to_speech",
+                        "audioBytes": audio_len,
+                        "base": metadata,
+                    }),
+                )
+                .await;
         }
 
         tracing::info!("Telegram TTS: sent voice note ({audio_len} bytes)");
@@ -1220,18 +1274,88 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
-                    return None;
+        let mut budget_charge = None;
+        if let (Some(remote_budget), Some((provider, model, billing))) = (
+            RemoteBudgetClient::from_env(),
+            super::transcription::estimate_transcription_billing(config, Some(duration)),
+        ) {
+            match remote_budget.estimate_pricing(&provider, &model, billing.clone()).await {
+                Ok(pricing) => {
+                    let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
+                    let metadata = json!({
+                        "channel": "telegram",
+                        "modality": "speech_to_text",
+                        "chatId": chat_id,
+                        "durationSeconds": duration,
+                        "audioBytes": audio_data.len(),
+                        "billing": billing,
+                    });
+                    match remote_budget
+                        .check_explicit_cost(
+                            Some("voice:stt:telegram"),
+                            "instance_stt",
+                            &provider,
+                            &model,
+                            estimated_cost_usd,
+                            metadata.clone(),
+                        )
+                        .await
+                    {
+                        Ok(check) if check.allowed => {
+                            budget_charge = Some((
+                                remote_budget,
+                                provider,
+                                model,
+                                estimated_cost_usd,
+                                metadata,
+                            ));
+                        }
+                        Ok(_) => {
+                            tracing::info!("Telegram: skipping voice note because budget is exhausted");
+                            return None;
+                        }
+                        Err(error) => {
+                            tracing::warn!("Telegram: remote STT budget check failed: {error}");
+                        }
+                    }
                 }
-            };
+                Err(error) => {
+                    tracing::warn!("Telegram: failed to estimate STT pricing: {error}");
+                }
+            }
+        }
+
+        let text = match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Voice transcription failed: {e}");
+                return None;
+            }
+        };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
             return None;
+        }
+
+        if let Some((remote_budget, provider, model, estimated_cost_usd, metadata)) = budget_charge {
+            let _ = remote_budget
+                .consume_explicit_cost(
+                    Some("voice:stt:telegram"),
+                    &format!("zeroclaw:voice:stt:telegram:{}", uuid::Uuid::new_v4()),
+                    "instance_stt",
+                    &provider,
+                    &model,
+                    estimated_cost_usd,
+                    0,
+                    json!({
+                        "channel": "telegram",
+                        "modality": "speech_to_text",
+                        "transcribedChars": text.chars().count(),
+                        "base": metadata,
+                    }),
+                )
+                .await;
         }
 
         // Enter voice-chat mode so outgoing replies get a TTS voice note

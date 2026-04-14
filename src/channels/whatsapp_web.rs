@@ -31,11 +31,13 @@
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
+use crate::remote_budget::RemoteBudgetClient;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 #[cfg(feature = "whatsapp-web")]
 use base64::Engine as _;
 use parking_lot::Mutex;
+use serde_json::json;
 #[cfg(feature = "whatsapp-web")]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -556,12 +558,89 @@ impl WhatsAppWebChannel {
             file_name
         );
 
+        let mut budget_charge = None;
+        if let (Some(remote_budget), Some((provider, model, billing))) = (
+            RemoteBudgetClient::from_env(),
+            super::transcription::estimate_transcription_billing(
+                config,
+                audio.seconds.map(u64::from),
+            ),
+        ) {
+            match remote_budget
+                .estimate_pricing(&provider, &model, billing.clone())
+                .await
+            {
+                Ok(pricing) => {
+                    let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
+                    let metadata = json!({
+                        "channel": "whatsapp",
+                        "modality": "speech_to_text",
+                        "durationSeconds": audio.seconds.map(u64::from),
+                        "audioBytes": audio_data.len(),
+                        "billing": billing,
+                    });
+                    match remote_budget
+                        .check_explicit_cost(
+                            Some("voice:stt:whatsapp"),
+                            "instance_stt",
+                            &provider,
+                            &model,
+                            estimated_cost_usd,
+                            metadata.clone(),
+                        )
+                        .await
+                    {
+                        Ok(check) if check.allowed => {
+                            budget_charge = Some((
+                                remote_budget,
+                                provider,
+                                model,
+                                estimated_cost_usd,
+                                metadata,
+                            ));
+                        }
+                        Ok(_) => {
+                            tracing::info!("WhatsApp Web: skipping voice note because budget is exhausted");
+                            return None;
+                        }
+                        Err(error) => {
+                            tracing::warn!("WhatsApp Web: remote STT budget check failed: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("WhatsApp Web: failed to estimate STT pricing: {error}");
+                }
+            }
+        }
+
         match super::transcription::transcribe_audio(audio_data, file_name, config).await {
             Ok(text) if text.trim().is_empty() => {
                 tracing::info!("WhatsApp Web: voice transcription returned empty text, skipping");
                 None
             }
             Ok(text) => {
+                if let Some((remote_budget, provider, model, estimated_cost_usd, metadata)) =
+                    budget_charge
+                {
+                    let _ = remote_budget
+                        .consume_explicit_cost(
+                            Some("voice:stt:whatsapp"),
+                            &format!("zeroclaw:voice:stt:whatsapp:{}", uuid::Uuid::new_v4()),
+                            "instance_stt",
+                            &provider,
+                            &model,
+                            estimated_cost_usd,
+                            0,
+                            json!({
+                                "channel": "whatsapp",
+                                "modality": "speech_to_text",
+                                "transcribedChars": text.chars().count(),
+                                "base": metadata,
+                            }),
+                        )
+                        .await;
+                }
                 tracing::info!(
                     "WhatsApp Web: voice note transcribed ({} chars)",
                     text.len()
@@ -1836,6 +1915,36 @@ impl WhatsAppWebChannel {
         text: &str,
         tts_config: &crate::config::TtsConfig,
     ) -> Result<()> {
+        let mut budget_charge = None;
+        if let (Some(remote_budget), Some((provider, model, billing))) = (
+            RemoteBudgetClient::from_env(),
+            super::tts::estimate_tts_billing(tts_config, text),
+        ) {
+            let pricing = remote_budget.estimate_pricing(&provider, &model, billing.clone()).await?;
+            let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
+            let metadata = json!({
+                "channel": "whatsapp",
+                "modality": "text_to_speech",
+                "recipient": to.to_string(),
+                "textChars": text.chars().count(),
+                "billing": billing,
+            });
+            let check = remote_budget
+                .check_explicit_cost(
+                    Some("voice:tts:whatsapp"),
+                    "instance_tts",
+                    &provider,
+                    &model,
+                    estimated_cost_usd,
+                    metadata.clone(),
+                )
+                .await?;
+            if !check.allowed {
+                anyhow::bail!("LLM budget exceeded for TTS.");
+            }
+            budget_charge = Some((remote_budget, provider, model, estimated_cost_usd, metadata));
+        }
+
         let tts_manager = super::tts::TtsManager::new(tts_config)?;
         let audio_bytes = tts_manager.synthesize(text).await?;
         let audio_len = audio_bytes.len();
@@ -1855,6 +1964,27 @@ impl WhatsAppWebChannel {
             upload.url.len(),
             upload.file_length
         );
+
+        if let Some((remote_budget, provider, model, estimated_cost_usd, metadata)) = budget_charge
+        {
+            let _ = remote_budget
+                .consume_explicit_cost(
+                    Some("voice:tts:whatsapp"),
+                    &format!("zeroclaw:voice:tts:whatsapp:{}", uuid::Uuid::new_v4()),
+                    "instance_tts",
+                    &provider,
+                    &model,
+                    estimated_cost_usd,
+                    0,
+                    json!({
+                        "channel": "whatsapp",
+                        "modality": "text_to_speech",
+                        "audioBytes": audio_len,
+                        "base": metadata,
+                    }),
+                )
+                .await;
+        }
 
         // Estimate duration: Opus at ~32kbps → bytes / 4000 ≈ seconds
         #[allow(clippy::cast_possible_truncation)]

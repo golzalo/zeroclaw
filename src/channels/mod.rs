@@ -98,6 +98,7 @@ use crate::memory::{self, Memory};
 use crate::observability::traits::{ObserverEvent, ObserverMetric};
 use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
+use crate::remote_budget::RemoteBudgetClient;
 use crate::runtime;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
@@ -407,6 +408,96 @@ impl InFlightTaskCompletion {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct RemoteBudgetSnapshot {
+    #[serde(default)]
+    #[serde(rename = "actorId")]
+    actor_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "monthlyIncludedBudgetUsd")]
+    monthly_included_budget_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "monthlyUsageUsd")]
+    monthly_usage_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "includedRemainingUsd")]
+    included_remaining_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "purchasedCreditBalanceUsd")]
+    purchased_credit_balance_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "availableBudgetUsd")]
+    available_budget_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "hardLimitEnabled")]
+    hard_limit_enabled: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct RemoteBudgetPricing {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "inputPriceUsdPer1M")]
+    input_price_usd_per_1m: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "outputPriceUsdPer1M")]
+    output_price_usd_per_1m: Option<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct RemoteBudgetCheckResponse {
+    #[serde(default)]
+    allowed: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "quoteId")]
+    quote_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "estimatedCostUsd")]
+    estimated_cost_usd: Option<f64>,
+    #[serde(default)]
+    pricing: Option<RemoteBudgetPricing>,
+    #[serde(default)]
+    snapshot: Option<RemoteBudgetSnapshot>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct RemoteBudgetConsumeResponse {
+    #[serde(default)]
+    duplicate: bool,
+    #[serde(default)]
+    #[serde(rename = "quoteId")]
+    quote_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "overflowUsd")]
+    overflow_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "debitedCreditsUsd")]
+    debited_credits_usd: Option<f64>,
+    #[serde(default)]
+    #[serde(rename = "costUsd")]
+    cost_usd: Option<f64>,
+    #[serde(default)]
+    pricing: Option<RemoteBudgetPricing>,
+    #[serde(default)]
+    snapshot: Option<RemoteBudgetSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct ChannelRemoteBudgetContext {
+    actor_id: String,
+    instance_id: Option<String>,
+    scope_id: String,
+}
+
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     // Include thread_ts for per-topic memory isolation in forum groups
     match &msg.thread_ts {
@@ -429,6 +520,240 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
 
 fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
     msg.thread_ts.clone().or_else(|| Some(msg.id.clone()))
+}
+
+fn build_remote_budget_endpoint(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let suffix = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    format!("{base}{suffix}")
+}
+
+fn resolve_channel_model_pricing(
+    prices: &HashMap<String, crate::config::schema::ModelPricing>,
+    model_name: &str,
+) -> crate::config::schema::ModelPricing {
+    prices
+        .get(model_name)
+        .cloned()
+        .or_else(|| {
+            prices.iter().find_map(|(configured_model, pricing)| {
+                if configured_model.eq_ignore_ascii_case(model_name) {
+                    Some(pricing.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(crate::config::schema::ModelPricing {
+            input: 0.0,
+            output: 0.0,
+        })
+}
+
+fn estimate_channel_request_tokens(history: &[ChatMessage], max_tool_iterations: usize) -> (u64, u64) {
+    let estimated_input_tokens =
+        history.iter().map(|message| message.content.chars().count()).sum::<usize>().div_ceil(4)
+            as u64;
+    let estimated_output_tokens = (400 + (max_tool_iterations as u64 * 250)).max(400);
+    (estimated_input_tokens, estimated_output_tokens)
+}
+
+fn summarize_channel_usage(
+    config: &crate::config::Config,
+    model_name: &str,
+    outcome: &crate::agent::loop_::AgentTurnOutcome,
+) -> crate::agent::loop_::UsageSummary {
+    let input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.input_tokens.unwrap_or(0))
+        .sum();
+    let output_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.output_tokens.unwrap_or(0))
+        .sum();
+    let cached_input_tokens: u64 = outcome
+        .requests
+        .iter()
+        .map(|request| request.cached_input_tokens.unwrap_or(0))
+        .sum();
+    let pricing = resolve_channel_model_pricing(&config.cost.prices, model_name);
+    let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input.max(0.0);
+    let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output.max(0.0);
+
+    crate::agent::loop_::UsageSummary {
+        request_count: outcome.requests.len(),
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+        cost_usd: input_cost + output_cost,
+        prompt_components: crate::agent::loop_::PromptComponentBreakdown::default(),
+        requests: outcome.requests.clone(),
+        budget_consumed_remotely: false,
+        remote_budget: None,
+    }
+}
+
+fn resolve_channel_remote_budget_context(msg: &traits::ChannelMessage) -> Option<ChannelRemoteBudgetContext> {
+    let actor_id = std::env::var("OWNER_ACTOR_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let instance_id = std::env::var("INSTANCE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let scope_id = match &msg.thread_ts {
+        Some(thread_ts) => format!("channel:{}:{}:{}", msg.channel, msg.reply_target, thread_ts),
+        None => format!("channel:{}:{}", msg.channel, msg.reply_target),
+    };
+    Some(ChannelRemoteBudgetContext {
+        actor_id,
+        instance_id,
+        scope_id,
+    })
+}
+
+async fn remote_budget_check_for_channel(
+    ctx: &ChannelRuntimeContext,
+    remote_ctx: &ChannelRemoteBudgetContext,
+    provider_label: &str,
+    model_label: &str,
+    history: &[ChatMessage],
+) -> anyhow::Result<Option<RemoteBudgetCheckResponse>> {
+    let remote_budget = ctx.prompt_config.cost.remote_budget.clone();
+    if !remote_budget.enabled || remote_budget.api_base_url.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let (estimated_input_tokens, estimated_output_tokens) =
+        estimate_channel_request_tokens(history, ctx.max_tool_iterations);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(remote_budget.timeout_ms.max(1)))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let url = build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.check_path);
+    let mut request = client.post(url).json(&serde_json::json!({
+        "actorId": remote_ctx.actor_id,
+        "scopeId": remote_ctx.scope_id,
+        "instanceId": remote_ctx.instance_id,
+        "agentType": "instance",
+        "provider": provider_label,
+        "model": model_label,
+        "estimatedInputTokens": estimated_input_tokens,
+        "estimatedOutputTokens": estimated_output_tokens,
+        "metadata": {
+            "messageCount": history.len(),
+        }
+    }));
+    if !remote_budget.api_token.trim().is_empty() {
+        request = request.bearer_auth(remote_budget.api_token.trim());
+    }
+
+    let response = request.send().await;
+    match response {
+        Ok(resp)
+            if resp.status().is_success()
+                || resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED =>
+        {
+            let payload = resp
+                .json::<RemoteBudgetCheckResponse>()
+                .await
+                .context("Failed to parse remote budget check response")?;
+            Ok(Some(payload))
+        }
+        Ok(resp) if remote_budget.fail_open => {
+            tracing::warn!("Remote budget check failed with status {}", resp.status());
+            Ok(None)
+        }
+        Ok(resp) => Err(anyhow::anyhow!(
+            "Remote budget check failed with status {}",
+            resp.status()
+        )),
+        Err(error) if remote_budget.fail_open => {
+            tracing::warn!("Remote budget check unavailable: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(anyhow::anyhow!("Remote budget check failed: {error}")),
+    }
+}
+
+async fn remote_budget_consume_for_channel(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    remote_ctx: &ChannelRemoteBudgetContext,
+    provider_label: &str,
+    model_label: &str,
+    summary: &crate::agent::loop_::UsageSummary,
+    duration: Duration,
+    quote_id: Option<&str>,
+) -> anyhow::Result<Option<RemoteBudgetConsumeResponse>> {
+    let remote_budget = ctx.prompt_config.cost.remote_budget.clone();
+    if !remote_budget.enabled || remote_budget.api_base_url.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(remote_budget.timeout_ms.max(1)))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let url = build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.consume_path);
+    let mut request = client.post(url).json(&serde_json::json!({
+        "eventId": format!("zeroclaw:channel:{}:{}:{}", remote_ctx.actor_id, msg.channel, msg.id),
+        "actorId": remote_ctx.actor_id,
+        "instanceId": remote_ctx.instance_id,
+        "scopeId": remote_ctx.scope_id,
+        "agentType": "instance",
+        "provider": provider_label,
+        "model": model_label,
+        "quoteId": quote_id,
+        "inputTokens": summary.input_tokens,
+        "outputTokens": summary.output_tokens,
+        "cachedInputTokens": summary.cached_input_tokens,
+        "totalTokens": summary.total_tokens,
+        "durationMs": duration.as_millis().min(u128::from(u64::MAX)) as u64,
+        "metadata": {
+            "channel": msg.channel,
+            "sender": msg.sender,
+            "replyTarget": msg.reply_target,
+            "requests": summary.requests,
+            "promptComponents": summary.prompt_components,
+        }
+    }));
+    if !remote_budget.api_token.trim().is_empty() {
+        request = request.bearer_auth(remote_budget.api_token.trim());
+    }
+
+    let response = request.send().await;
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            let payload = resp
+                .json::<RemoteBudgetConsumeResponse>()
+                .await
+                .context("Failed to parse remote budget consume response")?;
+            Ok(Some(payload))
+        }
+        Ok(resp) if remote_budget.fail_open => {
+            tracing::warn!("Remote budget consume failed with status {}", resp.status());
+            Ok(None)
+        }
+        Ok(resp) => Err(anyhow::anyhow!(
+            "Remote budget consume failed with status {}",
+            resp.status()
+        )),
+        Err(error) if remote_budget.fail_open => {
+            tracing::warn!("Remote budget consume unavailable: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(anyhow::anyhow!("Remote budget consume failed: {error}")),
+    }
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
@@ -1839,7 +2164,59 @@ fn slugify_image_basename(prompt: &str) -> String {
     base.chars().take(48).collect()
 }
 
-fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) -> Option<String> {
+const PERSISTENT_IMAGE_PROVIDER: &str = "openai";
+const PERSISTENT_IMAGE_MODEL: &str = "gpt-image-1";
+const PERSISTENT_IMAGE_SIZE: &str = "1024x1024";
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistentImageUsagePayload {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistentImageUsageSidecar {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    usage: Option<PersistentImageUsagePayload>,
+}
+
+fn persistent_image_billing() -> (String, String, serde_json::Value) {
+    (
+        PERSISTENT_IMAGE_PROVIDER.to_string(),
+        PERSISTENT_IMAGE_MODEL.to_string(),
+        serde_json::json!({
+            "type": "per_image",
+            "imageCount": 1,
+            "size": PERSISTENT_IMAGE_SIZE,
+        }),
+    )
+}
+
+async fn load_persistent_image_usage_sidecar(
+    usage_path: &Path,
+) -> Option<PersistentImageUsageSidecar> {
+    let contents = match tokio::fs::read_to_string(usage_path).await {
+        Ok(contents) => contents,
+        Err(_) => return None,
+    };
+    let parsed = serde_json::from_str::<PersistentImageUsageSidecar>(&contents).ok();
+    let _ = tokio::fs::remove_file(usage_path).await;
+    parsed
+}
+
+async fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) -> Option<String> {
     let script_path = workspace_dir.join("tools").join("persistent_image_generate.py");
     if !script_path.is_file() {
         tracing::warn!(
@@ -1855,13 +2232,67 @@ fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) -> Optio
         .as_secs();
     let output_name = format!("{}-{timestamp}.png", slugify_image_basename(prompt));
     let output_rel = format!("outbox/images/{output_name}");
+    let usage_rel = format!("outbox/images/{output_name}.usage.json");
+    let usage_path = workspace_dir.join(&usage_rel);
+
+    let mut budget_charge = None;
+    if let Some(remote_budget) = RemoteBudgetClient::from_env() {
+        let (provider, model, billing) = persistent_image_billing();
+        match remote_budget
+            .estimate_pricing(&provider, &model, billing.clone())
+            .await
+        {
+            Ok(pricing) => {
+                let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
+                let metadata = serde_json::json!({
+                    "modality": "image_generation",
+                    "providerAttempt": provider.clone(),
+                    "executionPath": "python_script",
+                    "promptChars": prompt.chars().count(),
+                    "billing": billing,
+                });
+                match remote_budget
+                    .check_explicit_cost(
+                        Some("image:generate:persistent"),
+                        "instance_image",
+                        &provider,
+                        &model,
+                        estimated_cost_usd,
+                        metadata.clone(),
+                    )
+                    .await
+                {
+                    Ok(check) if check.allowed => {
+                        budget_charge =
+                            Some((remote_budget, provider, model, estimated_cost_usd, metadata));
+                    }
+                    Ok(_) => {
+                        tracing::info!("persistent image generator skipped because budget is exhausted");
+                        return None;
+                    }
+                    Err(error) => {
+                        tracing::warn!("persistent image generator budget check failed: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!("persistent image generator pricing estimate failed: {error}");
+            }
+        }
+    }
 
     let output = match Command::new("python3")
         .arg(&script_path)
         .arg("--prompt")
         .arg(prompt)
+        .arg("--model")
+        .arg(PERSISTENT_IMAGE_MODEL)
+        .arg("--size")
+        .arg(PERSISTENT_IMAGE_SIZE)
         .arg("--output")
         .arg(&output_rel)
+        .arg("--usage-output")
+        .arg(&usage_rel)
         .current_dir(workspace_dir)
         .env("ZEROCLAW_WORKSPACE", workspace_dir)
         .output()
@@ -1884,6 +2315,75 @@ fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) -> Optio
 
     let marker = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if marker.starts_with("[IMAGE:") && marker.ends_with(']') {
+        let usage_sidecar = load_persistent_image_usage_sidecar(&usage_path).await;
+        if let Some((remote_budget, provider, model, estimated_cost_usd, metadata)) = budget_charge
+        {
+            let event_id = format!(
+                "zeroclaw:image:generate:persistent:{}",
+                uuid::Uuid::new_v4()
+            );
+            let result = if let Some(usage) = usage_sidecar.and_then(|entry| entry.usage) {
+                let total_tokens = if usage.total_tokens > 0 {
+                    usage.total_tokens
+                } else {
+                    usage.input_tokens.saturating_add(usage.output_tokens)
+                };
+                remote_budget
+                    .consume_explicit_usage(
+                        Some("image:generate:persistent"),
+                        &event_id,
+                        "instance_image",
+                        &provider,
+                        &model,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cached_input_tokens,
+                        0,
+                        estimated_cost_usd,
+                        serde_json::json!({
+                            "modality": "image_generation",
+                            "providerAttempt": provider,
+                            "executionPath": "python_script",
+                            "marker": marker,
+                            "base": metadata,
+                            "usage": {
+                                "inputTokens": usage.input_tokens,
+                                "outputTokens": usage.output_tokens,
+                                "cachedInputTokens": usage.cached_input_tokens,
+                                "totalTokens": total_tokens,
+                            }
+                        }),
+                    )
+                    .await
+            } else {
+                remote_budget
+                    .consume_explicit_cost(
+                        Some("image:generate:persistent"),
+                        &event_id,
+                        "instance_image",
+                        &provider,
+                        &model,
+                        estimated_cost_usd,
+                        0,
+                        serde_json::json!({
+                            "modality": "image_generation",
+                            "providerAttempt": provider,
+                            "executionPath": "python_script",
+                            "marker": marker,
+                            "base": metadata,
+                        }),
+                    )
+                    .await
+            };
+
+            if let Err(error) = result {
+                tracing::warn!(
+                    err = %error,
+                    marker = %marker,
+                    "failed to record persistent image budget consumption"
+                );
+            }
+        }
         Some(marker)
     } else {
         tracing::warn!(stdout = %marker, "persistent image generator returned unexpected output");
@@ -1891,7 +2391,7 @@ fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) -> Optio
     }
 }
 
-fn repair_unresolved_image_response(
+async fn repair_unresolved_image_response(
     message: &str,
     history: &[ChatMessage],
     workspace_dir: &Path,
@@ -1907,7 +2407,7 @@ fn repair_unresolved_image_response(
         return normalized;
     };
 
-    if let Some(marker) = generate_persistent_image_marker(workspace_dir, &prompt) {
+    if let Some(marker) = generate_persistent_image_marker(workspace_dir, &prompt).await {
         tracing::info!(
             prompt = %truncate_with_ellipsis(&prompt, 120),
             "repaired unresolved image marker with persisted workspace file"
@@ -2680,6 +3180,82 @@ async fn process_channel_message(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+    let remote_budget_context = resolve_channel_remote_budget_context(&msg);
+
+    let remote_budget_check_result = match remote_budget_context.as_ref() {
+        Some(remote_ctx) => {
+            match remote_budget_check_for_channel(
+                ctx.as_ref(),
+                remote_ctx,
+                route.provider.as_str(),
+                route.model.as_str(),
+                &history,
+            )
+            .await
+            {
+                Ok(Some(check)) if !check.allowed => {
+                    let error_text = "⚠️ LLM budget exceeded for this account. Please add credits to continue.";
+                    runtime_trace::record_event(
+                        "channel_message_budget_blocked",
+                        Some(msg.channel.as_str()),
+                        Some(route.provider.as_str()),
+                        Some(route.model.as_str()),
+                        None,
+                        Some(false),
+                        check.reason.as_deref().or(Some("llm budget exceeded")),
+                        serde_json::json!({
+                            "sender": msg.sender,
+                            "reply_target": msg.reply_target,
+                            "actor_id": remote_ctx.actor_id,
+                            "instance_id": remote_ctx.instance_id,
+                            "scope_id": remote_ctx.scope_id,
+                            "budget": check,
+                        }),
+                    );
+                    if let Some(channel) = target_channel.as_ref() {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(error_text, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                    return;
+                }
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!("Remote budget precheck failed for channel message: {error}");
+                    runtime_trace::record_event(
+                        "channel_message_budget_error",
+                        Some(msg.channel.as_str()),
+                        Some(route.provider.as_str()),
+                        Some(route.model.as_str()),
+                        None,
+                        Some(false),
+                        Some("remote budget check failed"),
+                        serde_json::json!({
+                            "sender": msg.sender,
+                            "reply_target": msg.reply_target,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    if let Some(channel) = target_channel.as_ref() {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(
+                                    "⚠️ Budget service unavailable. Please try again in a moment.",
+                                    &msg.reply_target,
+                                )
+                                .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -2805,13 +3381,18 @@ async fn process_channel_message(
     let history_len_before_tools = history.len();
 
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(
+            Result<
+                Result<crate::agent::loop_::AgentTurnOutcome, anyhow::Error>,
+                tokio::time::error::Elapsed,
+            >,
+        ),
         Cancelled,
     }
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
-    let mut llm_result = tokio::select! {
+    let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
@@ -2905,9 +3486,39 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(Ok(outcome))) => {
+            let mut usage_summary =
+                summarize_channel_usage(ctx.prompt_config.as_ref(), route.model.as_str(), &outcome);
+            if let Some(remote_ctx) = remote_budget_context.as_ref() {
+                match remote_budget_consume_for_channel(
+                    ctx.as_ref(),
+                    &msg,
+                    remote_ctx,
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    &usage_summary,
+                    started_at.elapsed(),
+                    remote_budget_check_result
+                        .as_ref()
+                        .and_then(|check| check.quote_id.as_deref()),
+                )
+                .await
+                {
+                    Ok(Some(remote_budget)) => {
+                        usage_summary.budget_consumed_remotely = true;
+                        if let Some(cost_usd) = remote_budget.cost_usd {
+                            usage_summary.cost_usd = cost_usd;
+                        }
+                        usage_summary.remote_budget = serde_json::to_value(&remote_budget).ok();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!("Remote budget consume failed for channel message: {error}");
+                    }
+                }
+            }
             // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
+            let mut outbound_response = outcome.output;
             if let Some(hooks) = &ctx.hooks {
                 match hooks
                     .run_on_message_sending(
@@ -2977,7 +3588,8 @@ async fn process_channel_message(
                 &delivered_response,
                 &history,
                 ctx.workspace_dir.as_ref(),
-            );
+            )
+            .await;
             delivered_response =
                 promote_delivery_markers(&delivered_response, ctx.workspace_dir.as_ref());
             runtime_trace::record_event(
@@ -2992,6 +3604,7 @@ async fn process_channel_message(
                     "sender": msg.sender,
                     "elapsed_ms": started_at.elapsed().as_millis(),
                     "response": scrub_credentials(&delivered_response),
+                    "usage": usage_summary,
                 }),
             );
 
@@ -3462,6 +4075,7 @@ pub fn build_system_prompt_with_mode(
         Some(&autonomy_cfg),
         native_tools,
         skills_prompt_mode,
+        &[],
     )
 }
 
@@ -3475,6 +4089,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     autonomy_config: Option<&crate::config::AutonomyConfig>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    extra_context_files: &[String],
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -3607,12 +4222,25 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         prompt.push_str(&aieos_prompt);
                         prompt.push_str("\n\n");
                     }
+                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                    append_extra_context_files(
+                        &mut prompt,
+                        workspace_dir,
+                        extra_context_files,
+                        max_chars,
+                    );
                 }
                 Ok(None) => {
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
                     // Fall back to OpenClaw bootstrap files
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
                     load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    append_extra_context_files(
+                        &mut prompt,
+                        workspace_dir,
+                        extra_context_files,
+                        max_chars,
+                    );
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
@@ -3621,17 +4249,35 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                     );
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
                     load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    append_extra_context_files(
+                        &mut prompt,
+                        workspace_dir,
+                        extra_context_files,
+                        max_chars,
+                    );
                 }
             }
         } else {
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
             load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+            append_extra_context_files(
+                &mut prompt,
+                workspace_dir,
+                extra_context_files,
+                max_chars,
+            );
         }
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
         load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+        append_extra_context_files(
+            &mut prompt,
+            workspace_dir,
+            extra_context_files,
+            max_chars,
+        );
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -3725,6 +4371,20 @@ fn inject_workspace_file(
             // Missing-file marker (matches OpenClaw behavior)
             let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
         }
+    }
+}
+
+fn append_extra_context_files(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    extra_context_files: &[String],
+    max_chars: usize,
+) {
+    if extra_context_files.is_empty() {
+        return;
+    }
+    for filename in extra_context_files {
+        inject_workspace_file(prompt, workspace_dir, filename, max_chars);
     }
 }
 
@@ -4668,7 +5328,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let tools_registry = Arc::new(built_tools);
 
-    let skills = crate::skills::load_skills_with_config(&workspace, &config);
+    let mut skills = crate::skills::load_skills_with_config(&workspace, &config);
+    if !config.agent.allowed_skills.is_empty() {
+        let allowed_lower: std::collections::HashSet<String> = config
+            .agent
+            .allowed_skills
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        skills.retain(|skill| allowed_lower.contains(&skill.name.to_ascii_lowercase()));
+    }
 
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
@@ -4710,6 +5379,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
+        &config.agent.context_files,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
@@ -4943,10 +5613,16 @@ mod tests {
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
+    use axum::{http::StatusCode, routing::post, Json, Router};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use tempfile::TempDir;
+
+    fn env_guard() -> &'static std::sync::Mutex<()> {
+        static GUARD: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+    }
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -5674,6 +6350,35 @@ mod tests {
         }
     }
 
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CountingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.reply.clone())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.reply.clone())
+        }
+    }
+
     struct ToolCallingProvider;
 
     fn tool_call_payload() -> String {
@@ -6039,6 +6744,124 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("BTC is currently around"));
         assert!(!reply.contains("\"tool_calls\""));
         assert!(!reply.contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_blocks_when_remote_budget_is_exhausted() {
+        let _env_guard = env_guard().lock().unwrap();
+        unsafe {
+            std::env::set_var("OWNER_ACTOR_ID", "budget-user@s.whatsapp.net");
+            std::env::set_var("INSTANCE_ID", "dedicated-budget-test");
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test budget server");
+        let server_addr = listener.local_addr().expect("budget server addr");
+        let app = Router::new().route(
+            "/check",
+            post(|| async {
+                (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({
+                        "allowed": false,
+                        "reason": "budget exhausted",
+                    })),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve budget server");
+        });
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut config = crate::config::Config::default();
+        config.cost.remote_budget.enabled = true;
+        config.cost.remote_budget.api_base_url = format!("http://{server_addr}");
+        config.cost.remote_budget.check_path = "/check".to_string();
+        config.cost.remote_budget.consume_path = "/consume".to_string();
+        config.cost.remote_budget.fail_open = false;
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+                reply: "this should never be sent".to_string(),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 2,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "budget-msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "hola".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await.clone();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("LLM budget exceeded"));
+
+        server.abort();
+        unsafe {
+            std::env::remove_var("OWNER_ACTOR_ID");
+            std::env::remove_var("INSTANCE_ID");
+        }
     }
 
     #[tokio::test]
@@ -7942,6 +8765,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&config),
             false,
             crate::config::SkillsPromptInjectionMode::Full,
+            &[],
         );
 
         assert!(
@@ -7971,6 +8795,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&config),
             false,
             crate::config::SkillsPromptInjectionMode::Full,
+            &[],
         );
 
         assert!(
@@ -10157,6 +10982,18 @@ This is an example JSON object for profile settings."#;
             sent_messages.len(),
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_image_billing_targets_openai_gpt_image() {
+        let (provider, model, billing) = persistent_image_billing();
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-image-1");
+        assert_eq!(billing.get("type").and_then(|value| value.as_str()), Some("per_image"));
+        assert_eq!(
+            billing.get("size").and_then(|value| value.as_str()),
+            Some("1024x1024")
         );
     }
 }
