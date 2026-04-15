@@ -16,8 +16,11 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
 use serde_json::json;
+use serde_json::Value;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::fs;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
 
@@ -25,6 +28,27 @@ const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const WHATSAPP_REMINDER_PREFIX: &str = "⏰ *REMINDER:* ";
+const TENANT_SERVICE_HELPER_TIMEOUT_SECS: u64 = 60;
+
+#[derive(Debug, Clone, Default)]
+struct ResolvedAgentJobPrompt {
+    prompt: String,
+    tenant_service: TenantServiceCronMetadata,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TenantServiceCronMetadata {
+    kind: Option<TenantServiceCronKind>,
+    prompt_file: Option<PathBuf>,
+    run_command: Option<String>,
+    delivery_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantServiceCronKind {
+    Execution,
+    Announce,
+}
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
@@ -220,7 +244,11 @@ async fn run_agent_job(
         );
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
-    let prompt = job.prompt.clone().unwrap_or_default();
+    let resolved_prompt = match resolve_agent_job_prompt(config, job.prompt.as_deref().unwrap_or("")).await {
+        Ok(prompt) => prompt,
+        Err(error) => return (false, error),
+    };
+    let prompt = resolved_prompt.prompt.clone();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let selected_model = resolve_cron_model(config, job.model.as_deref());
     let model_name = selected_model.clone().unwrap_or_else(|| {
@@ -284,6 +312,7 @@ async fn run_agent_job(
         None
     };
 
+    let run_started_at = Utc::now();
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(crate::agent::loop_::run_with_report(
@@ -339,17 +368,337 @@ async fn run_agent_job(
                     tracing::warn!(job_id = %job.id, error = %error, "Cron remote budget consume failed");
                 }
             }
+            let normalized_output = match normalize_tenant_service_cron_output(
+                config,
+                &resolved_prompt.tenant_service,
+                &report.output,
+                run_started_at,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(error) => return (false, format!("agent job failed: {error}")),
+            };
             (
                 true,
-                if report.output.trim().is_empty() {
+                if normalized_output.trim().is_empty() {
                     "agent job executed".to_string()
                 } else {
-                    report.output
+                    normalized_output
                 },
             )
         }
         Err(e) => (false, format!("agent job failed: {e}")),
     }
+}
+
+async fn resolve_agent_job_prompt(
+    config: &Config,
+    prompt: &str,
+) -> std::result::Result<ResolvedAgentJobPrompt, String> {
+    let trimmed = prompt.trim();
+    let tenant_service = parse_tenant_service_cron_metadata(config, trimmed);
+    if let Some(path) = tenant_service.prompt_file.clone() {
+        let loaded = fs::read_to_string(&path).await.map_err(|error| {
+            format!(
+                "cron prompt file could not be read: {} ({error})",
+                path.display()
+            )
+        })?;
+        if loaded.trim().is_empty() {
+            return Err(format!("cron prompt file is empty: {}", path.display()));
+        }
+        return Ok(ResolvedAgentJobPrompt {
+            prompt: loaded,
+            tenant_service,
+        });
+    }
+    Ok(ResolvedAgentJobPrompt {
+        prompt: trimmed.to_string(),
+        tenant_service,
+    })
+}
+
+fn parse_tenant_service_cron_metadata(config: &Config, prompt: &str) -> TenantServiceCronMetadata {
+    let mut metadata = TenantServiceCronMetadata::default();
+    let trimmed = prompt.trim();
+    if let Some(candidate) = trimmed.strip_prefix("@tenant-service-execution") {
+        let value = candidate.trim();
+        if !value.is_empty() {
+            metadata.kind = Some(TenantServiceCronKind::Execution);
+            metadata.prompt_file = Some(resolve_cron_prompt_path(config, value));
+        }
+    } else if let Some(candidate) = trimmed.strip_prefix("@tenant-service-announce") {
+        let value = candidate.trim();
+        if !value.is_empty() {
+            metadata.kind = Some(TenantServiceCronKind::Announce);
+            metadata.prompt_file = Some(resolve_cron_prompt_path(config, value));
+        }
+    }
+    for line in prompt.lines() {
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "TENANT_SERVICE_EXECUTION_PROMPT_FILE" => {
+                metadata.kind = Some(TenantServiceCronKind::Execution);
+                metadata.prompt_file = Some(resolve_cron_prompt_path(config, value));
+            }
+            "TENANT_SERVICE_ANNOUNCE_PROMPT_FILE" => {
+                metadata.kind = Some(TenantServiceCronKind::Announce);
+                metadata.prompt_file = Some(resolve_cron_prompt_path(config, value));
+            }
+            "TENANT_SERVICE_RUN_COMMAND" => {
+                metadata.run_command = Some(value.to_string());
+            }
+            "TENANT_SERVICE_DELIVERY_COMMAND" => {
+                metadata.delivery_command = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+    if metadata.prompt_file.is_none() {
+        if let Some(candidate) = extract_cron_prompt_file_reference(prompt) {
+            metadata.prompt_file = Some(resolve_cron_prompt_path(config, candidate));
+        }
+    }
+    if let Some(prompt_file) = metadata.prompt_file.as_ref() {
+        if let Some(job_name) = prompt_file.parent().and_then(|path| path.file_name()) {
+            let slug = job_name.to_string_lossy();
+            if metadata.run_command.is_none() {
+                metadata.run_command = Some(format!(
+                    "node tools/tenant_job_runner.mjs invoke --job {}",
+                    slug
+                ));
+            }
+            if metadata.delivery_command.is_none() {
+                metadata.delivery_command = Some(format!(
+                    "node tools/tenant_job_delivery.mjs --job {} --skip-run",
+                    slug
+                ));
+            }
+        }
+    }
+    metadata
+}
+
+fn extract_cron_prompt_file_reference(prompt: &str) -> Option<&str> {
+    let trimmed = prompt.trim();
+    if let Some(raw_path) = trimmed.strip_prefix("@file:") {
+        let candidate = raw_path.trim();
+        return if candidate.is_empty() { None } else { Some(candidate) };
+    }
+    if let Some(raw_path) = trimmed.strip_prefix("@file") {
+        let candidate = raw_path.trim();
+        return if candidate.is_empty() { None } else { Some(candidate) };
+    }
+    if let Some(raw_path) = trimmed.strip_prefix("@tenant-service-execution") {
+        let candidate = raw_path.trim();
+        return if candidate.is_empty() { None } else { Some(candidate) };
+    }
+    if let Some(raw_path) = trimmed.strip_prefix("@tenant-service-announce") {
+        let candidate = raw_path.trim();
+        return if candidate.is_empty() { None } else { Some(candidate) };
+    }
+
+    for line in trimmed.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let normalized_key = key.trim();
+        if normalized_key == "TENANT_SERVICE_EXECUTION_PROMPT_FILE"
+            || normalized_key == "TENANT_SERVICE_ANNOUNCE_PROMPT_FILE"
+        {
+            let candidate = value.trim();
+            if !candidate.is_empty() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+async fn normalize_tenant_service_cron_output(
+    config: &Config,
+    metadata: &TenantServiceCronMetadata,
+    output: &str,
+    run_started_at: DateTime<Utc>,
+) -> std::result::Result<String, String> {
+    let trimmed = output.trim();
+
+    if metadata.kind == Some(TenantServiceCronKind::Announce)
+        || metadata.delivery_command.is_some()
+    {
+        if let Some(marker) = extract_delivery_marker(trimmed) {
+            return Ok(marker);
+        }
+        if let Some(command) = metadata.delivery_command.as_deref() {
+            let helper_output = run_tenant_service_helper_command(config, command).await?;
+            if let Some(marker) = extract_delivery_marker(&helper_output) {
+                return Ok(marker);
+            }
+            return Err(format!(
+                "tenant service delivery command did not return a delivery marker: {}",
+                truncate_for_error(&helper_output)
+            ));
+        }
+    }
+
+    if metadata.kind == Some(TenantServiceCronKind::Execution) || metadata.run_command.is_some() {
+        if output_reports_cron_success(trimmed) {
+            return Ok("OK".to_string());
+        }
+        if tenant_service_latest_is_recent_success(metadata, run_started_at).await {
+            return Ok("OK".to_string());
+        }
+        if let Some(command) = metadata.run_command.as_deref() {
+            let helper_output = run_tenant_service_helper_command(config, command).await?;
+            if output_reports_cron_success(&helper_output)
+                || tenant_service_latest_is_recent_success(metadata, run_started_at).await
+            {
+                return Ok("OK".to_string());
+            }
+            return Err(format!(
+                "tenant service execution command did not report success: {}",
+                truncate_for_error(&helper_output)
+            ));
+        }
+    }
+
+    Ok(trimmed.to_string())
+}
+
+async fn tenant_service_latest_is_recent_success(
+    metadata: &TenantServiceCronMetadata,
+    run_started_at: DateTime<Utc>,
+) -> bool {
+    let Some(prompt_file) = metadata.prompt_file.as_ref() else {
+        return false;
+    };
+    let Some(service_root) = prompt_file.parent() else {
+        return false;
+    };
+    let latest_path = service_root.join("output").join("latest.json");
+    let latest_meta = match fs::metadata(&latest_path).await {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    let modified = match latest_meta.modified() {
+        Ok(value) => DateTime::<Utc>::from(value),
+        Err(_) => return false,
+    };
+    if modified < run_started_at - chrono::Duration::seconds(5) {
+        return false;
+    }
+    let payload = match fs::read_to_string(&latest_path).await {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let json = match serde_json::from_str::<Value>(&payload) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    output_reports_cron_success_from_json(&json)
+}
+
+async fn run_tenant_service_helper_command(
+    config: &Config,
+    command: &str,
+) -> std::result::Result<String, String> {
+    let mut child = build_cron_shell_command(command, &config.workspace_dir)
+        .map_err(|error| format!("tenant service helper shell setup error: {error}"))?;
+    let child = child
+        .spawn()
+        .map_err(|error| format!("tenant service helper spawn error: {error}"))?;
+    match time::timeout(
+        Duration::from_secs(TENANT_SERVICE_HELPER_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if output.status.success() {
+                if !stdout.is_empty() {
+                    Ok(stdout)
+                } else if !stderr.is_empty() {
+                    Ok(stderr)
+                } else {
+                    Ok(String::new())
+                }
+            } else {
+                Err(format!(
+                    "status={} stdout={} stderr={}",
+                    output.status,
+                    truncate_for_error(&stdout),
+                    truncate_for_error(&stderr)
+                ))
+            }
+        }
+        Ok(Err(error)) => Err(format!("tenant service helper spawn error: {error}")),
+        Err(_) => Err(format!(
+            "tenant service helper timed out after {}s",
+            TENANT_SERVICE_HELPER_TIMEOUT_SECS
+        )),
+    }
+}
+
+fn output_reports_cron_success(output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.eq_ignore_ascii_case("ok") {
+        return true;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .map(|value| output_reports_cron_success_from_json(&value))
+        .unwrap_or(false)
+}
+
+fn output_reports_cron_success_from_json(value: &Value) -> bool {
+    if value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|status| status.eq_ignore_ascii_case("ok"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    value
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn extract_delivery_marker(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| line.starts_with('[') && line.ends_with(']') && line.contains(':'))
+        .map(ToOwned::to_owned)
+}
+
+fn truncate_for_error(value: &str) -> String {
+    const MAX_LEN: usize = 240;
+    let trimmed = value.trim();
+    if trimmed.len() <= MAX_LEN {
+        return trimmed.to_string();
+    }
+    format!("{}…", &trimmed[..MAX_LEN - 1])
+}
+
+fn resolve_cron_prompt_path(config: &Config, candidate: &str) -> PathBuf {
+    let path = PathBuf::from(candidate);
+    if path.is_absolute() {
+        return path;
+    }
+    config.workspace_dir.join(path)
 }
 
 fn resolve_cron_model(config: &Config, raw_model: Option<&str>) -> Option<String> {
@@ -849,6 +1198,136 @@ mod tests {
         assert!(success);
         assert!(output.contains("scheduler-ok"));
         assert!(output.contains("status=exit status: 0"));
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_job_prompt_reads_at_file_references() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let prompt_path = config.workspace_dir.join("cron-prompt.txt");
+        tokio::fs::write(&prompt_path, "Use only http_request.\nReply with OK.\n")
+            .await
+            .unwrap();
+
+        let resolved = resolve_agent_job_prompt(&config, &format!("@file:{}", prompt_path.display()))
+            .await
+            .unwrap();
+        assert!(resolved.prompt.contains("Use only http_request."));
+        assert!(!resolved.prompt.contains("@file:"));
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_job_prompt_reads_space_delimited_file_references() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let prompt_path = config.workspace_dir.join("cron-prompt-space.txt");
+        tokio::fs::write(&prompt_path, "Use only http_request.\nReply with OK.\n")
+            .await
+            .unwrap();
+
+        let resolved = resolve_agent_job_prompt(&config, &format!("@file {}", prompt_path.display()))
+            .await
+            .unwrap();
+        assert!(resolved.prompt.contains("Use only http_request."));
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_job_prompt_rejects_missing_at_file_references() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+
+        let error = resolve_agent_job_prompt(&config, "@file:/tmp/definitely-missing-cron-prompt.txt")
+            .await
+            .unwrap_err();
+        assert!(error.contains("cron prompt file could not be read"));
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_job_prompt_reads_tenant_service_prompt_file_assignments() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let prompt_path = config.workspace_dir.join("service-execution-prompt.txt");
+        tokio::fs::write(&prompt_path, "Use only http_request.\nReply with OK.\n")
+            .await
+            .unwrap();
+
+        let resolved = resolve_agent_job_prompt(
+            &config,
+            &format!(
+                "TENANT_SERVICE_EXECUTION_PROMPT_FILE={}\nTENANT_SERVICE_EXECUTION_ALLOWED_TOOLS=http_request\nTENANT_SERVICE_RUN_COMMAND=node tools/tenant_job_runner.mjs invoke --job sample",
+                prompt_path.display()
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(resolved.prompt.contains("Use only http_request."));
+        assert!(!resolved
+            .prompt
+            .contains("TENANT_SERVICE_EXECUTION_PROMPT_FILE="));
+        assert_eq!(
+            resolved.tenant_service.kind,
+            Some(TenantServiceCronKind::Execution)
+        );
+        assert_eq!(
+            resolved.tenant_service.run_command.as_deref(),
+            Some("node tools/tenant_job_runner.mjs invoke --job sample")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_job_prompt_reads_tenant_service_alias_prompt_references() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let prompt_path = config
+            .workspace_dir
+            .join("tenant-app/server/jobs/sample/execution_prompt.txt");
+        tokio::fs::create_dir_all(prompt_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&prompt_path, "Use only http_request.\nReply with OK.\n")
+            .await
+            .unwrap();
+
+        let resolved = resolve_agent_job_prompt(
+            &config,
+            &format!("@tenant-service-execution {}", prompt_path.display()),
+        )
+        .await
+        .unwrap();
+        assert!(resolved.prompt.contains("Use only http_request."));
+        assert_eq!(
+            resolved.tenant_service.kind,
+            Some(TenantServiceCronKind::Execution)
+        );
+        assert_eq!(
+            resolved.tenant_service.run_command.as_deref(),
+            Some("node tools/tenant_job_runner.mjs invoke --job sample")
+        );
+        assert_eq!(
+            resolved.tenant_service.delivery_command.as_deref(),
+            Some("node tools/tenant_job_delivery.mjs --job sample --skip-run")
+        );
+    }
+
+    #[test]
+    fn output_reports_cron_success_accepts_ok_json() {
+        assert!(output_reports_cron_success("OK"));
+        assert!(output_reports_cron_success("{\"status\":\"ok\"}"));
+        assert!(output_reports_cron_success("{\"ok\":true}"));
+        assert!(!output_reports_cron_success("{\"status\":\"error\"}"));
+    }
+
+    #[test]
+    fn extract_delivery_marker_reads_document_marker() {
+        assert_eq!(
+            extract_delivery_marker("[DOCUMENT:/tmp/report.csv]"),
+            Some("[DOCUMENT:/tmp/report.csv]".to_string())
+        );
+        assert_eq!(
+            extract_delivery_marker("  [DOCUMENT:/tmp/report.csv]\n"),
+            Some("[DOCUMENT:/tmp/report.csv]".to_string())
+        );
+        assert_eq!(extract_delivery_marker("sin marker"), None);
     }
 
     #[tokio::test]

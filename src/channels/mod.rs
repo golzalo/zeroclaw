@@ -35,7 +35,7 @@ pub mod nostr;
 pub mod notion;
 pub mod qq;
 pub mod reddit;
-mod runtime_router;
+pub(crate) mod runtime_router;
 pub mod session_backend;
 pub mod session_sqlite;
 pub mod session_store;
