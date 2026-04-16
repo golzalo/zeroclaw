@@ -1192,6 +1192,10 @@ pub struct AgentConfig {
     /// Default: `[]` (no filtering — all tools included).
     #[serde(default)]
     pub tool_filter_groups: Vec<ToolFilterGroup>,
+    /// Seconds of inactivity before a channel session is automatically archived and
+    /// cleared. `0` = disabled (default — preserves current behaviour).
+    #[serde(default)]
+    pub chat_purge_idle_time_secs: u64,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1224,6 +1228,7 @@ impl Default for AgentConfig {
             allowed_skills: Vec::new(),
             context_files: Vec::new(),
             tool_filter_groups: Vec::new(),
+            chat_purge_idle_time_secs: 0,
         }
     }
 }
@@ -3548,6 +3553,24 @@ pub struct MemoryConfig {
     /// Only used when `backend = "qdrant"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+
+    // ── Consolidation pipeline ─────────────────────────────────
+    /// Memory consolidation pipeline configuration.
+    #[serde(default)]
+    pub consolidation: ConsolidationConfig,
+}
+
+/// Memory consolidation pipeline configuration (`[memory.consolidation]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ConsolidationConfig {
+    /// Workspace-relative path to a file containing the consolidation system prompt.
+    /// When set and the file exists, its content replaces the built-in prompt.
+    #[serde(default)]
+    pub prompt_file: Option<String>,
+    /// Interval in seconds for the background recovery sweep that retries stale
+    /// `.pending.md` / `.working.md` dump files. `0` = disabled (default).
+    #[serde(default)]
+    pub recovery_interval_secs: u64,
 }
 
 fn default_embedding_provider() -> String {
@@ -3623,6 +3646,7 @@ impl Default for MemoryConfig {
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            consolidation: ConsolidationConfig::default(),
         }
     }
 }

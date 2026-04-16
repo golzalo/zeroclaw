@@ -820,12 +820,8 @@ impl ImageGenerator {
                             .await
                         {
                             Ok(check) if check.allowed => {
-                                budget_charge = Some((
-                                    provider,
-                                    model,
-                                    estimated_cost_usd,
-                                    metadata,
-                                ));
+                                budget_charge =
+                                    Some((provider, model, estimated_cost_usd, metadata));
                             }
                             Ok(_) => {
                                 tracing::info!(
@@ -861,8 +857,10 @@ impl ImageGenerator {
 
             match result {
                 Ok(path) => {
-                    if let (Some(remote_budget), Some((provider, model, estimated_cost_usd, metadata))) =
-                        (remote_budget.as_ref(), budget_charge)
+                    if let (
+                        Some(remote_budget),
+                        Some((provider, model, estimated_cost_usd, metadata)),
+                    ) = (remote_budget.as_ref(), budget_charge)
                     {
                         let _ = remote_budget
                             .consume_explicit_cost(
@@ -974,7 +972,10 @@ impl ImageGenerator {
         }
     }
 
-    fn estimate_image_billing(&self, provider_name: &str) -> Option<(String, String, serde_json::Value)> {
+    fn estimate_image_billing(
+        &self,
+        provider_name: &str,
+    ) -> Option<(String, String, serde_json::Value)> {
         match provider_name {
             "stability" => Some((
                 "stability".to_string(),
@@ -1760,7 +1761,10 @@ mod tests {
         let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
         let body = generator.build_openai_image_request_body("Draw a monkey");
 
-        assert_eq!(body.get("model").and_then(|v| v.as_str()), Some("gpt-image-1"));
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("gpt-image-1")
+        );
         assert!(body.get("response_format").is_none());
     }
 
@@ -1778,7 +1782,10 @@ mod tests {
 
         assert_eq!(provider, "openai");
         assert_eq!(model, "gpt-image-1");
-        assert_eq!(billing.get("type").and_then(|value| value.as_str()), Some("per_image"));
+        assert_eq!(
+            billing.get("type").and_then(|value| value.as_str()),
+            Some("per_image")
+        );
         assert_eq!(
             billing.get("size").and_then(|value| value.as_str()),
             Some("1024x1536")
@@ -1804,9 +1811,18 @@ mod tests {
 
     #[test]
     fn image_extension_from_content_type_supports_common_formats() {
-        assert_eq!(ImageGenerator::image_extension_from_content_type("image/png"), "png");
-        assert_eq!(ImageGenerator::image_extension_from_content_type("image/jpeg"), "jpg");
-        assert_eq!(ImageGenerator::image_extension_from_content_type("image/webp"), "webp");
+        assert_eq!(
+            ImageGenerator::image_extension_from_content_type("image/png"),
+            "png"
+        );
+        assert_eq!(
+            ImageGenerator::image_extension_from_content_type("image/jpeg"),
+            "jpg"
+        );
+        assert_eq!(
+            ImageGenerator::image_extension_from_content_type("image/webp"),
+            "webp"
+        );
         assert_eq!(
             ImageGenerator::image_extension_from_content_type("image/jpeg; charset=binary"),
             "jpg"

@@ -586,7 +586,9 @@ impl TelegramChannel {
             RemoteBudgetClient::from_env(),
             super::tts::estimate_tts_billing(tts_config, text),
         ) {
-            let pricing = remote_budget.estimate_pricing(&provider, &model, billing.clone()).await?;
+            let pricing = remote_budget
+                .estimate_pricing(&provider, &model, billing.clone())
+                .await?;
             let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
             let metadata = json!({
                 "channel": "telegram",
@@ -1279,7 +1281,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             RemoteBudgetClient::from_env(),
             super::transcription::estimate_transcription_billing(config, Some(duration)),
         ) {
-            match remote_budget.estimate_pricing(&provider, &model, billing.clone()).await {
+            match remote_budget
+                .estimate_pricing(&provider, &model, billing.clone())
+                .await
+            {
                 Ok(pricing) => {
                     let estimated_cost_usd = pricing.estimated_cost_usd.unwrap_or(0.0);
                     let metadata = json!({
@@ -1311,7 +1316,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                             ));
                         }
                         Ok(_) => {
-                            tracing::info!("Telegram: skipping voice note because budget is exhausted");
+                            tracing::info!(
+                                "Telegram: skipping voice note because budget is exhausted"
+                            );
                             return None;
                         }
                         Err(error) => {
@@ -1325,20 +1332,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
 
-        let text = match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("Voice transcription failed: {e}");
-                return None;
-            }
-        };
+        let text =
+            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Voice transcription failed: {e}");
+                    return None;
+                }
+            };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
             return None;
         }
 
-        if let Some((remote_budget, provider, model, estimated_cost_usd, metadata)) = budget_charge {
+        if let Some((remote_budget, provider, model, estimated_cost_usd, metadata)) = budget_charge
+        {
             let _ = remote_budget
                 .consume_explicit_cost(
                     Some("voice:stt:telegram"),

@@ -407,11 +407,7 @@ impl Tool for DelegateTool {
                     let _ = remote_budget
                         .consume_text_quote(
                             Some(&format!("delegate:{agent_name}")),
-                            &format!(
-                                "zeroclaw:delegate:{}:{}",
-                                agent_name,
-                                uuid::Uuid::new_v4()
-                            ),
+                            &format!("zeroclaw:delegate:{}:{}", agent_name, uuid::Uuid::new_v4()),
                             quote.as_deref(),
                             &format!("delegate:{agent_name}"),
                             &agent_config.provider,
@@ -654,11 +650,7 @@ impl DelegateTool {
                     let _ = remote_budget
                         .consume_text_quote(
                             Some(&format!("delegate:{agent_name}")),
-                            &format!(
-                                "zeroclaw:delegate:{}:{}",
-                                agent_name,
-                                uuid::Uuid::new_v4()
-                            ),
+                            &format!("zeroclaw:delegate:{}:{}", agent_name, uuid::Uuid::new_v4()),
                             quote.as_deref(),
                             &format!("delegate:{agent_name}"),
                             &agent_config.provider,
@@ -979,8 +971,8 @@ mod tests {
             max_iterations,
             timeout_secs: None,
             agentic_timeout_secs: None,
-                skills: Vec::new(),
-                context_files: Vec::new(),
+            skills: Vec::new(),
+            context_files: Vec::new(),
         }
     }
 
@@ -1533,8 +1525,8 @@ mod tests {
             max_iterations: 10,
             timeout_secs: None,
             agentic_timeout_secs: None,
-                skills: Vec::new(),
-                context_files: Vec::new(),
+            skills: Vec::new(),
+            context_files: Vec::new(),
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),

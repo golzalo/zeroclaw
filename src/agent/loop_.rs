@@ -318,7 +318,10 @@ fn build_prompt_component_breakdown(
         enriched_user_chars: enriched_user.chars().count(),
         skills_prompt_chars,
         tool_instruction_chars,
-        workspace_file_chars: workspace_files.iter().map(|entry| entry.injected_chars).sum(),
+        workspace_file_chars: workspace_files
+            .iter()
+            .map(|entry| entry.injected_chars)
+            .sum(),
         workspace_files,
         extra_context_file_chars: extra_context_files_usage
             .iter()
@@ -467,9 +470,7 @@ fn latest_user_message_requests_tool_first_execution(history: &[ChatMessage]) ->
     let Some(last_user) = latest_user_message(history) else {
         return history.iter().any(|message| {
             message.role == "system"
-                && (message
-                    .content
-                    .contains("IMPLEMENTATION DIRECTIVE:")
+                && (message.content.contains("IMPLEMENTATION DIRECTIVE:")
                     || message
                         .content
                         .contains("SERVICE IMPLEMENTATION DIRECTIVE:")
@@ -485,9 +486,7 @@ fn latest_user_message_requests_tool_first_execution(history: &[ChatMessage]) ->
         || trimmed.starts_with("PROCESS IMPLEMENTATION DIRECTIVE:")
         || history.iter().any(|message| {
             message.role == "system"
-                && (message
-                    .content
-                    .contains("IMPLEMENTATION DIRECTIVE:")
+                && (message.content.contains("IMPLEMENTATION DIRECTIVE:")
                     || message
                         .content
                         .contains("SERVICE IMPLEMENTATION DIRECTIVE:")
@@ -533,7 +532,9 @@ fn extract_artifact_references(text: &str) -> Vec<String> {
 
     for token in text.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';')) {
         let candidate = token
-            .trim_matches(|ch: char| matches!(ch, '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | '"'))
+            .trim_matches(|ch: char| {
+                matches!(ch, '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | '"')
+            })
             .trim();
         if candidate.is_empty() {
             continue;
@@ -712,8 +713,10 @@ fn filter_skills_by_allowlist(
         return skills;
     }
 
-    let allowed_lower: HashSet<String> =
-        allowed.iter().map(|name| name.to_ascii_lowercase()).collect();
+    let allowed_lower: HashSet<String> = allowed
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
     skills
         .into_iter()
         .filter(|skill| allowed_lower.contains(&skill.name.to_ascii_lowercase()))
@@ -816,11 +819,7 @@ fn format_prompt_messages_for_trace(messages: &[ChatMessage]) -> String {
             formatted.push('\n');
         }
 
-        let _ = writeln!(
-            formatted,
-            "[{index}] {}",
-            message.role.to_ascii_uppercase()
-        );
+        let _ = writeln!(formatted, "[{index}] {}", message.role.to_ascii_uppercase());
 
         let scrubbed = scrub_credentials(&message.content);
         let scrubbed = unescape_trace_text(&scrubbed)
@@ -1213,7 +1212,8 @@ pub(crate) fn activate_skill_tool_requirements(
         return Vec::new();
     };
 
-    let available_tool_names: HashSet<&str> = tools_registry.iter().map(|tool| tool.name()).collect();
+    let available_tool_names: HashSet<&str> =
+        tools_registry.iter().map(|tool| tool.name()).collect();
     let mut activated = skill_activations.lock().unwrap_or_else(|e| e.into_inner());
     activated.activate_skill(skill.name.clone());
 
@@ -3514,7 +3514,10 @@ pub(crate) async fn run_tool_call_loop(
             tool_descriptions,
         );
         let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
-        if let Some(system_prompt) = history.first_mut().filter(|message| message.role == "system") {
+        if let Some(system_prompt) = history
+            .first_mut()
+            .filter(|message| message.role == "system")
+        {
             system_prompt.content = refresh_system_prompt_tool_sections(
                 &system_prompt.content,
                 &tool_specs,
@@ -3819,7 +3822,8 @@ pub(crate) async fn run_tool_call_loop(
                 continue;
             }
 
-            if user_requested_scheduling(history) && response_claims_schedule_success(&display_text) {
+            if user_requested_scheduling(history) && response_claims_schedule_success(&display_text)
+            {
                 if !scheduled_delivery_created || !scheduled_delivery_verified {
                     let reason = if !scheduled_delivery_created {
                         "assistant claimed a scheduled delivery without creating a cron job"
@@ -4192,10 +4196,9 @@ pub(crate) async fn run_tool_call_loop(
                     scheduled_delivery_verified = true;
                 }
                 if call.name == "read_skill" {
-                    if let (Some(skill_name), Some(skill_activations)) = (
-                        extract_read_skill_name(&call.arguments),
-                        skill_activations,
-                    ) {
+                    if let (Some(skill_name), Some(skill_activations)) =
+                        (extract_read_skill_name(&call.arguments), skill_activations)
+                    {
                         let activated_tool_names = activate_skill_tool_requirements(
                             &skill_name,
                             skills,
@@ -4339,9 +4342,7 @@ pub(crate) async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub(crate) fn build_tool_instructions(
-    tool_specs: &[crate::tools::ToolSpec],
-) -> String {
+pub(crate) fn build_tool_instructions(tool_specs: &[crate::tools::ToolSpec]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -4360,9 +4361,7 @@ pub(crate) fn build_tool_instructions(
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
-            tool.name,
-            tool.description,
-            tool.parameters
+            tool.name, tool.description, tool.parameters
         );
     }
 
@@ -4905,6 +4904,13 @@ pub async fn run(
                         continue;
                     }
 
+                    // Archive chat transcript before clearing; recovery sweep consolidates it.
+                    if let Err(e) =
+                        memory::chat_dump::write_chat_dump(&config.workspace_dir, "cli", &history)
+                    {
+                        tracing::debug!("Failed to write CLI chat dump: {e}");
+                    }
+
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
                     *skill_activations.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -5103,7 +5109,8 @@ async fn run_single_turn_with_report(
     allowed_tools: Option<Vec<String>>,
     session_state_file: Option<PathBuf>,
 ) -> Result<ProcessMessageReport> {
-    let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -5481,8 +5488,12 @@ async fn run_single_turn_with_report(
         .iter()
         .map(|request| request.cached_input_tokens.unwrap_or(0))
         .sum();
-    let cost_usd =
-        compute_usage_cost_usd(&config.cost.prices, &model_name, input_tokens, output_tokens);
+    let cost_usd = compute_usage_cost_usd(
+        &config.cost.prices,
+        &model_name,
+        input_tokens,
+        output_tokens,
+    );
 
     Ok(ProcessMessageReport {
         output: outcome.output,
@@ -5842,8 +5853,12 @@ pub async fn process_message(
         .iter()
         .map(|request| request.cached_input_tokens.unwrap_or(0))
         .sum();
-    let cost_usd =
-        compute_usage_cost_usd(&config.cost.prices, &model_name, input_tokens, output_tokens);
+    let cost_usd = compute_usage_cost_usd(
+        &config.cost.prices,
+        &model_name,
+        input_tokens,
+        output_tokens,
+    );
 
     Ok(ProcessMessageReport {
         output: outcome.output,
@@ -6737,15 +6752,13 @@ mod tests {
         assert_eq!(new_model, "gpt-5.4");
         assert!(
             history.iter().any(|message| {
-                message.role == "assistant"
-                    && message.content.contains("\"name\":\"switch_model\"")
+                message.role == "assistant" && message.content.contains("\"name\":\"switch_model\"")
             }),
             "assistant tool-call history should be preserved before switching"
         );
         assert!(
-            history
-                .iter()
-                .any(|message| message.role == "user" && message.content.contains("requested:openai:gpt-5.4")),
+            history.iter().any(|message| message.role == "user"
+                && message.content.contains("requested:openai:gpt-5.4")),
             "tool results should be preserved before switching"
         );
 
@@ -7524,7 +7537,10 @@ After text."#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(
-            calls[0].arguments.get("command").and_then(serde_json::Value::as_str),
+            calls[0]
+                .arguments
+                .get("command")
+                .and_then(serde_json::Value::as_str),
             Some("pwd")
         );
     }
@@ -8035,10 +8051,7 @@ Tail"#;
                 "web_fetch",
                 Arc::new(AtomicUsize::new(0)),
             )),
-            Box::new(CountingTool::new(
-                "cron_add",
-                Arc::new(AtomicUsize::new(0)),
-            )),
+            Box::new(CountingTool::new("cron_add", Arc::new(AtomicUsize::new(0)))),
         ];
         let skill_activations = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
         let history = vec![
@@ -8203,7 +8216,8 @@ Tail"#;
 
     #[test]
     fn response_claims_schedule_success_ignores_unscheduled_denials() {
-        let response = "No se ha programado ningun recordatorio ni tarea en tu agenda real en este momento.";
+        let response =
+            "No se ha programado ningun recordatorio ni tarea en tu agenda real en este momento.";
 
         assert!(!response_claims_schedule_success(response));
     }

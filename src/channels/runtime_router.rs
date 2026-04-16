@@ -11,7 +11,11 @@ pub(crate) struct RuntimeDirective {
 }
 
 pub(crate) fn build_runtime_directive(message: &str) -> Option<RuntimeDirective> {
-    if std::env::var("ZEROCLAW_DEDICATED_ROUTING_MODE").ok().as_deref() != Some("agents_mktp") {
+    if std::env::var("ZEROCLAW_DEDICATED_ROUTING_MODE")
+        .ok()
+        .as_deref()
+        != Some("agents_mktp")
+    {
         return None;
     }
 
@@ -146,33 +150,32 @@ fn looks_like_concrete_coding_request(text: &str) -> bool {
             "respect the content",
         ],
     );
-    let has_prd_intent =
-        contains_any(
-            &lower,
-            &[
-                "prd",
-                "docx",
-                "pdf",
-                "attachment",
-                "adjunt",
-                "archivo",
-                "requirements",
-                "requerimientos",
-            ],
-        ) && contains_any(
-            &lower,
-            &[
-                "implement",
-                "build",
-                "constru",
-                "arm",
-                "crear",
-                "hacer",
-                "publish",
-                "publica",
-                "publicar",
-            ],
-        );
+    let has_prd_intent = contains_any(
+        &lower,
+        &[
+            "prd",
+            "docx",
+            "pdf",
+            "attachment",
+            "adjunt",
+            "archivo",
+            "requirements",
+            "requerimientos",
+        ],
+    ) && contains_any(
+        &lower,
+        &[
+            "implement",
+            "build",
+            "constru",
+            "arm",
+            "crear",
+            "hacer",
+            "publish",
+            "publica",
+            "publicar",
+        ],
+    );
     let has_product_app_noun = contains_any(
         &lower,
         &[
@@ -228,7 +231,9 @@ fn looks_like_concrete_coding_request(text: &str) -> bool {
         ],
     );
 
-    (has_url && has_redesign_intent) || has_prd_intent || (has_product_app_noun && has_product_app_verb)
+    (has_url && has_redesign_intent)
+        || has_prd_intent
+        || (has_product_app_noun && has_product_app_verb)
 }
 
 fn build_service_runtime_message(original_message: &str) -> String {
@@ -238,7 +243,16 @@ fn build_service_runtime_message(original_message: &str) -> String {
     let wants_csv = contains_any(&original_message.to_lowercase(), &[" csv", "csv ", ".csv"]);
     let wants_ppt = contains_any(
         &original_message.to_lowercase(),
-        &["ppt", "pptx", "powerpoint", "presentation", "presentacion", "presentación", "deck", "slides"],
+        &[
+            "ppt",
+            "pptx",
+            "powerpoint",
+            "presentation",
+            "presentacion",
+            "presentación",
+            "deck",
+            "slides",
+        ],
     );
 
     let mut first_actions = Vec::new();
@@ -514,7 +528,11 @@ fn extract_attachment_path(text: &str) -> Option<String> {
         .split_whitespace()
         .find(|token| token.contains("attachments/whatsapp/"))
     {
-        return Some(token.trim_end_matches(&[')', ',', '.', ';'][..]).to_string());
+        return Some(
+            token
+                .trim_end_matches(&[')', ',', '.', ';'][..])
+                .to_string(),
+        );
     }
 
     text.split_whitespace()
@@ -524,7 +542,11 @@ fn extract_attachment_path(text: &str) -> Option<String> {
                 .iter()
                 .any(|ext| lower.ends_with(ext))
         })
-        .map(|token| token.trim_end_matches(&[')', ',', '.', ';'][..]).to_string())
+        .map(|token| {
+            token
+                .trim_end_matches(&[')', ',', '.', ';'][..])
+                .to_string()
+        })
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -594,7 +616,9 @@ mod tests {
         )
         .expect("service directive");
         assert_eq!(directive.kind, RuntimeDirectiveKind::Service);
-        assert!(directive.content.contains("SERVICE IMPLEMENTATION DIRECTIVE:"));
+        assert!(directive
+            .content
+            .contains("SERVICE IMPLEMENTATION DIRECTIVE:"));
         assert!(directive
             .content
             .contains("python3 tools/tenant_service_builder.py init"));
@@ -636,9 +660,13 @@ mod tests {
         )
         .expect("service directive");
         assert_eq!(directive.kind, RuntimeDirectiveKind::Service);
-        assert!(directive.content.contains("SERVICE IMPLEMENTATION DIRECTIVE:"));
+        assert!(directive
+            .content
+            .contains("SERVICE IMPLEMENTATION DIRECTIVE:"));
         assert!(directive.content.contains("--artifact-kind document"));
-        assert!(directive.content.contains("--artifact-file-name <name>.pptx"));
+        assert!(directive
+            .content
+            .contains("--artifact-file-name <name>.pptx"));
         assert!(directive
             .content
             .contains("prefer returning an artifactPayload in latest.json"));
