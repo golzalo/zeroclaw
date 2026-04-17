@@ -4425,6 +4425,13 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
+    if let Err(err) = crate::skills::seed_builtin_skills(&config.workspace_dir) {
+        tracing::warn!(
+            workspace = %config.workspace_dir.display(),
+            "Failed to seed builtin skills into workspace: {err}"
+        );
+    }
+
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
         tracing::info!(
