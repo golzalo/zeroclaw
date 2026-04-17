@@ -465,13 +465,36 @@ fn latest_user_message(history: &[ChatMessage]) -> Option<&str> {
 
 fn latest_user_message_requests_tool_first_execution(history: &[ChatMessage]) -> bool {
     let Some(last_user) = latest_user_message(history) else {
-        return false;
+        return history.iter().any(|message| {
+            message.role == "system"
+                && (message
+                    .content
+                    .contains("IMPLEMENTATION DIRECTIVE:")
+                    || message
+                        .content
+                        .contains("SERVICE IMPLEMENTATION DIRECTIVE:")
+                    || message
+                        .content
+                        .contains("PROCESS IMPLEMENTATION DIRECTIVE:"))
+        });
     };
 
     let trimmed = last_user.trim_start();
     trimmed.starts_with("IMPLEMENTATION DIRECTIVE:")
         || trimmed.starts_with("SERVICE IMPLEMENTATION DIRECTIVE:")
         || trimmed.starts_with("PROCESS IMPLEMENTATION DIRECTIVE:")
+        || history.iter().any(|message| {
+            message.role == "system"
+                && (message
+                    .content
+                    .contains("IMPLEMENTATION DIRECTIVE:")
+                    || message
+                        .content
+                        .contains("SERVICE IMPLEMENTATION DIRECTIVE:")
+                    || message
+                        .content
+                        .contains("PROCESS IMPLEMENTATION DIRECTIVE:"))
+        })
 }
 
 fn internal_repair_message(instruction: impl AsRef<str>) -> ChatMessage {
@@ -8232,6 +8255,21 @@ Tail"#;
         )];
 
         assert!(!latest_user_message_requests_tool_first_execution(&history));
+    }
+
+    #[test]
+    fn latest_user_message_requests_tool_first_execution_detects_runtime_directives_in_system_prompt(
+    ) {
+        let history = vec![
+            ChatMessage::system(
+                "base system\n\nSERVICE IMPLEMENTATION DIRECTIVE:\nOnly reply after a concrete implementation step succeeded or you hit a specific blocker.",
+            ),
+            ChatMessage::user(
+                "quiero hacer un proceso que entre a https://dolarhoy.com/ cada 2 minutos",
+            ),
+        ];
+
+        assert!(latest_user_message_requests_tool_first_execution(&history));
     }
 
     #[test]

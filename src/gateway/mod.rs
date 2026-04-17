@@ -1098,7 +1098,24 @@ async fn run_gateway_chat_with_tools(
     session_id: Option<&str>,
 ) -> anyhow::Result<crate::agent::loop_::ProcessMessageReport> {
     let config = state.config.lock().clone();
-    Box::pin(crate::agent::process_message(config, message, session_id, None)).await
+    let effective_message = crate::channels::runtime_router::build_runtime_directive(message)
+        .map(|directive| directive.content)
+        .unwrap_or_else(|| message.to_string());
+    Box::pin(crate::agent::process_message(
+        config,
+        &effective_message,
+        session_id,
+        None,
+    ))
+    .await
+}
+
+fn dedicated_runtime_forces_agentic_webhook() -> bool {
+    std::env::var("ZEROCLAW_DEDICATED_ROUTING_MODE").ok().as_deref() == Some("agents_mktp")
+}
+
+fn effective_webhook_agentic(webhook_body: &WebhookBody) -> bool {
+    webhook_body.agentic || dedicated_runtime_forces_agentic_webhook()
 }
 
 fn resolve_model_pricing(
@@ -1307,8 +1324,9 @@ async fn remote_budget_check(
         return Ok(None);
     }
 
+    let effective_agentic = effective_webhook_agentic(webhook_body);
     let (estimated_input_tokens, estimated_output_tokens) =
-        estimate_webhook_request_tokens(&webhook_body.message, webhook_body.agentic);
+        estimate_webhook_request_tokens(&webhook_body.message, effective_agentic);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(remote_budget.timeout_ms.max(1)))
@@ -1319,7 +1337,7 @@ async fn remote_budget_check(
         "actorId": actor_id,
         "scopeId": webhook_body.scope_id.clone(),
         "instanceId": extract_instance_id_from_webhook(webhook_body),
-        "agentType": if webhook_body.agentic { "instance" } else { "instance_simple" },
+        "agentType": if effective_agentic { "instance" } else { "instance_simple" },
         "provider": provider_label,
         "model": model_label,
         "estimatedInputTokens": estimated_input_tokens,
@@ -1384,12 +1402,13 @@ async fn remote_budget_consume(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let url = build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.consume_path);
+    let effective_agentic = effective_webhook_agentic(webhook_body);
     let mut request = client.post(url).json(&serde_json::json!({
         "eventId": format!("zeroclaw:{}:{}:{}", actor_id, webhook_body.scope_id.clone().unwrap_or_else(|| "scope".to_string()), Uuid::new_v4()),
         "actorId": actor_id,
         "instanceId": extract_instance_id_from_webhook(webhook_body),
         "scopeId": webhook_body.scope_id.clone(),
-        "agentType": if webhook_body.agentic { "instance" } else { "instance_simple" },
+        "agentType": if effective_agentic { "instance" } else { "instance_simple" },
         "provider": provider_label,
         "model": model_label,
         "quoteId": quote_id,
@@ -1588,7 +1607,8 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    let response_result = if webhook_body.agentic {
+    let effective_agentic = effective_webhook_agentic(&webhook_body);
+    let response_result = if effective_agentic {
         run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await
     } else {
         run_gateway_chat_simple(&state, message).await
