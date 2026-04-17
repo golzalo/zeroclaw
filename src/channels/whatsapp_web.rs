@@ -1349,6 +1349,27 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    async fn send_degraded_self_chat_greeting(
+        client: &wa_rs::Client,
+        self_phone: Option<&str>,
+    ) -> Result<()> {
+        let Some(self_phone) = self_phone else {
+            anyhow::bail!("Cannot greet degraded self-chat without a configured self phone");
+        };
+        let digits: String = self_phone.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            anyhow::bail!("Configured self phone `{self_phone}` does not contain digits");
+        }
+        let to = wa_rs_binary::jid::Jid::pn(digits);
+        Self::send_agent_text_message(
+            client,
+            &to,
+            &Self::greeting_with_runtime_name("Hola"),
+        )
+        .await
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     fn is_group_summary_request(message: &str) -> bool {
         let lowered = message.trim().to_ascii_lowercase();
         if lowered.is_empty() {
@@ -4408,6 +4429,7 @@ impl Channel for WhatsAppWebChannel {
                                     let client = client.clone();
                                     let bootstrap_group_done = bootstrap_group_done.clone();
                                     let degraded_self_chat_mode = degraded_self_chat_mode.clone();
+                                    let self_phone = self_phone.clone();
                                     let official_group_jid = official_group_jid.clone();
                                     let managed_groups = managed_groups.clone();
                                     tokio::spawn(async move {
@@ -4429,13 +4451,30 @@ impl Channel for WhatsAppWebChannel {
                                                 &official_group_jid,
                                                 &managed_groups,
                                             ) {
-                                                degraded_self_chat_mode.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::SeqCst,
-                                                );
+                                                let newly_enabled = degraded_self_chat_mode
+                                                    .compare_exchange(
+                                                        false,
+                                                        true,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    )
+                                                    .is_ok();
                                                 tracing::warn!(
                                                     "WhatsApp Web degraded self-chat fallback enabled because no managed groups were created"
                                                 );
+                                                if newly_enabled {
+                                                    if let Err(greeting_err) =
+                                                        WhatsAppWebChannel::send_degraded_self_chat_greeting(
+                                                            &client,
+                                                            self_phone.as_deref(),
+                                                        )
+                                                        .await
+                                                    {
+                                                        tracing::warn!(
+                                                            "WhatsApp Web failed to send degraded self-chat greeting: {greeting_err}"
+                                                        );
+                                                    }
+                                                }
                                             }
                                             bootstrap_group_done.store(
                                                 false,
