@@ -1542,6 +1542,13 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         },
     );
     prices.insert(
+        "openai/gpt-5.1".into(),
+        ModelPricing {
+            input: 1.25,
+            output: 10.0,
+        },
+    );
+    prices.insert(
         "openai/o1-preview".into(),
         ModelPricing {
             input: 15.0,
