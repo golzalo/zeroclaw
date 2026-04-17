@@ -431,15 +431,7 @@ impl Agent {
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
-            .skills({
-                if let Err(err) = crate::skills::seed_builtin_skills(&config.workspace_dir) {
-                    tracing::warn!(
-                        workspace = %config.workspace_dir.display(),
-                        "Failed to seed builtin skills into workspace: {err}"
-                    );
-                }
-                crate::skills::load_skills_with_config(&config.workspace_dir, config)
-            })
+            .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))

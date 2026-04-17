@@ -5243,12 +5243,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    if let Err(err) = crate::skills::seed_builtin_skills(&workspace) {
-        tracing::warn!(
-            workspace = %workspace.display(),
-            "Failed to seed builtin skills into workspace: {err}"
-        );
-    }
     let (mut built_tools, delegate_handle_ch): (Vec<Box<dyn Tool>>, _) =
         tools::all_tools_with_runtime(
             Arc::new(config.clone()),

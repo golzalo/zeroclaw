@@ -13,35 +13,6 @@ pub mod creator;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
-const BUILTIN_WHATSAPP_GROUP_OBSERVER_SKILL_NAME: &str = "whatsapp-group-observer";
-const BUILTIN_WHATSAPP_GROUP_OBSERVER_SKILL_TOML: &str = r#"[skill]
-name = "whatsapp-group-observer"
-description = "Manage passive WhatsApp group observation with runtime tools."
-version = "0.1.0"
-author = "zeroclaw"
-tags = ["whatsapp", "observation", "operations"]
-requires_tools = [
-  "whatsapp_list_groups",
-  "whatsapp_list_observed_groups",
-  "whatsapp_observe_group",
-  "whatsapp_unobserve_group",
-]
-
-prompts = [
-  """Use this skill when the user wants to observe, monitor, inspect, or stop observing a WhatsApp group.
-
-Observation is passive capture only: observing a group should keep appending future messages to the observation log and should not make the agent reply inside that observed-only group.
-
-Workflow:
-- Use `whatsapp_list_groups` to inspect the cached visible groups unless the user already gave an exact `group_jid`.
-- Use `whatsapp_observe_group` to register observation. When the request comes from the current WhatsApp conversation, pass the current `reply_target` as `delivery_chat_jid`.
-- Use `whatsapp_list_observed_groups` to inspect the current observation state.
-- Use `whatsapp_unobserve_group` to stop observing a group.
-
-Do not promise synchronous summaries or TXT exports from this skill. If cached visible groups are missing, explain that WhatsApp still needs to refresh the visible-groups snapshot and avoid guessing group identifiers."""
-]
-"#;
-
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
@@ -795,21 +766,6 @@ pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("skills")
 }
 
-pub fn seed_builtin_skills(workspace_dir: &Path) -> Result<()> {
-    init_skills_dir(workspace_dir)?;
-
-    let skill_dir = skills_dir(workspace_dir).join(BUILTIN_WHATSAPP_GROUP_OBSERVER_SKILL_NAME);
-    std::fs::create_dir_all(&skill_dir)?;
-    let manifest_path = skill_dir.join("SKILL.toml");
-    let markdown_path = skill_dir.join("SKILL.md");
-    if manifest_path.exists() || markdown_path.exists() {
-        return Ok(());
-    }
-
-    std::fs::write(&manifest_path, BUILTIN_WHATSAPP_GROUP_OBSERVER_SKILL_TOML)?;
-    Ok(())
-}
-
 /// Initialize the skills directory with a README
 pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     let dir = skills_dir(workspace_dir);
@@ -1406,21 +1362,6 @@ command = "echo hello"
         init_skills_dir(dir.path()).unwrap();
         init_skills_dir(dir.path()).unwrap(); // second call should not fail
         assert!(dir.path().join("skills").join("README.md").exists());
-    }
-
-    #[test]
-    fn seed_builtin_skills_creates_whatsapp_observer_skill() {
-        let dir = tempfile::tempdir().unwrap();
-        seed_builtin_skills(dir.path()).unwrap();
-
-        let skill_path = dir
-            .path()
-            .join("skills")
-            .join(BUILTIN_WHATSAPP_GROUP_OBSERVER_SKILL_NAME)
-            .join("SKILL.toml");
-        let content = fs::read_to_string(skill_path).unwrap();
-        assert!(content.contains("whatsapp-group-observer"));
-        assert!(content.contains("whatsapp_observe_group"));
     }
 
     #[test]
