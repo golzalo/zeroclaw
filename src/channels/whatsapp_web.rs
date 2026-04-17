@@ -32,18 +32,35 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
 use crate::remote_budget::RemoteBudgetClient;
+use crate::providers::openai::OpenAiProvider;
+use crate::providers::traits::Provider;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 #[cfg(feature = "whatsapp-web")]
 use base64::Engine as _;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(feature = "whatsapp-web")]
+use std::io::{BufRead, BufReader, Write};
 #[cfg(feature = "whatsapp-web")]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::{fs, select};
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_core::download::MediaType;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_core::iq::groups::GROUP_IQ_NAMESPACE;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_core::iq::spec::IqSpec;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_core::request::InfoQuery;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_binary::builder::NodeBuilder;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_binary::jid::GROUP_SERVER;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_binary::node::{Node, NodeContent};
 
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
@@ -64,6 +81,20 @@ const WHATSAPP_SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] = [
 const WHATSAPP_AGENT_PREFIX: &str = "🤖 *AGENT:* ";
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_REMINDER_PREFIX: &str = "⏰ *REMINDER:* ";
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_BOOTSTRAP_COMMUNITY_SUBJECT: &str = "Super86";
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_BOOTSTRAP_GROUP_SUBJECT: &str = "s86 - General";
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_BOOTSTRAP_GROUP_GREETING: &str = "Hola";
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_SUPPORT_GROUP_SUBJECT: &str = "s86 - Soporte";
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_DEFAULT_SUPPORT_PHONE: &str = "+5491178290582";
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_TOPIC_GROUP_DEFAULT_SUBJECT: &str = "Topico";
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_TOPIC_GROUP_PREFIX: &str = "s86 - ";
 
 #[cfg(feature = "whatsapp-web")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +111,243 @@ enum WhatsAppAttachmentKind {
 struct WhatsAppAttachment {
     kind: WhatsAppAttachmentKind,
     target: String,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObservedGroupConfig {
+    group_jid: String,
+    group_name: String,
+    enabled_at: String,
+    delivery_chat_jid: String,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObservedGroupMessage {
+    timestamp: String,
+    role: String,
+    sender: String,
+    content: String,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedGroupRecord {
+    key: String,
+    group_jid: String,
+    group_name: String,
+}
+
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone)]
+struct WhatsAppVisibleGroup {
+    jid: String,
+    subject: String,
+    linked_parent_jid: Option<String>,
+    is_parent: bool,
+    is_default_sub_group: bool,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Default)]
+struct GroupParticipatingExtendedIq;
+
+#[cfg(feature = "whatsapp-web")]
+impl GroupParticipatingExtendedIq {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl IqSpec for GroupParticipatingExtendedIq {
+    type Response = Vec<WhatsAppVisibleGroup>;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::get(
+            GROUP_IQ_NAMESPACE,
+            wa_rs_binary::jid::Jid::new("", GROUP_SERVER),
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("participating")
+                    .children([
+                        NodeBuilder::new("participants").build(),
+                        NodeBuilder::new("description").build(),
+                    ])
+                    .build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        let groups_node = response
+            .get_optional_child_by_tag(&["groups"])
+            .ok_or_else(|| anyhow!("missing <groups> in participating groups response"))?;
+
+        let mut groups = Vec::new();
+        for group_node in groups_node.get_children_by_tag("group") {
+            let raw_id = group_node
+                .attrs
+                .get("id")
+                .map(|value| value.to_string_value())
+                .ok_or_else(|| anyhow!("group missing required `id` attribute"))?;
+            let jid = if raw_id.contains('@') {
+                raw_id
+            } else {
+                wa_rs_binary::jid::Jid::group(raw_id).to_string()
+            };
+            let subject = group_node
+                .attrs
+                .get("subject")
+                .map(|value| value.to_string_value())
+                .unwrap_or_default();
+
+            let mut linked_parent_jid = None;
+            let mut is_parent = false;
+            let mut is_default_sub_group = false;
+
+            for child in group_node.children().into_iter().flatten() {
+                match child.tag.as_str() {
+                    "linked_parent" => {
+                        linked_parent_jid = child.attrs.get("jid").map(|value| {
+                            let raw = value.to_string_value();
+                            if raw.contains('@') {
+                                raw
+                            } else {
+                                wa_rs_binary::jid::Jid::group(raw).to_string()
+                            }
+                        });
+                    }
+                    "parent" => is_parent = true,
+                    "default_sub_group" => is_default_sub_group = true,
+                    _ => {}
+                }
+            }
+
+            groups.push(WhatsAppVisibleGroup {
+                jid,
+                subject,
+                linked_parent_jid,
+                is_parent,
+                is_default_sub_group,
+            });
+        }
+
+        Ok(groups)
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone)]
+struct CommunityCreateIq {
+    subject: String,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl CommunityCreateIq {
+    fn new(subject: impl Into<String>) -> Self {
+        Self {
+            subject: subject.into(),
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl IqSpec for CommunityCreateIq {
+    type Response = wa_rs_binary::jid::Jid;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let create_key = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .trim_start_matches("3eb0")
+            .to_string();
+        let create = NodeBuilder::new("create")
+            .attr("subject", &self.subject)
+            .attr("key", create_key)
+            .children([NodeBuilder::new("parent")
+                .attr("default_membership_approval_mode", "request_required")
+                .build()])
+            .build();
+
+        InfoQuery::set(
+            GROUP_IQ_NAMESPACE,
+            wa_rs_binary::jid::Jid::new("", GROUP_SERVER),
+            Some(NodeContent::Nodes(vec![create])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        parse_group_jid_from_iq_response(response)
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone)]
+struct LinkedGroupCreateIq {
+    subject: String,
+    parent_group_jid: wa_rs_binary::jid::Jid,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl LinkedGroupCreateIq {
+    fn new(subject: impl Into<String>, parent_group_jid: wa_rs_binary::jid::Jid) -> Self {
+        Self {
+            subject: subject.into(),
+            parent_group_jid,
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl IqSpec for LinkedGroupCreateIq {
+    type Response = wa_rs_binary::jid::Jid;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let create_key = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .trim_start_matches("3eb0")
+            .to_string();
+        let create = NodeBuilder::new("create")
+            .attr("subject", &self.subject)
+            .attr("key", create_key)
+            .children([NodeBuilder::new("linked_parent")
+                .jid_attr("jid", self.parent_group_jid.clone())
+                .build()])
+            .build();
+
+        InfoQuery::set(
+            GROUP_IQ_NAMESPACE,
+            wa_rs_binary::jid::Jid::new("", GROUP_SERVER),
+            Some(NodeContent::Nodes(vec![create])),
+        )
+    }
+
+    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
+        parse_group_jid_from_iq_response(response)
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn parse_group_jid_from_iq_response(response: &Node) -> Result<wa_rs_binary::jid::Jid> {
+    let group_node = response
+        .get_optional_child_by_tag(&["group"])
+        .ok_or_else(|| anyhow!("missing <group> in WhatsApp group create response"))?;
+    let group_id = group_node
+        .attrs
+        .get("id")
+        .map(|value| value.to_string_value())
+        .ok_or_else(|| anyhow!("group create response missing `id` attribute"))?;
+
+    if group_id.contains('@') {
+        group_id
+            .parse()
+            .map_err(|e| anyhow!("invalid WhatsApp group jid `{group_id}`: {e}"))
+    } else {
+        Ok(wa_rs_binary::jid::Jid::group(group_id))
+    }
 }
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
@@ -134,6 +402,22 @@ pub struct WhatsAppWebChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Chats whose last incoming message was a voice note.
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Prevent duplicate one-shot bootstrap actions within the same process.
+    bootstrap_group_done: Arc<std::sync::atomic::AtomicBool>,
+    /// When group bootstrap fails completely, allow the agent to keep operating via self-chat.
+    degraded_self_chat_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Official bootstrap group JID accepted for inbound group chat.
+    official_group_jid: Arc<Mutex<Option<String>>>,
+    /// All managed topic groups accepted for inbound group chat, keyed by jid -> display name.
+    managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Chats waiting for the user to provide the next topic name.
+    pending_topic_name_chats: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Chats waiting for the user to choose a group summary target by numeric index.
+    pending_summary_selection_chats:
+        Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>,
+    /// Chats waiting for the user to choose an already observed group for immediate summary generation.
+    pending_summary_generation_selection_chats:
+        Arc<Mutex<std::collections::HashMap<String, Vec<ObservedGroupConfig>>>>,
 }
 
 impl WhatsAppWebChannel {
@@ -175,6 +459,14 @@ impl WhatsAppWebChannel {
             tts_config: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            bootstrap_group_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            degraded_self_chat_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            official_group_jid: Arc::new(Mutex::new(None)),
+            managed_groups: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_topic_name_chats: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_summary_selection_chats: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_summary_generation_selection_chats:
+                Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -458,6 +750,1041 @@ impl WhatsAppWebChannel {
         }
 
         Ok(wa_rs_binary::jid::Jid::pn(digits))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn register_managed_group(
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+        group_jid: &str,
+        group_name: &str,
+    ) {
+        managed_groups
+            .lock()
+            .insert(group_jid.to_string(), group_name.to_string());
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn managed_groups_snapshot(
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Vec<(String, String)> {
+        let mut groups = managed_groups
+            .lock()
+            .iter()
+            .map(|(jid, name)| (jid.clone(), name.clone()))
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+        groups
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn managed_group_name(
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+        group_jid: &str,
+    ) -> Option<String> {
+        managed_groups.lock().get(group_jid).cloned()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_support_group_name(group_name: &str) -> bool {
+        group_name.trim() == WHATSAPP_SUPPORT_GROUP_SUBJECT
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn managed_groups_dir() -> PathBuf {
+        Self::workspace_dir()
+            .join("state")
+            .join("whatsapp")
+            .join("managed_groups")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn managed_groups_index_path() -> PathBuf {
+        Self::managed_groups_dir().join("index.json")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn community_record_key() -> &'static str {
+        "community"
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn bootstrap_community_subject() -> String {
+        std::env::var("ZEROCLAW_WHATSAPP_COMMUNITY_NAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| WHATSAPP_BOOTSTRAP_COMMUNITY_SUBJECT.to_string())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn bootstrap_community_enabled() -> bool {
+        matches!(
+            std::env::var("ZEROCLAW_WHATSAPP_BOOTSTRAP_COMMUNITY")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn managed_group_key_for_subject(subject: &str) -> String {
+        if subject == WHATSAPP_BOOTSTRAP_GROUP_SUBJECT {
+            "main".to_string()
+        } else if subject == WHATSAPP_SUPPORT_GROUP_SUBJECT {
+            "support".to_string()
+        } else {
+            format!("topic:{}", subject.trim())
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn load_managed_group_records() -> std::collections::HashMap<String, ManagedGroupRecord> {
+        let path = Self::managed_groups_index_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return std::collections::HashMap::new();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn save_managed_group_records(
+        groups: &std::collections::HashMap<String, ManagedGroupRecord>,
+    ) -> Result<()> {
+        let dir = Self::managed_groups_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow!("Failed to create managed groups dir {}: {e}", dir.display()))?;
+        let serialized = serde_json::to_string_pretty(groups)
+            .map_err(|e| anyhow!("Failed to serialize managed groups config: {e}"))?;
+        let path = Self::managed_groups_index_path();
+        std::fs::write(&path, serialized)
+            .map_err(|e| anyhow!("Failed to write managed groups index {}: {e}", path.display()))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn persist_managed_group_record(key: &str, group_jid: &str, group_name: &str) -> Result<()> {
+        let mut records = Self::load_managed_group_records();
+        records.insert(
+            key.to_string(),
+            ManagedGroupRecord {
+                key: key.to_string(),
+                group_jid: group_jid.to_string(),
+                group_name: group_name.to_string(),
+            },
+        );
+        Self::save_managed_group_records(&records)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn find_visible_group_jid_by_subject(
+        visible_groups: &[(String, String)],
+        subject: &str,
+    ) -> Option<String> {
+        visible_groups
+            .iter()
+            .find(|(_jid, name)| name == subject)
+            .map(|(jid, _name)| jid.clone())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn find_visible_linked_group_jid(
+        visible_groups: &[WhatsAppVisibleGroup],
+        community_jid: &str,
+        subject: &str,
+    ) -> Option<String> {
+        visible_groups
+            .iter()
+            .find(|group| {
+                group.linked_parent_jid.as_deref() == Some(community_jid) && group.subject == subject
+            })
+            .map(|group| group.jid.clone())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn find_visible_parent_group_jid(
+        visible_groups: &[WhatsAppVisibleGroup],
+        subject: &str,
+    ) -> Option<String> {
+        visible_groups
+            .iter()
+            .find(|group| group.is_parent && group.subject == subject)
+            .map(|group| group.jid.clone())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn ensure_bootstrap_community(
+        client: Arc<wa_rs::Client>,
+    ) -> Result<wa_rs_binary::jid::Jid> {
+        let community_name = Self::bootstrap_community_subject();
+        let visible_groups = Self::fetch_all_visible_groups_extended(&client).await?;
+        let persisted = Self::load_managed_group_records();
+
+        let maybe_existing_jid = persisted
+            .get(Self::community_record_key())
+            .and_then(|record| {
+                visible_groups
+                    .iter()
+                    .find(|group| group.jid == record.group_jid && group.is_parent)
+                    .map(|group| group.jid.clone())
+            })
+            .or_else(|| Self::find_visible_parent_group_jid(&visible_groups, &community_name));
+
+        let community_jid = if let Some(group_jid) = maybe_existing_jid {
+            group_jid
+        } else {
+            client
+                .execute(CommunityCreateIq::new(&community_name))
+                .await
+                .map_err(|e| anyhow!("Failed to create WhatsApp community `{community_name}`: {e}"))?
+                .to_string()
+        };
+
+        Self::persist_managed_group_record(
+            Self::community_record_key(),
+            &community_jid,
+            &community_name,
+        )?;
+
+        community_jid
+            .parse()
+            .map_err(|e| anyhow!("Invalid ensured WhatsApp community JID `{community_jid}`: {e}"))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn ensure_managed_group_in_community(
+        client: Arc<wa_rs::Client>,
+        group_name: &str,
+        community_jid: &wa_rs_binary::jid::Jid,
+        official_group_jid: Arc<Mutex<Option<String>>>,
+        managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Result<(wa_rs_binary::jid::Jid, bool)> {
+        let visible_groups = Self::fetch_all_visible_groups_extended(&client).await?;
+        let key = Self::managed_group_key_for_subject(group_name);
+        let persisted = Self::load_managed_group_records();
+        let community_jid_str = community_jid.to_string();
+
+        let maybe_existing_jid = persisted
+            .get(&key)
+            .and_then(|record| {
+                visible_groups
+                    .iter()
+                    .find(|group| {
+                        group.jid == record.group_jid
+                            && group.linked_parent_jid.as_deref() == Some(community_jid_str.as_str())
+                            && group.subject == group_name
+                    })
+                    .map(|group| group.jid.clone())
+            })
+            .or_else(|| {
+                Self::find_visible_linked_group_jid(
+                    &visible_groups,
+                    &community_jid_str,
+                    group_name,
+                )
+            });
+
+        let (group_jid, created) = if let Some(group_jid) = maybe_existing_jid {
+            (group_jid, false)
+        } else {
+            let created = client
+                .execute(LinkedGroupCreateIq::new(group_name, community_jid.clone()))
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to create WhatsApp linked group `{group_name}` in community {community_jid}: {e}"
+                    )
+                })?;
+            (created.to_string(), true)
+        };
+
+        *official_group_jid.lock() = Some(group_jid.clone());
+        Self::register_managed_group(&managed_groups, &group_jid, group_name);
+        Self::persist_managed_group_record(&key, &group_jid, group_name)?;
+
+        let jid = group_jid
+            .parse()
+            .map_err(|e| anyhow!("Invalid ensured WhatsApp JID `{group_jid}`: {e}"))?;
+        Ok((jid, created))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn ensure_managed_group_standalone(
+        client: Arc<wa_rs::Client>,
+        group_name: &str,
+        official_group_jid: Arc<Mutex<Option<String>>>,
+        managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Result<(wa_rs_binary::jid::Jid, bool)> {
+        let visible_groups = Self::fetch_all_visible_groups(&client, &managed_groups).await?;
+        let key = Self::managed_group_key_for_subject(group_name);
+        let persisted = Self::load_managed_group_records();
+
+        let maybe_existing_jid = persisted
+            .get(&key)
+            .and_then(|record| {
+                visible_groups
+                    .iter()
+                    .find(|(jid, _name)| jid == &record.group_jid)
+                    .map(|(jid, _name)| jid.clone())
+            })
+            .or_else(|| Self::find_visible_group_jid_by_subject(&visible_groups, group_name));
+
+        let (group_jid, created) = if let Some(group_jid) = maybe_existing_jid {
+            (group_jid, false)
+        } else {
+            let options = wa_rs::GroupCreateOptions::new(group_name);
+            let created = client
+                .groups()
+                .create_group(options)
+                .await
+                .map_err(|e| anyhow!("Failed to create WhatsApp group `{group_name}`: {e}"))?;
+            (created.gid.to_string(), true)
+        };
+
+        *official_group_jid.lock() = Some(group_jid.clone());
+        Self::register_managed_group(&managed_groups, &group_jid, group_name);
+        Self::persist_managed_group_record(&key, &group_jid, group_name)?;
+
+        let jid = group_jid
+            .parse()
+            .map_err(|e| anyhow!("Invalid ensured WhatsApp JID `{group_jid}`: {e}"))?;
+        Ok((jid, created))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_whatsapp_rate_overlimit_error(error: &anyhow::Error) -> bool {
+        let text = error.to_string();
+        text.contains("rate-overlimit") || text.contains("code=429")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn should_enable_degraded_self_chat_mode(
+        official_group_jid: &Arc<Mutex<Option<String>>>,
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> bool {
+        official_group_jid.lock().is_none() && managed_groups.lock().is_empty()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn ensure_managed_group(
+        client: Arc<wa_rs::Client>,
+        group_name: &str,
+        official_group_jid: Arc<Mutex<Option<String>>>,
+        managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Result<(wa_rs_binary::jid::Jid, bool)> {
+        if Self::bootstrap_community_enabled() {
+            match Self::ensure_bootstrap_community(client.clone()).await {
+                Ok(community_jid) => match Self::ensure_managed_group_in_community(
+                    client.clone(),
+                    group_name,
+                    &community_jid,
+                    official_group_jid.clone(),
+                    managed_groups.clone(),
+                )
+                .await
+                {
+                    Ok(result) => return Ok(result),
+                    Err(err) => {
+                        let fallback_reason = if Self::is_whatsapp_rate_overlimit_error(&err) {
+                            "rate limit while creating community-linked group"
+                        } else {
+                            "community-linked group creation failed"
+                        };
+                        tracing::warn!(
+                            subject = group_name,
+                            community_jid = %community_jid,
+                            "WhatsApp Web {fallback_reason}; falling back to standalone group: {err}"
+                        );
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        subject = group_name,
+                        "WhatsApp Web community bootstrap unavailable; falling back to standalone group: {err}"
+                    );
+                }
+            }
+        }
+
+        Self::ensure_managed_group_standalone(client, group_name, official_group_jid, managed_groups)
+            .await
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn fetch_all_visible_groups_extended(
+        client: &wa_rs::Client,
+    ) -> Result<Vec<WhatsAppVisibleGroup>> {
+        let mut groups = client
+            .execute(GroupParticipatingExtendedIq::new())
+            .await
+            .map_err(|e| anyhow!("Failed to fetch WhatsApp participating groups: {e}"))?;
+        groups.sort_by(|left, right| left.subject.cmp(&right.subject).then(left.jid.cmp(&right.jid)));
+        Ok(groups)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn fetch_all_visible_groups(
+        client: &wa_rs::Client,
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut groups = Self::fetch_all_visible_groups_extended(client)
+            .await?
+            .into_iter()
+            .filter(|group| !group.is_parent)
+            .map(|group| (group.jid, group.subject))
+            .collect::<Vec<_>>();
+
+        if groups.is_empty() {
+            groups = Self::managed_groups_snapshot(managed_groups);
+        } else {
+            groups.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+        }
+
+        Ok(groups)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_topic_subject(message: &str) -> Option<String> {
+        for (open, close) in [('\'', '\''), ('"', '"'), ('‘', '’'), ('“', '”')] {
+            let Some(start) = message.find(open) else {
+                continue;
+            };
+            let rest = &message[start + open.len_utf8()..];
+            let Some(end) = rest.find(close) else {
+                continue;
+            };
+            let candidate = rest[..end].trim();
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+
+        None
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn sanitize_group_subject(subject: &str) -> String {
+        let sanitized = subject
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_'))
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if sanitized.is_empty() {
+            WHATSAPP_TOPIC_GROUP_DEFAULT_SUBJECT.to_string()
+        } else {
+            sanitized
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn topic_group_name(subject: &str) -> String {
+        format!(
+            "{WHATSAPP_TOPIC_GROUP_PREFIX}{}",
+            Self::sanitize_group_subject(subject)
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn runtime_display_name() -> Option<String> {
+        std::env::var("INSTANCE_DISPLAY_NAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn greeting_with_runtime_name(base_greeting: &str) -> String {
+        let greeting = base_greeting.trim();
+        match Self::runtime_display_name() {
+            Some(name) if !greeting.is_empty() => format!("{greeting} {name}"),
+            Some(name) => format!("Hola {name}"),
+            None => greeting.to_string(),
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn support_phone() -> Option<String> {
+        std::env::var("ZEROCLAW_WHATSAPP_SUPPORT_PHONE")
+            .ok()
+            .or_else(|| Some(WHATSAPP_DEFAULT_SUPPORT_PHONE.to_string()))
+            .and_then(|value| Self::normalize_phone_token(&value))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn ensure_support_participant(
+        client: &wa_rs::Client,
+        group_jid: &wa_rs_binary::jid::Jid,
+    ) -> Result<()> {
+        let Some(support_phone) = Self::support_phone() else {
+            return Ok(());
+        };
+
+        let participant: wa_rs_binary::jid::Jid = format!(
+            "{}@s.whatsapp.net",
+            support_phone.trim_start_matches('+')
+        )
+        .parse()
+        .map_err(|e| anyhow!("Invalid support WhatsApp JID for `{support_phone}`: {e}"))?;
+
+        client
+            .groups()
+            .add_participants(group_jid, &[participant.clone()])
+            .await
+            .map_err(|e| anyhow!("Failed to add support participant {participant} to {group_jid}: {e}"))?;
+
+        tracing::info!(
+            group_jid = %group_jid,
+            participant = %participant,
+            "WhatsApp Web support participant ensured in support group"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_topic_group_subject(message: &str) -> Option<String> {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let lowered = trimmed.to_ascii_lowercase();
+        let asks_to_create = [
+            "creame",
+            "crea",
+            "crear",
+            "armame",
+            "arma",
+            "haceme",
+            "hace",
+        ]
+        .iter()
+        .any(|verb| lowered.contains(verb));
+        let mentions_topic = [
+            "topico",
+            "tópico",
+            "grupo",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+        let marks_new = lowered.contains("nuevo") || lowered.contains("nueva");
+        let names_topic = [
+            "llamado",
+            "llamada",
+            "que se llame",
+            "con nombre",
+            "nombre",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+
+        if !asks_to_create || !mentions_topic || !marks_new || !names_topic {
+            return None;
+        }
+
+        Self::extract_quoted_topic_subject(trimmed)
+            .map(|subject| Self::sanitize_group_subject(&subject))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_topic_creation_request_without_name(message: &str) -> bool {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let lowered = trimmed.to_ascii_lowercase();
+        let asks_to_create = [
+            "quiero crear",
+            "creame",
+            "crea",
+            "crear",
+            "armame",
+            "arma",
+            "haceme",
+            "hace",
+        ]
+        .iter()
+        .any(|verb| lowered.contains(verb));
+        let mentions_topic = ["topico", "tópico", "grupo"]
+            .iter()
+            .any(|needle| lowered.contains(needle));
+        let marks_new = lowered.contains("nuevo") || lowered.contains("nueva");
+
+        asks_to_create
+            && mentions_topic
+            && marks_new
+            && Self::extract_quoted_topic_subject(trimmed).is_none()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_topic_name_prompt(client: &wa_rs::Client, chat: &str) -> Result<()> {
+        let to: wa_rs_binary::jid::Jid = chat
+            .parse()
+            .map_err(|e| anyhow!("Invalid WhatsApp JID `{chat}` for topic prompt: {e}"))?;
+        Self::send_agent_text_message(
+            client,
+            &to,
+            "Decime como queres llamarlo, entre comillas si queres. Ejemplo: 'Resumen grupos'",
+        )
+        .await
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_agent_text_message(
+        client: &wa_rs::Client,
+        to: &wa_rs_binary::jid::Jid,
+        text: &str,
+    ) -> Result<()> {
+        let message = wa_rs_proto::whatsapp::Message {
+            conversation: Some(Self::apply_agent_message_prefix(text)),
+            ..Default::default()
+        };
+        client
+            .send_message(to.clone(), message)
+            .await
+            .map_err(|e| anyhow!("Failed to send WhatsApp text message: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_group_summary_request(message: &str) -> bool {
+        let lowered = message.trim().to_ascii_lowercase();
+        if lowered.is_empty() {
+            return false;
+        }
+
+        let asks_for_summary = [
+            "resumime",
+            "resumen",
+            "resumi",
+            "quiero un resumen",
+            "haceme un resumen",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+        let targets_group = ["grupo", "topico", "tópico", "este chat", "esta conversacion", "esta conversación"]
+            .iter()
+            .any(|needle| lowered.contains(needle));
+
+        asks_for_summary && targets_group
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_group_summary_generate_now_request(message: &str) -> bool {
+        let lowered = message.trim().to_ascii_lowercase();
+        if lowered.is_empty() {
+            return false;
+        }
+
+        let asks_for_generation = [
+            "generame ahora",
+            "genera ahora",
+            "forza el resumen",
+            "resumime ahora",
+            "quiero el resumen ahora",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+        let mentions_summary = ["resumen", "txt"]
+            .iter()
+            .any(|needle| lowered.contains(needle));
+
+        asks_for_generation && mentions_summary
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn parse_group_summary_selection(message: &str) -> Option<usize> {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let digits: String = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let index = digits.parse::<usize>().ok()?;
+        index.checked_sub(1)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_group_summary_group_list(
+        client: &wa_rs::Client,
+        chat: &str,
+        groups: &[(String, String)],
+    ) -> Result<()> {
+        let to: wa_rs_binary::jid::Jid = chat
+            .parse()
+            .map_err(|e| anyhow!("Invalid WhatsApp JID `{chat}` for summary prompt: {e}"))?;
+        let mut lines = vec![
+            "Estos son los grupos disponibles para resumir:".to_string(),
+            String::new(),
+        ];
+        lines.extend(
+            groups
+                .iter()
+                .enumerate()
+                .map(|(idx, (_jid, name))| format!("{}. {}", idx + 1, name)),
+        );
+        lines.push(String::new());
+        lines.push("Respondeme solo con el numero del grupo.".to_string());
+        Self::send_agent_text_message(client, &to, &lines.join("\n")).await
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_observed_group_summary_group_list(
+        client: &wa_rs::Client,
+        chat: &str,
+        groups: &[ObservedGroupConfig],
+    ) -> Result<()> {
+        let to: wa_rs_binary::jid::Jid = chat
+            .parse()
+            .map_err(|e| anyhow!("Invalid WhatsApp JID `{chat}` for observed summary prompt: {e}"))?;
+        let mut lines = vec![
+            "Estos son los grupos observados que podes resumir ahora:".to_string(),
+            String::new(),
+        ];
+        lines.extend(
+            groups
+                .iter()
+                .enumerate()
+                .map(|(idx, group)| format!("{}. {}", idx + 1, group.group_name)),
+        );
+        lines.push(String::new());
+        lines.push("Respondeme solo con el numero del grupo observado.".to_string());
+        Self::send_agent_text_message(client, &to, &lines.join("\n")).await
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn observed_groups_dir() -> PathBuf {
+        Self::workspace_dir()
+            .join("state")
+            .join("whatsapp")
+            .join("observed_groups")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn observed_groups_index_path() -> PathBuf {
+        Self::observed_groups_dir().join("index.json")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn observed_group_log_path(group_jid: &str) -> PathBuf {
+        let safe_name: String = group_jid
+            .chars()
+            .map(|ch| match ch {
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                _ => ch,
+            })
+            .collect();
+        Self::observed_groups_dir().join(format!("{safe_name}.jsonl"))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn load_observed_groups() -> std::collections::HashMap<String, ObservedGroupConfig> {
+        let path = Self::observed_groups_index_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return std::collections::HashMap::new();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn observed_groups_for_delivery_chat(chat_jid: &str) -> Vec<ObservedGroupConfig> {
+        let mut groups = Self::load_observed_groups()
+            .into_values()
+            .filter(|group| group.delivery_chat_jid == chat_jid)
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            left.group_name
+                .cmp(&right.group_name)
+                .then(left.group_jid.cmp(&right.group_jid))
+        });
+        groups
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn save_observed_groups(
+        groups: &std::collections::HashMap<String, ObservedGroupConfig>,
+    ) -> Result<()> {
+        let dir = Self::observed_groups_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow!("Failed to create observed groups dir {}: {e}", dir.display()))?;
+        let serialized = serde_json::to_string_pretty(groups)
+            .map_err(|e| anyhow!("Failed to serialize observed groups config: {e}"))?;
+        let path = Self::observed_groups_index_path();
+        std::fs::write(&path, serialized)
+            .map_err(|e| anyhow!("Failed to write observed groups index {}: {e}", path.display()))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn register_observed_group(
+        group_jid: &str,
+        group_name: &str,
+        delivery_chat_jid: &str,
+    ) -> Result<ObservedGroupConfig> {
+        let mut groups = Self::load_observed_groups();
+        let now = chrono::Utc::now().to_rfc3339();
+        let entry = groups
+            .entry(group_jid.to_string())
+            .or_insert_with(|| ObservedGroupConfig {
+                group_jid: group_jid.to_string(),
+                group_name: group_name.to_string(),
+                enabled_at: now.clone(),
+                delivery_chat_jid: delivery_chat_jid.to_string(),
+            });
+        entry.group_name = group_name.to_string();
+        entry.delivery_chat_jid = delivery_chat_jid.to_string();
+        let observed = entry.clone();
+        Self::save_observed_groups(&groups)?;
+        Ok(observed)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn observed_group_config(group_jid: &str) -> Option<ObservedGroupConfig> {
+        Self::load_observed_groups().remove(group_jid)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn append_observed_group_message(
+        group_jid: &str,
+        role: &str,
+        sender: &str,
+        content: &str,
+    ) -> Result<()> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let dir = Self::observed_groups_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow!("Failed to create observed groups dir {}: {e}", dir.display()))?;
+        let path = Self::observed_group_log_path(group_jid);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| anyhow!("Failed to open observed group log {}: {e}", path.display()))?;
+        let line = serde_json::to_string(&ObservedGroupMessage {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            role: role.to_string(),
+            sender: sender.to_string(),
+            content: trimmed.to_string(),
+        })
+        .map_err(|e| anyhow!("Failed to serialize observed group message: {e}"))?;
+        writeln!(file, "{line}")
+            .map_err(|e| anyhow!("Failed to append observed group log {}: {e}", path.display()))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn load_observed_group_messages(group_jid: &str) -> Vec<ObservedGroupMessage> {
+        let path = Self::observed_group_log_path(group_jid);
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        BufReader::new(file)
+            .lines()
+            .filter_map(|line| line.ok())
+            .filter_map(|line| serde_json::from_str::<ObservedGroupMessage>(&line).ok())
+            .collect()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn trim_summary_source_text(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            return text.to_string();
+        }
+
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(max_chars)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!("...[historial recortado]\n{tail}")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn render_group_transcript(messages: &[ObservedGroupMessage]) -> String {
+        messages
+            .iter()
+            .map(|msg| {
+                let role = match msg.role.as_str() {
+                    "user" => format!("Usuario ({})", msg.sender),
+                    "assistant" => "Agente".to_string(),
+                    "system" => "Sistema".to_string(),
+                    other => other.to_string(),
+                };
+                format!("{role}: {}", msg.content.trim())
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn summarize_group_messages_to_text(
+        group_name: &str,
+        messages: &[ObservedGroupMessage],
+    ) -> Result<String> {
+        let transcript = Self::render_group_transcript(messages);
+        let trimmed_transcript = Self::trim_summary_source_text(&transcript, 12_000);
+        let provider = OpenAiProvider::new(None);
+        let model = std::env::var("ZEROCLAW_DEFAULT_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "gpt-5.1".to_string());
+        let system_prompt = "Sos un asistente que resume conversaciones de WhatsApp. Devolve un resumen claro en espanol, en texto plano, con estas secciones si aplican: Resumen general, Decisiones, Tareas, Pendientes, Riesgos, Datos mencionados. No inventes nada.";
+        let user_prompt = format!(
+            "Grupo: {group_name}\n\nHistorial del grupo:\n{trimmed_transcript}\n\nGenera un resumen fiel y conciso."
+        );
+        let response = provider
+            .chat_with_system(Some(system_prompt), &user_prompt, &model, 0.2)
+            .await?;
+        let summary = response.trim().to_string();
+        if summary.is_empty() {
+            anyhow::bail!("Summary model returned empty text");
+        }
+        Ok(summary)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn create_group_summary_txt(
+        observed_group: &ObservedGroupConfig,
+    ) -> Result<(String, String)> {
+        let messages = Self::load_observed_group_messages(&observed_group.group_jid);
+        if messages.is_empty() {
+            anyhow::bail!("No observed history found for the selected group yet");
+        }
+
+        let summary =
+            Self::summarize_group_messages_to_text(&observed_group.group_name, &messages).await?;
+        let now = chrono::Local::now();
+        let file_name = format!(
+            "super86-group-summary-{}.txt",
+            now.format("%Y%m%d-%H%M%S")
+        );
+        let output_dir = Self::workspace_dir().join("outbox/documents");
+        std::fs::create_dir_all(&output_dir)
+            .map_err(|e| anyhow!("Failed to create output dir {}: {e}", output_dir.display()))?;
+        let output_path = output_dir.join(file_name);
+        let document = format!(
+            "Resumen de grupo\nFecha: {}\nGrupo: {}\nChat: {}\nObservando desde: {}\n\n{}\n",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            observed_group.group_name,
+            observed_group.group_jid,
+            observed_group.enabled_at,
+            summary
+        );
+        std::fs::write(&output_path, document)
+            .map_err(|e| anyhow!("Failed to write summary txt {}: {e}", output_path.display()))?;
+        Ok((output_path.to_string_lossy().to_string(), summary))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn create_topic_group_flow(
+        client: Arc<wa_rs::Client>,
+        subject: &str,
+        official_group_jid: Arc<Mutex<Option<String>>>,
+        managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Result<String> {
+        let group_name = Self::topic_group_name(subject);
+        let (group_jid, created_now) = Self::ensure_managed_group(
+            client.clone(),
+            &group_name,
+            official_group_jid,
+            managed_groups,
+        )
+        .await?;
+
+        let greeting_text = format!(
+            "{}, {} el topico {group_name}. Seguimos por aca.",
+            Self::greeting_with_runtime_name("Hola")
+            ,
+            if created_now { "ya cree" } else { "ya encontre" }
+        );
+        let greeting = wa_rs_proto::whatsapp::Message {
+            conversation: Some(Self::apply_agent_message_prefix(&greeting_text)),
+            ..Default::default()
+        };
+
+        client
+            .send_message(group_jid.clone(), greeting)
+            .await
+            .map_err(|e| anyhow!("Failed to send topic greeting to WhatsApp group: {e}"))?;
+
+        tracing::info!(
+            group_jid = %group_jid,
+            subject = %group_name,
+            created_now,
+            "WhatsApp Web topic group ensured in hot path"
+        );
+        Ok(group_jid.to_string())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn run_bootstrap_group_flow(
+        client: Arc<wa_rs::Client>,
+        official_group_jid: Arc<Mutex<Option<String>>>,
+        managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Result<()> {
+        let (group_jid, created_now) = Self::ensure_managed_group(
+            client.clone(),
+            WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
+            official_group_jid,
+            managed_groups.clone(),
+        )
+        .await?;
+
+        tracing::info!(
+            group_jid = %group_jid,
+            subject = WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
+            created_now,
+            "WhatsApp Web bootstrap group ensured"
+        );
+
+        let greeting = wa_rs_proto::whatsapp::Message {
+            conversation: Some(Self::apply_agent_message_prefix(
+                &Self::greeting_with_runtime_name(WHATSAPP_BOOTSTRAP_GROUP_GREETING),
+            )),
+            ..Default::default()
+        };
+
+        client
+            .send_message(group_jid.clone(), greeting)
+            .await
+            .map_err(|e| anyhow!("Failed to send bootstrap greeting to WhatsApp group: {e}"))?;
+
+        tracing::info!(
+            group_jid = %group_jid,
+            greeting = WHATSAPP_BOOTSTRAP_GROUP_GREETING,
+            "WhatsApp Web bootstrap greeting sent"
+        );
+
+        let (support_group_jid, support_created_now) = Self::ensure_managed_group(
+            client.clone(),
+            WHATSAPP_SUPPORT_GROUP_SUBJECT,
+            Arc::new(Mutex::new(None)),
+            managed_groups,
+        )
+        .await?;
+
+        tracing::info!(
+            group_jid = %support_group_jid,
+            subject = WHATSAPP_SUPPORT_GROUP_SUBJECT,
+            support_created_now,
+            "WhatsApp Web support group ensured"
+        );
+
+        if let Err(err) = Self::ensure_support_participant(&client, &support_group_jid).await {
+            tracing::warn!(
+                group_jid = %support_group_jid,
+                "WhatsApp Web failed to ensure support participant: {err}"
+            );
+        }
+        Ok(())
     }
 
     // ── Reconnect state-machine helpers (used by listen() and tested directly) ──
@@ -2169,10 +3496,27 @@ impl Channel for WhatsAppWebChannel {
                     ..Default::default()
                 };
                 client.send_message(to.clone(), text_msg).await?;
+                if Self::observed_group_config(&message.recipient).is_some() {
+                    let _ = Self::append_observed_group_message(
+                        &message.recipient,
+                        "assistant",
+                        "agent",
+                        &clean_content,
+                    );
+                }
             }
 
             for attachment in attachments {
                 Self::send_attachment(&client, &to, &attachment).await?;
+            }
+
+            if clean_content.is_empty() && Self::observed_group_config(&message.recipient).is_some() {
+                let _ = Self::append_observed_group_message(
+                    &message.recipient,
+                    "assistant",
+                    "agent",
+                    "[Adjunto enviado por el agente]",
+                );
             }
 
             return Ok(());
@@ -2180,6 +3524,14 @@ impl Channel for WhatsAppWebChannel {
 
         if let Some(attachment) = Self::parse_path_only_attachment(&clean_content) {
             Self::send_attachment(&client, &to, &attachment).await?;
+            if Self::observed_group_config(&message.recipient).is_some() {
+                let _ = Self::append_observed_group_message(
+                    &message.recipient,
+                    "assistant",
+                    "agent",
+                    "[Adjunto enviado por el agente]",
+                );
+            }
             return Ok(());
         }
 
@@ -2194,6 +3546,14 @@ impl Channel for WhatsAppWebChannel {
         };
 
         let message_id = client.send_message(to, outgoing).await?;
+        if Self::observed_group_config(&message.recipient).is_some() {
+            let _ = Self::append_observed_group_message(
+                &message.recipient,
+                "assistant",
+                "agent",
+                &clean_content,
+            );
+        }
         tracing::debug!(
             "WhatsApp Web: sent text to {} (id: {})",
             message.recipient,
@@ -2270,6 +3630,14 @@ impl Channel for WhatsAppWebChannel {
             let allow_direct_messages = self.allow_direct_messages;
             let allow_group_messages = self.allow_group_messages;
             let self_phone = self.self_phone.clone();
+            let bootstrap_group_done = self.bootstrap_group_done.clone();
+            let degraded_self_chat_mode = self.degraded_self_chat_mode.clone();
+            let official_group_jid = self.official_group_jid.clone();
+            let managed_groups = self.managed_groups.clone();
+            let pending_topic_name_chats = self.pending_topic_name_chats.clone();
+            let pending_summary_selection_chats = self.pending_summary_selection_chats.clone();
+            let pending_summary_generation_selection_chats =
+                self.pending_summary_generation_selection_chats.clone();
 
             tracing::info!(
                 raw_pair_phone = ?self.pair_phone,
@@ -2285,6 +3653,11 @@ impl Channel for WhatsAppWebChannel {
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
+                .with_device_props(
+                    Some("Super86".to_string()),
+                    None,
+                    Some(wa_rs_proto::whatsapp::device_props::PlatformType::Safari),
+                )
                 .on_event(move |event, client| {
                     let tx_inner = tx_clone.clone();
                     let allowed_numbers = allowed_numbers.clone();
@@ -2293,6 +3666,14 @@ impl Channel for WhatsAppWebChannel {
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
                     let self_phone = self_phone.clone();
+                    let bootstrap_group_done = bootstrap_group_done.clone();
+                    let degraded_self_chat_mode = degraded_self_chat_mode.clone();
+                    let official_group_jid = official_group_jid.clone();
+                    let managed_groups = managed_groups.clone();
+                    let pending_topic_name_chats = pending_topic_name_chats.clone();
+                    let pending_summary_selection_chats = pending_summary_selection_chats.clone();
+                    let pending_summary_generation_selection_chats =
+                        pending_summary_generation_selection_chats.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -2333,6 +3714,25 @@ impl Channel for WhatsAppWebChannel {
                                 );
                                 let rejection_reason =
                                     decision.rejection_reason.unwrap_or("accepted");
+                                let configured_group = official_group_jid.lock().clone();
+                                let managed_group_name = if decision.chat_kind
+                                    == WhatsAppChatKind::Group
+                                {
+                                    Self::managed_group_name(&managed_groups, &chat)
+                                } else {
+                                    None
+                                };
+                                let group_is_managed = managed_group_name.is_some();
+                                let group_is_support = managed_group_name
+                                    .as_deref()
+                                    .map(Self::is_support_group_name)
+                                    .unwrap_or(false);
+                                let group_is_observed = decision.chat_kind == WhatsAppChatKind::Group
+                                    && Self::observed_group_config(&chat).is_some();
+                                let accepted = decision.accepted
+                                    || (decision.chat_kind == WhatsAppChatKind::Group
+                                        && rejection_reason == "group_disabled"
+                                        && (group_is_managed || group_is_observed));
 
                                 tracing::trace!(
                                     raw_sender_jid = %sender_jid,
@@ -2351,12 +3751,14 @@ impl Channel for WhatsAppWebChannel {
                                     allow_self_chat,
                                     allow_direct_messages,
                                     allow_group_messages,
-                                    accepted = decision.accepted,
+                                    group_is_managed,
+                                    group_is_support,
+                                    accepted,
                                     rejection_reason,
                                     "WhatsApp Web inbound chat policy evaluation"
                                 );
 
-                                if !decision.accepted {
+                                if !accepted {
                                     tracing::warn!(
                                         reason = rejection_reason,
                                         chat_kind = ?decision.chat_kind,
@@ -2365,6 +3767,28 @@ impl Channel for WhatsAppWebChannel {
                                         "WhatsApp Web inbound message rejected by chat policy"
                                     );
                                     return;
+                                }
+
+                                if decision.chat_kind == WhatsAppChatKind::Group {
+                                    if !allow_group_messages && !group_is_managed && !group_is_observed {
+                                        match configured_group {
+                                            Some(expected_group) => {
+                                                tracing::warn!(
+                                                    expected_group_jid = %expected_group,
+                                                    actual_group_jid = %chat,
+                                                    "WhatsApp Web inbound group message rejected: not a managed or observed group"
+                                                );
+                                                return;
+                                            }
+                                            None => {
+                                                tracing::warn!(
+                                                    actual_group_jid = %chat,
+                                                    "WhatsApp Web inbound group message rejected: no managed or observed group registered yet"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
                                 }
                                 let normalized = decision
                                     .sender_allowed_candidate
@@ -2429,6 +3853,471 @@ impl Channel for WhatsAppWebChannel {
                                     content
                                 );
 
+                                if decision.chat_kind == WhatsAppChatKind::Group
+                                    && !Self::is_agent_echo_content(&content)
+                                {
+                                    if let Some(observed_group) = Self::observed_group_config(&chat)
+                                    {
+                                        if let Err(err) = Self::append_observed_group_message(
+                                            &observed_group.group_jid,
+                                            "user",
+                                            &normalized,
+                                            &content,
+                                        ) {
+                                            tracing::warn!(
+                                                chat = %chat,
+                                                "WhatsApp Web failed to append observed inbound group message: {err}"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if decision.chat_kind == WhatsAppChatKind::Group
+                                    && group_is_observed
+                                    && !group_is_managed
+                                {
+                                    tracing::debug!(
+                                        chat = %chat,
+                                        "WhatsApp Web observed-only group message captured without invoking the agent"
+                                    );
+                                    return;
+                                }
+
+                                if decision.chat_kind == WhatsAppChatKind::Group && group_is_support {
+                                    tracing::debug!(
+                                        chat = %chat,
+                                        "WhatsApp Web support group message ignored by main agent loop"
+                                    );
+                                    return;
+                                }
+
+                                let awaiting_topic_name =
+                                    pending_topic_name_chats.lock().contains(&chat);
+                                let pending_summary_options =
+                                    pending_summary_selection_chats.lock().get(&chat).cloned();
+                                let pending_generation_options = pending_summary_generation_selection_chats
+                                    .lock()
+                                    .get(&chat)
+                                    .cloned();
+
+                                if let Some(topic_subject) = Self::extract_topic_group_subject(&content) {
+                                    match Self::create_topic_group_flow(
+                                        client.clone(),
+                                        &topic_subject,
+                                        official_group_jid.clone(),
+                                        managed_groups.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(group_jid) => {
+                                            let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                                Ok(jid) => jid,
+                                                Err(_) => return,
+                                            };
+                                            if let Err(err) = Self::send_agent_text_message(
+                                                &client,
+                                                &to,
+                                                &format!(
+                                                    "Listo, ya cree el grupo {}. Seguimos ahi.",
+                                                    topic_subject
+                                                ),
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    source_chat = %chat,
+                                                    created_group_jid = %group_jid,
+                                                    "WhatsApp Web failed to send topic creation confirmation: {err}"
+                                                );
+                                            }
+                                            tracing::info!(
+                                                source_chat = %chat,
+                                                created_group_jid = %group_jid,
+                                                subject = %topic_subject,
+                                                "WhatsApp Web topic command handled"
+                                            );
+                                        }
+                                        Err(err) => {
+                                            tracing::error!(
+                                                source_chat = %chat,
+                                                subject = %topic_subject,
+                                                "WhatsApp Web topic command failed: {err}"
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                if Self::is_topic_creation_request_without_name(&content) {
+                                    pending_topic_name_chats.lock().insert(chat.clone());
+                                    if let Err(err) =
+                                        Self::send_topic_name_prompt(&client, &chat).await
+                                    {
+                                        tracing::error!(
+                                            source_chat = %chat,
+                                            "WhatsApp Web topic name prompt failed: {err}"
+                                        );
+                                    }
+                                    return;
+                                }
+
+                                if awaiting_topic_name {
+                                    pending_topic_name_chats.lock().remove(&chat);
+                                    let topic_subject = Self::sanitize_group_subject(
+                                        Self::extract_quoted_topic_subject(&content)
+                                            .as_deref()
+                                            .unwrap_or(content.trim()),
+                                    );
+                                    match Self::create_topic_group_flow(
+                                        client.clone(),
+                                        &topic_subject,
+                                        official_group_jid.clone(),
+                                        managed_groups.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(group_jid) => {
+                                            let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                                Ok(jid) => jid,
+                                                Err(_) => return,
+                                            };
+                                            if let Err(err) = Self::send_agent_text_message(
+                                                &client,
+                                                &to,
+                                                &format!(
+                                                    "Listo, ya cree el grupo {}. Seguimos ahi.",
+                                                    topic_subject
+                                                ),
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    source_chat = %chat,
+                                                    created_group_jid = %group_jid,
+                                                    "WhatsApp Web failed to send topic follow-up confirmation: {err}"
+                                                );
+                                            }
+                                            tracing::info!(
+                                                source_chat = %chat,
+                                                created_group_jid = %group_jid,
+                                                subject = %topic_subject,
+                                                "WhatsApp Web topic command handled from follow-up name"
+                                            );
+                                        }
+                                        Err(err) => {
+                                            tracing::error!(
+                                                source_chat = %chat,
+                                                subject = %topic_subject,
+                                                "WhatsApp Web topic follow-up creation failed: {err}"
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                if Self::is_group_summary_generate_now_request(&content) {
+                                    let observed_groups =
+                                        Self::observed_groups_for_delivery_chat(&chat);
+                                    let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                        Ok(jid) => jid,
+                                        Err(_) => return,
+                                    };
+                                    if observed_groups.is_empty() {
+                                        let _ = Self::send_agent_text_message(
+                                            &client,
+                                            &to,
+                                            "Todavia no tenes grupos observados desde este chat.",
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                    pending_summary_generation_selection_chats
+                                        .lock()
+                                        .insert(chat.clone(), observed_groups.clone());
+                                    if let Err(err) = Self::send_observed_group_summary_group_list(
+                                        &client,
+                                        &chat,
+                                        &observed_groups,
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(
+                                            source_chat = %chat,
+                                            "WhatsApp Web failed to send observed group summary list: {err}"
+                                        );
+                                    }
+                                    return;
+                                }
+
+                                if let Some(options) = pending_generation_options {
+                                    let Some(selected_index) =
+                                        Self::parse_group_summary_selection(&content)
+                                    else {
+                                        return;
+                                    };
+                                    pending_summary_generation_selection_chats
+                                        .lock()
+                                        .remove(&chat);
+                                    let Some(observed_group) =
+                                        options.get(selected_index).cloned()
+                                    else {
+                                        let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                            Ok(jid) => jid,
+                                            Err(_) => return,
+                                        };
+                                        let _ = Self::send_agent_text_message(
+                                            &client,
+                                            &to,
+                                            "Ese numero no corresponde a ningun grupo observado de la lista.",
+                                        )
+                                        .await;
+                                        return;
+                                    };
+
+                                    match Self::create_group_summary_txt(&observed_group).await {
+                                        Ok((summary_path, _summary_text)) => {
+                                            let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                                Ok(jid) => jid,
+                                                Err(_) => return,
+                                            };
+                                            let _ = Self::send_agent_text_message(
+                                                &client,
+                                                &to,
+                                                &format!(
+                                                    "Te dejo el resumen actualizado de {} en txt.",
+                                                    observed_group.group_name
+                                                ),
+                                            )
+                                            .await;
+                                            if let Err(err) = Self::send_attachment(
+                                                &client,
+                                                &to,
+                                                &WhatsAppAttachment {
+                                                    kind: WhatsAppAttachmentKind::Document,
+                                                    target: summary_path.clone(),
+                                                },
+                                            )
+                                            .await
+                                            {
+                                                tracing::error!(
+                                                    chat = %chat,
+                                                    path = %summary_path,
+                                                    "WhatsApp Web failed to send immediate summary txt: {err}"
+                                                );
+                                            }
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                chat = %chat,
+                                                group_jid = %observed_group.group_jid,
+                                                "WhatsApp Web failed to build immediate group summary txt: {err}"
+                                            );
+                                            let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                                Ok(jid) => jid,
+                                                Err(_) => return,
+                                            };
+                                            let _ = Self::send_agent_text_message(
+                                                &client,
+                                                &to,
+                                                "Todavia no tengo suficiente historial observado para generar el txt de este grupo.",
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                if Self::is_group_summary_request(&content) {
+                                    let groups = match Self::fetch_all_visible_groups(
+                                        &client,
+                                        &managed_groups,
+                                    )
+                                    .await
+                                    {
+                                        Ok(groups) => groups,
+                                        Err(err) => {
+                                            tracing::error!(
+                                                source_chat = %chat,
+                                                "WhatsApp Web failed to fetch visible groups for summary selection: {err}"
+                                            );
+                                            Self::managed_groups_snapshot(&managed_groups)
+                                        }
+                                    };
+                                    if groups.is_empty() {
+                                        tracing::warn!(
+                                            source_chat = %chat,
+                                            "WhatsApp Web group summary requested but no managed groups are registered"
+                                        );
+                                        let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                            Ok(jid) => jid,
+                                            Err(_) => return,
+                                        };
+                                        if let Err(err) = Self::send_agent_text_message(
+                                            &client,
+                                            &to,
+                                            "Todavia no tengo grupos registrados para resumir.",
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                source_chat = %chat,
+                                                "WhatsApp Web failed to send empty group summary list notice: {err}"
+                                            );
+                                        }
+                                        return;
+                                    }
+                                    pending_summary_selection_chats
+                                        .lock()
+                                        .insert(chat.clone(), groups.clone());
+                                    if let Err(err) =
+                                        Self::send_group_summary_group_list(&client, &chat, &groups)
+                                            .await
+                                    {
+                                        tracing::error!(
+                                            source_chat = %chat,
+                                            "WhatsApp Web failed to send group summary group list: {err}"
+                                        );
+                                    }
+                                    return;
+                                }
+
+                                if let Some(options) = pending_summary_options {
+                                    let Some(selected_index) =
+                                        Self::parse_group_summary_selection(&content)
+                                    else {
+                                        return;
+                                    };
+                                    pending_summary_selection_chats.lock().remove(&chat);
+                                    let Some((selected_group_jid, selected_group_name)) =
+                                        options.get(selected_index).cloned()
+                                    else {
+                                        tracing::warn!(
+                                            source_chat = %chat,
+                                            selected_index,
+                                            "WhatsApp Web invalid group summary selection index"
+                                        );
+                                        let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                            Ok(jid) => jid,
+                                            Err(_) => return,
+                                        };
+                                        if let Err(err) = Self::send_agent_text_message(
+                                            &client,
+                                            &to,
+                                            "Ese numero no corresponde a ningun grupo de la lista.",
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                source_chat = %chat,
+                                                "WhatsApp Web failed to send invalid summary selection notice: {err}"
+                                            );
+                                        }
+                                        return;
+                                    };
+
+                                    let observed_group = match Self::register_observed_group(
+                                        &selected_group_jid,
+                                        &selected_group_name,
+                                        &chat,
+                                    ) {
+                                        Ok(observed_group) => observed_group,
+                                        Err(err) => {
+                                            tracing::error!(
+                                                chat = %chat,
+                                                selected_group_jid = %selected_group_jid,
+                                                "WhatsApp Web failed to persist observed group selection: {err}"
+                                            );
+                                            let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                                Ok(jid) => jid,
+                                                Err(_) => return,
+                                            };
+                                            let _ = Self::send_agent_text_message(
+                                                &client,
+                                                &to,
+                                                "No pude guardar la configuracion de observacion para ese grupo.",
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                    };
+
+                                    match Self::create_group_summary_txt(&observed_group).await
+                                    {
+                                        Ok((summary_path, _summary_text)) => {
+                                            let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                                Ok(jid) => jid,
+                                                Err(err) => {
+                                                    tracing::error!(
+                                                        chat = %chat,
+                                                        "Invalid WhatsApp JID for summary delivery: {err}"
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                            let notice = wa_rs_proto::whatsapp::Message {
+                                                conversation: Some(Self::apply_agent_message_prefix(
+                                                    &format!(
+                                                        "Te dejo el resumen de {} en txt.",
+                                                        selected_group_name
+                                                    ),
+                                                )),
+                                                ..Default::default()
+                                            };
+                                            if let Err(err) =
+                                                client.send_message(to.clone(), notice).await
+                                            {
+                                                tracing::warn!(
+                                                    chat = %chat,
+                                                    "WhatsApp Web failed to send summary notice: {err}"
+                                                );
+                                            }
+                                            if let Err(err) = Self::send_attachment(
+                                                &client,
+                                                &to,
+                                                &WhatsAppAttachment {
+                                                    kind: WhatsAppAttachmentKind::Document,
+                                                    target: summary_path.clone(),
+                                                },
+                                            )
+                                            .await
+                                            {
+                                                tracing::error!(
+                                                    chat = %chat,
+                                                    path = %summary_path,
+                                                    "WhatsApp Web failed to send summary txt: {err}"
+                                                );
+                                            }
+                                        }
+                                        Err(err) => {
+                                            tracing::error!(
+                                                chat = %chat,
+                                                selected_group_jid = %selected_group_jid,
+                                                "WhatsApp Web failed to build selected group summary txt: {err}"
+                                            );
+                                            let to: wa_rs_binary::jid::Jid = match chat.parse() {
+                                                Ok(jid) => jid,
+                                                Err(_) => return,
+                                            };
+                                            if let Err(send_err) = Self::send_agent_text_message(
+                                                &client,
+                                                &to,
+                                                &format!(
+                                                    "Listo, ya estoy observando {}. Todavia no tengo suficiente historial nuevo para armar el txt.",
+                                                    selected_group_name
+                                                ),
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    chat = %chat,
+                                                    "WhatsApp Web failed to send summary failure notice: {send_err}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+
                                 if Self::is_agent_echo_content(&content) {
                                     tracing::info!(
                                         chat = %chat,
@@ -2437,6 +4326,28 @@ impl Channel for WhatsAppWebChannel {
                                         "WhatsApp Web: ignoring inbound message tagged as agent output"
                                     );
                                     return;
+                                }
+
+                                let degraded_self_chat_mode_enabled = degraded_self_chat_mode
+                                    .load(std::sync::atomic::Ordering::SeqCst);
+
+                                if decision.chat_kind == WhatsAppChatKind::SelfChat
+                                    && !degraded_self_chat_mode_enabled
+                                {
+                                    tracing::info!(
+                                        chat = %chat,
+                                        sender = %normalized,
+                                        "WhatsApp Web: ignoring self-chat message outside managed topic command"
+                                    );
+                                    return;
+                                } else if decision.chat_kind == WhatsAppChatKind::SelfChat
+                                    && degraded_self_chat_mode_enabled
+                                {
+                                    tracing::warn!(
+                                        chat = %chat,
+                                        sender = %normalized,
+                                        "WhatsApp Web degraded fallback active: accepting self-chat because no managed groups are available"
+                                    );
                                 }
 
                                 if content.is_empty() {
@@ -2484,6 +4395,60 @@ impl Channel for WhatsAppWebChannel {
                             Event::Connected(_) => {
                                 tracing::info!("WhatsApp Web connected successfully");
                                 WhatsAppWebChannel::reset_retry(&retry_count);
+
+                                if bootstrap_group_done
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    )
+                                    .is_ok()
+                                {
+                                    let client = client.clone();
+                                    let bootstrap_group_done = bootstrap_group_done.clone();
+                                    let degraded_self_chat_mode = degraded_self_chat_mode.clone();
+                                    let official_group_jid = official_group_jid.clone();
+                                    let managed_groups = managed_groups.clone();
+                                    tokio::spawn(async move {
+                                        let bootstrap_official_group_jid =
+                                            official_group_jid.clone();
+                                        let bootstrap_managed_groups = managed_groups.clone();
+                                        if let Err(err) =
+                                            WhatsAppWebChannel::run_bootstrap_group_flow(
+                                                client,
+                                                bootstrap_official_group_jid,
+                                                bootstrap_managed_groups,
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                "WhatsApp Web bootstrap group flow failed: {err}"
+                                            );
+                                            if WhatsAppWebChannel::should_enable_degraded_self_chat_mode(
+                                                &official_group_jid,
+                                                &managed_groups,
+                                            ) {
+                                                degraded_self_chat_mode.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                tracing::warn!(
+                                                    "WhatsApp Web degraded self-chat fallback enabled because no managed groups were created"
+                                                );
+                                            }
+                                            bootstrap_group_done.store(
+                                                false,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
+                                        } else {
+                                            degraded_self_chat_mode.store(
+                                                false,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
+                                        }
+                                    });
+                                }
                             }
                             Event::LoggedOut(_) => {
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2539,6 +4504,8 @@ impl Channel for WhatsAppWebChannel {
                 builder = builder.with_pair_code(PairCodeOptions {
                     phone_number: phone.clone(),
                     custom_code: self.pair_code.clone(),
+                    platform_id: wa_rs::pair_code::PlatformId::Safari,
+                    platform_display: "Super86".to_string(),
                     ..Default::default()
                 });
             } else if self.pair_code.is_some() {
@@ -3007,6 +4974,170 @@ mod tests {
 
         assert!(!decision.accepted);
         assert_eq!(decision.rejection_reason, Some("self_requires_pair_phone"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_extract_topic_group_subject_from_named_prompt() {
+        assert_eq!(
+            WhatsAppWebChannel::extract_topic_group_subject(
+                "Creame un topico nuevo llamado 'Resumen grupos'"
+            ),
+            Some("Resumen grupos".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_extract_topic_group_subject_from_typographic_quotes() {
+        assert_eq!(
+            WhatsAppWebChannel::extract_topic_group_subject(
+                "Creame un topico nuevo llamado “Resumen grupos”"
+            ),
+            Some("Resumen grupos".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_extract_topic_group_subject_from_natural_variant() {
+        assert_eq!(
+            WhatsAppWebChannel::extract_topic_group_subject(
+                "Armame un grupo nuevo con nombre 'Resumen grupos'"
+            ),
+            Some("Resumen grupos".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_extract_topic_group_subject_requires_explicit_name() {
+        assert_eq!(
+            WhatsAppWebChannel::extract_topic_group_subject("creame un topico nuevo"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_detects_topic_creation_request_without_name() {
+        assert!(WhatsAppWebChannel::is_topic_creation_request_without_name(
+            "Quiero crear un topico nuevo"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_detects_topic_creation_request_without_name_with_group_variant() {
+        assert!(WhatsAppWebChannel::is_topic_creation_request_without_name(
+            "Armame un grupo nuevo"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_does_not_mark_named_request_as_pending() {
+        assert!(!WhatsAppWebChannel::is_topic_creation_request_without_name(
+            "Quiero crear un topico nuevo llamado 'Resumen grupos'"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_detects_group_summary_request() {
+        assert!(WhatsAppWebChannel::is_group_summary_request(
+            "Quiero un resumen de un grupo"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_detects_group_summary_request_for_current_chat() {
+        assert!(WhatsAppWebChannel::is_group_summary_request(
+            "Resumime esta conversacion"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_rejects_non_summary_request() {
+        assert!(!WhatsAppWebChannel::is_group_summary_request(
+            "Quiero crear un topico nuevo"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_parses_group_summary_selection_index() {
+        assert_eq!(
+            WhatsAppWebChannel::parse_group_summary_selection("2"),
+            Some(1)
+        );
+        assert_eq!(
+            WhatsAppWebChannel::parse_group_summary_selection("3. Resumen grupos"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_detects_immediate_group_summary_request() {
+        assert!(WhatsAppWebChannel::is_group_summary_generate_now_request(
+            "Generame ahora el resumen en txt"
+        ));
+        assert!(WhatsAppWebChannel::is_group_summary_generate_now_request(
+            "Resumime ahora en txt"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_sanitize_group_subject_removes_unsupported_chars() {
+        assert_eq!(
+            WhatsAppWebChannel::sanitize_group_subject("  To/pico!!! 2026  "),
+            "Topico 2026".to_string()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_topic_group_name_uses_prefixed_subject() {
+        assert_eq!(
+            WhatsAppWebChannel::topic_group_name("Resumen grupos"),
+            "s86 - Resumen grupos".to_string()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_greeting_with_runtime_name_uses_instance_display_name() {
+        let key = "INSTANCE_DISPLAY_NAME";
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, "Ale");
+        assert_eq!(
+            WhatsAppWebChannel::greeting_with_runtime_name("Hola"),
+            "Hola Ale".to_string()
+        );
+        if let Some(value) = previous {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_greeting_with_runtime_name_falls_back_without_env() {
+        let key = "INSTANCE_DISPLAY_NAME";
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert_eq!(
+            WhatsAppWebChannel::greeting_with_runtime_name("Hola"),
+            "Hola".to_string()
+        );
+        if let Some(value) = previous {
+            std::env::set_var(key, value);
+        }
     }
 
     #[test]
