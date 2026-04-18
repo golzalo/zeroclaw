@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeDirectiveKind {
     Coding,
@@ -10,6 +12,55 @@ pub(crate) struct RuntimeDirective {
     pub(crate) content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct RuntimeWebhookContext {
+    #[serde(default)]
+    pub recent_inbound_messages: Vec<RuntimeContextMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct RuntimeContextMessage {
+    #[serde(default)]
+    pub ts: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub sender: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StructuredRuntimeRequestKind {
+    Coding,
+    Service,
+    ServiceCancellation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+struct StructuredRuntimeFlags {
+    recurring_service: bool,
+    recurring_delivery: bool,
+    public_surface: bool,
+    google_workspace: bool,
+    simple_single_job: bool,
+    html_quote_csv: bool,
+    news_csv: bool,
+    internal_ppt: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StructuredRuntimeRequest {
+    request_kind: StructuredRuntimeRequestKind,
+    original_user_request: String,
+    effective_user_request: String,
+    source_urls: Vec<String>,
+    attachment_path: Option<String>,
+    follow_up_context: Vec<String>,
+    flags: StructuredRuntimeFlags,
+}
+
 pub(crate) fn build_runtime_directive(message: &str) -> Option<RuntimeDirective> {
     if std::env::var("ZEROCLAW_DEDICATED_ROUTING_MODE").ok().as_deref() != Some("agents_mktp") {
         return None;
@@ -17,6 +68,7 @@ pub(crate) fn build_runtime_directive(message: &str) -> Option<RuntimeDirective>
 
     let original = normalize_text(message);
     if original.is_empty()
+        || original.starts_with("DEDICATED_RUNTIME_REQUEST")
         || original.starts_with("IMPLEMENTATION DIRECTIVE:")
         || original.starts_with("SERVICE IMPLEMENTATION DIRECTIVE:")
         || original.starts_with("PROCESS IMPLEMENTATION DIRECTIVE:")
@@ -39,6 +91,178 @@ pub(crate) fn build_runtime_directive(message: &str) -> Option<RuntimeDirective>
     }
 
     None
+}
+
+pub(crate) fn build_webhook_runtime_message(
+    message: &str,
+    runtime_context: Option<&RuntimeWebhookContext>,
+) -> Option<String> {
+    if std::env::var("ZEROCLAW_DEDICATED_ROUTING_MODE").ok().as_deref() != Some("agents_mktp") {
+        return None;
+    }
+
+    let original = normalize_text(message);
+    if original.is_empty()
+        || original.starts_with("DEDICATED_RUNTIME_REQUEST")
+        || original.starts_with("IMPLEMENTATION DIRECTIVE:")
+        || original.starts_with("SERVICE IMPLEMENTATION DIRECTIVE:")
+        || original.starts_with("PROCESS IMPLEMENTATION DIRECTIVE:")
+    {
+        return None;
+    }
+
+    let recent_inbound_messages = runtime_context
+        .map(|context| context.recent_inbound_messages.as_slice())
+        .unwrap_or(&[]);
+    let effective = build_effective_runtime_message(original, recent_inbound_messages);
+
+    let request_kind = if looks_like_service_cancellation_request(&effective) {
+        Some(StructuredRuntimeRequestKind::ServiceCancellation)
+    } else if looks_like_service_request(&effective) {
+        Some(StructuredRuntimeRequestKind::Service)
+    } else if looks_like_concrete_coding_request(&effective) {
+        Some(StructuredRuntimeRequestKind::Coding)
+    } else {
+        None
+    }?;
+
+    Some(build_structured_runtime_message(
+        request_kind,
+        original,
+        &effective,
+    ))
+}
+
+fn build_structured_runtime_message(
+    request_kind: StructuredRuntimeRequestKind,
+    original_user_request: &str,
+    effective_user_request: &str,
+) -> String {
+    let lower = effective_user_request.to_lowercase();
+    let source_urls = extract_urls(effective_user_request);
+    let request = StructuredRuntimeRequest {
+        request_kind,
+        original_user_request: original_user_request.to_string(),
+        effective_user_request: effective_user_request.to_string(),
+        source_urls,
+        attachment_path: extract_attachment_path(effective_user_request),
+        follow_up_context: if effective_user_request != original_user_request {
+            extract_follow_up_context(effective_user_request)
+        } else {
+            Vec::new()
+        },
+        flags: StructuredRuntimeFlags {
+            recurring_service: looks_like_recurring_service_request(effective_user_request),
+            recurring_delivery: looks_like_recurring_delivery_request(effective_user_request),
+            public_surface: looks_like_public_surface_request(effective_user_request),
+            google_workspace: looks_like_google_workspace_request(effective_user_request),
+            simple_single_job: looks_like_simple_single_job_service_request(effective_user_request),
+            html_quote_csv: contains_any(
+                &lower,
+                &[
+                    "csv",
+                    "cotiz",
+                    "cotización",
+                    "quote",
+                    "quotes",
+                    "exchange rate",
+                    "fx",
+                    "dolar",
+                    "dólar",
+                    "blue",
+                    "oficial",
+                    "mep",
+                ],
+            ),
+            news_csv: contains_any(
+                &lower,
+                &[
+                    "csv",
+                    "news",
+                    "noticias",
+                    "headline",
+                    "headlines",
+                    "titular",
+                    "titulares",
+                    "top 3",
+                    "top three",
+                    "tres noticias",
+                ],
+            ),
+            internal_ppt: contains_any(
+                &lower,
+                &[
+                    "ppt",
+                    "pptx",
+                    "powerpoint",
+                    "presentación",
+                    "presentacion",
+                    "presentation",
+                    "reporte ejecutivo",
+                    "resumen ejecutivo",
+                ],
+            ) && contains_any(
+                &lower,
+                &[
+                    "api interna",
+                    "internal api",
+                    "dos apis",
+                    "two apis",
+                    "stage",
+                    "consolide",
+                    "consolidar",
+                ],
+            ),
+        },
+    };
+
+    let rendered = serde_json::to_string_pretty(&request)
+        .unwrap_or_else(|_| "{\"request_kind\":\"plain\"}".to_string());
+    [
+        "DEDICATED_RUNTIME_REQUEST",
+        "Use the preloaded runtime context files for policy and workflow. Treat the JSON below as structured execution context, not user-facing copy.",
+        "```json",
+        &rendered,
+        "```",
+    ]
+    .join("\n")
+}
+
+fn build_effective_runtime_message(
+    current_message: &str,
+    recent_inbound_messages: &[RuntimeContextMessage],
+) -> String {
+    let normalized_current = normalize_text(current_message);
+    if normalized_current.is_empty() {
+        return String::new();
+    }
+
+    if !looks_like_structured_followup_answer(normalized_current) {
+        return normalized_current.to_string();
+    }
+
+    let recent_context = extract_recent_context_snippet(recent_inbound_messages);
+    if recent_context.is_empty() {
+        return normalized_current.to_string();
+    }
+
+    let combined = [
+        recent_context.as_str(),
+        "FOLLOW-UP RESOLUTION:",
+        "The user has already answered the prior clarifying questions. Do not ask another round. Build now with reasonable defaults, then publish.",
+        "FOLLOW-UP ANSWERS:",
+        normalized_current,
+    ]
+    .join("\n");
+
+    if looks_like_concrete_coding_request(&combined)
+        || looks_like_service_request(&combined)
+        || looks_like_service_cancellation_request(&combined)
+    {
+        return combined;
+    }
+
+    normalized_current.to_string()
 }
 
 fn build_coding_runtime_message(original_message: &str) -> String {
@@ -146,6 +370,23 @@ fn looks_like_concrete_coding_request(text: &str) -> bool {
             "respect the content",
         ],
     );
+    let has_inspired_site_target = contains_any(
+        &lower,
+        &[
+            "web",
+            "website",
+            "sitio",
+            "sitio web",
+            "pagina",
+            "página",
+            "landing",
+            "homepage",
+            "home page",
+            "web corporativa",
+            "corporate site",
+            "company website",
+        ],
+    );
     let has_prd_intent =
         contains_any(
             &lower,
@@ -227,8 +468,27 @@ fn looks_like_concrete_coding_request(text: &str) -> bool {
             "lanz",
         ],
     );
+    let has_structured_followup_intent = looks_like_structured_followup_answer(text)
+        && contains_any(
+            &lower,
+            &[
+                "web de mi empresa",
+                "sitio de mi empresa",
+                "mi empresa",
+                "varias secciones",
+                "landing",
+                "sitio",
+                "web",
+                "listo para usar",
+                "lista para usar",
+            ],
+        );
 
-    (has_url && has_redesign_intent) || has_prd_intent || (has_product_app_noun && has_product_app_verb)
+    (has_url && has_redesign_intent)
+        || (has_redesign_intent && has_inspired_site_target)
+        || has_prd_intent
+        || (has_product_app_noun && has_product_app_verb)
+        || has_structured_followup_intent
 }
 
 fn build_service_runtime_message(original_message: &str) -> String {
@@ -467,6 +727,201 @@ fn looks_like_recurring_delivery_request(text: &str) -> bool {
     )
 }
 
+fn looks_like_service_cancellation_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let has_cancellation_verb = contains_any(
+        &lower,
+        &[
+            "cancel",
+            "cancela",
+            "cancelar",
+            "deten",
+            "detener",
+            "stop",
+            "paus",
+            "apaga",
+            "apagalo",
+            "apagá",
+            "no me lo mandes",
+            "no me lo envies",
+            "no me lo envíes",
+            "deja de correr",
+            "dejá de correr",
+            "no corra más",
+            "no corra mas",
+            "deja de mandarlo",
+            "sacalo del cron",
+        ],
+    );
+    let has_service_noun = contains_any(
+        &lower,
+        &[
+            "proceso",
+            "process",
+            "job",
+            "cron",
+            "scheduler",
+            "servicio",
+            "service",
+            "worker",
+            "background",
+            "reporte",
+            "csv",
+            "actualización",
+            "actualizacion",
+            "delivery",
+        ],
+    );
+
+    has_cancellation_verb && has_service_noun
+}
+
+fn looks_like_public_surface_request(text: &str) -> bool {
+    contains_any(
+        &text.to_lowercase(),
+        &[
+            "dashboard",
+            "ui",
+            "frontend",
+            "webapp",
+            "portal",
+            "page",
+            "pagina",
+            "página",
+            "landing",
+            "site",
+            "sitio",
+            "vista",
+            "pantalla",
+            "panel",
+            "mostrarlo en",
+            "mostrarla en",
+            "mostrarlo como",
+            "mostrarla como",
+            "visualiza",
+            "visualizar",
+            "verlo en",
+            "verla en",
+            "endpoint propio",
+            "endpoint same-origin",
+            "same-origin api",
+        ],
+    )
+}
+
+fn looks_like_simple_single_job_service_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let has_simple_job_verb = contains_any(
+        &lower,
+        &[
+            "scrap",
+            "scrape",
+            "extrae",
+            "extraiga",
+            "extraer",
+            "trae",
+            "traer",
+            "poll",
+            "monitor",
+            "sync",
+            "sincron",
+            "genera",
+            "genere",
+            "guardar",
+            "guarda",
+            "deja",
+            "dejar",
+            "consolida",
+            "consolidar",
+        ],
+    );
+    let has_simple_artifact_or_source = contains_any(
+        &lower,
+        &[
+            "csv",
+            "ppt",
+            "pptx",
+            "presentation",
+            "presentacion",
+            "presentación",
+            "json",
+            "news",
+            "noticias",
+            "headline",
+            "titular",
+            "report",
+            "reporte",
+            "api interna",
+            "internal api",
+            "two apis",
+            "dos apis",
+            "feed",
+            "rss",
+            "html",
+        ],
+    );
+    let explicitly_public_surface = contains_any(
+        &lower,
+        &[
+            "dashboard",
+            "frontend",
+            "ui",
+            "webapp",
+            "portal",
+            "landing",
+            "sitio",
+            "site",
+            "panel",
+            "pantalla",
+            "vista visible",
+            "mostrar en una web",
+            "endpoint propio",
+            "endpoint same-origin",
+        ],
+    );
+
+    has_simple_job_verb && has_simple_artifact_or_source && !explicitly_public_surface
+}
+
+fn looks_like_google_workspace_request(text: &str) -> bool {
+    contains_any(
+        &text.to_lowercase(),
+        &[
+            "google sheet",
+            "sheet",
+            "spreadsheet",
+            "drive",
+            "docs.google.com",
+            "google drive",
+        ],
+    )
+}
+
+fn looks_like_structured_followup_answer(text: &str) -> bool {
+    let normalized = normalize_text(text);
+    let has_enumerated_answers = (normalized.contains("1)") && normalized.contains("2)"))
+        || normalized.starts_with("1)")
+        || normalized.starts_with("1.")
+        || normalized.starts_with("1-")
+        || normalized.starts_with("1:");
+    let has_build_signal = contains_any(
+        &normalized.to_lowercase(),
+        &[
+            "listo para usar",
+            "lista para usar",
+            "varias secciones",
+            "mi empresa",
+            "somos competencia",
+            "me inspiran",
+            "html/css",
+            "react",
+            "next",
+        ],
+    );
+
+    has_enumerated_answers && has_build_signal
+}
+
 fn normalize_text(value: &str) -> &str {
     value.trim()
 }
@@ -475,7 +930,7 @@ fn extract_urls(text: &str) -> Vec<String> {
     let mut urls = Vec::new();
 
     for token in text.split_whitespace() {
-        let cleaned = token.trim_end_matches(&[')', ',', '.', ';'][..]);
+        let cleaned = token.trim_end_matches(&[')', ',', '.', ';', '!', '?'][..]);
         if cleaned.starts_with("http://") || cleaned.starts_with("https://") {
             urls.push(cleaned.to_string());
             continue;
@@ -514,7 +969,11 @@ fn extract_attachment_path(text: &str) -> Option<String> {
         .split_whitespace()
         .find(|token| token.contains("attachments/whatsapp/"))
     {
-        return Some(token.trim_end_matches(&[')', ',', '.', ';'][..]).to_string());
+        return Some(
+            token
+                .trim_end_matches(&[')', ',', '.', ';', '!', '?'][..])
+                .to_string(),
+        );
     }
 
     text.split_whitespace()
@@ -524,7 +983,41 @@ fn extract_attachment_path(text: &str) -> Option<String> {
                 .iter()
                 .any(|ext| lower.ends_with(ext))
         })
-        .map(|token| token.trim_end_matches(&[')', ',', '.', ';'][..]).to_string())
+        .map(|token| {
+            let cleaned = token.trim_end_matches(&[')', ',', '.', ';', '!', '?'][..]);
+            if cleaned.contains('/') {
+                cleaned.to_string()
+            } else {
+                format!("attachments/whatsapp/{cleaned}")
+            }
+        })
+}
+
+fn extract_recent_context_snippet(recent_inbound_messages: &[RuntimeContextMessage]) -> String {
+    let texts: Vec<&str> = recent_inbound_messages
+        .iter()
+        .map(|message| message.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect();
+    if texts.is_empty() {
+        return String::new();
+    }
+
+    texts[texts.len().saturating_sub(3)..].join("\n")
+}
+
+fn extract_follow_up_context(effective_user_request: &str) -> Vec<String> {
+    let Some((before_resolution, _)) = effective_user_request.split_once("\nFOLLOW-UP RESOLUTION:\n")
+    else {
+        return Vec::new();
+    };
+
+    before_resolution
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect()
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -533,7 +1026,10 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_runtime_directive, RuntimeDirectiveKind};
+    use super::{
+        build_runtime_directive, build_webhook_runtime_message, RuntimeContextMessage,
+        RuntimeDirectiveKind, RuntimeWebhookContext,
+    };
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -642,5 +1138,58 @@ mod tests {
         assert!(directive
             .content
             .contains("prefer returning an artifactPayload in latest.json"));
+    }
+
+    #[test]
+    fn builds_structured_coding_message_for_webhook_runtime() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("ZEROCLAW_DEDICATED_ROUTING_MODE", "agents_mktp");
+        }
+        let message = build_webhook_runtime_message(
+            "podes hacer una web inspirada en www.super86.app",
+            None,
+        )
+        .expect("structured runtime message");
+        assert!(message.contains("DEDICATED_RUNTIME_REQUEST"));
+        assert!(message.contains("\"request_kind\": \"coding\""));
+        assert!(message.contains("https://www.super86.app"));
+    }
+
+    #[test]
+    fn builds_structured_coding_message_with_follow_up_resolution() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("ZEROCLAW_DEDICATED_ROUTING_MODE", "agents_mktp");
+        }
+        let message = build_webhook_runtime_message(
+            "1) Es la web de mi empresa, somos competencia de ellos y me inspiran. 2) Varias secciones 3) Nova 24 4) listo para usar",
+            Some(&RuntimeWebhookContext {
+                recent_inbound_messages: vec![RuntimeContextMessage {
+                    text: "podes hacer una web inspirada en www.super86.app".to_string(),
+                    ..RuntimeContextMessage::default()
+                }],
+            }),
+        )
+        .expect("structured runtime message");
+        assert!(message.contains("\"request_kind\": \"coding\""));
+        assert!(message.contains("FOLLOW-UP ANSWERS:"));
+        assert!(message.contains("\"follow_up_context\": ["));
+        assert!(message.contains("Nova 24"));
+    }
+
+    #[test]
+    fn builds_structured_service_cancellation_message() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("ZEROCLAW_DEDICATED_ROUTING_MODE", "agents_mktp");
+        }
+        let message = build_webhook_runtime_message(
+            "cancelá el proceso cron que me manda el csv del dolar",
+            None,
+        )
+        .expect("structured runtime message");
+        assert!(message.contains("\"request_kind\": \"service_cancellation\""));
+        assert!(message.contains("cancelá el proceso cron que me manda el csv del dolar"));
     }
 }
