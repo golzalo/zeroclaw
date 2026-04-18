@@ -1099,30 +1099,18 @@ async fn run_gateway_chat_with_tools(
     runtime_context: Option<&crate::channels::runtime_router::RuntimeWebhookContext>,
 ) -> anyhow::Result<crate::agent::loop_::ProcessMessageReport> {
     let config = state.config.lock().clone();
-    let effective_message = crate::channels::runtime_router::build_webhook_runtime_message(
-        message,
-        runtime_context,
-    )
-        .or_else(|| {
-            crate::channels::runtime_router::build_runtime_directive(message)
-                .map(|directive| directive.content)
-        })
-        .unwrap_or_else(|| message.to_string());
+    let _ = runtime_context;
     Box::pin(crate::agent::process_message(
         config,
-        &effective_message,
+        message,
         session_id,
         None,
     ))
     .await
 }
 
-fn dedicated_runtime_forces_agentic_webhook() -> bool {
-    std::env::var("ZEROCLAW_DEDICATED_ROUTING_MODE").ok().as_deref() == Some("agents_mktp")
-}
-
 fn effective_webhook_agentic(webhook_body: &WebhookBody) -> bool {
-    webhook_body.agentic || dedicated_runtime_forces_agentic_webhook()
+    webhook_body.agentic
 }
 
 fn resolve_model_pricing(
