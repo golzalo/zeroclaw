@@ -1398,12 +1398,25 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     format!("{base_prompt}\n\n{refreshed_skills}")
 }
 
+fn load_runtime_skills(workspace_dir: &Path, config: &Config) -> Vec<crate::skills::Skill> {
+    let mut skills = crate::skills::load_skills_with_config(workspace_dir, config);
+    if config.agent.allowed_skills.is_empty() {
+        return skills;
+    }
+
+    let allowed_lower: HashSet<String> = config
+        .agent
+        .allowed_skills
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    skills.retain(|skill| allowed_lower.contains(&skill.name.to_ascii_lowercase()));
+    skills
+}
+
 fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
     let refreshed_skills = crate::skills::skills_to_prompt_with_mode(
-        &crate::skills::load_skills_with_config(
-            ctx.workspace_dir.as_ref(),
-            ctx.prompt_config.as_ref(),
-        ),
+        &load_runtime_skills(ctx.workspace_dir.as_ref(), ctx.prompt_config.as_ref()),
         ctx.workspace_dir.as_ref(),
         ctx.prompt_config.skills.prompt_injection_mode,
     );
@@ -3207,10 +3220,7 @@ async fn process_channel_message(
             .cloned()
             .unwrap_or_default()
     };
-    let skills = crate::skills::load_skills_with_config(
-        ctx.workspace_dir.as_ref(),
-        ctx.prompt_config.as_ref(),
-    );
+    let skills = load_runtime_skills(ctx.workspace_dir.as_ref(), ctx.prompt_config.as_ref());
     let skill_activations = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
     crate::agent::loop_::restore_skill_activations_from_history(
         &prior_turns_raw,
@@ -5417,16 +5427,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let tools_registry = Arc::new(built_tools);
 
-    let mut skills = crate::skills::load_skills_with_config(&workspace, &config);
-    if !config.agent.allowed_skills.is_empty() {
-        let allowed_lower: std::collections::HashSet<String> = config
-            .agent
-            .allowed_skills
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
-        skills.retain(|skill| allowed_lower.contains(&skill.name.to_ascii_lowercase()));
-    }
+    let skills = load_runtime_skills(&workspace, &config);
 
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
@@ -9571,6 +9572,131 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent_messages
             .iter()
             .any(|message| { message.contains("Conversation history cleared. Starting fresh.") }));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_fresh_session_respects_allowed_skills() {
+        let workspace = make_workspace();
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.skills.open_skills_enabled = false;
+        config.agent.allowed_skills = vec!["artifact_fulfillment".to_string()];
+
+        let artifact_skill_dir = workspace.path().join("skills").join("artifact_fulfillment");
+        std::fs::create_dir_all(&artifact_skill_dir).unwrap();
+        std::fs::write(
+            artifact_skill_dir.join("SKILL.md"),
+            "---\nname: artifact_fulfillment\ndescription: Allowed artifact skill\n---\n# Artifact Fulfillment\n",
+        )
+        .unwrap();
+
+        let extra_skill_dir = workspace.path().join("skills").join("refresh-test");
+        std::fs::create_dir_all(&extra_skill_dir).unwrap();
+        std::fs::write(
+            extra_skill_dir.join("SKILL.md"),
+            "---\nname: refresh-test\ndescription: Should stay hidden\n---\n# Refresh Test\n",
+        )
+        .unwrap();
+
+        let initial_skills = load_runtime_skills(workspace.path(), &config);
+        assert_eq!(initial_skills.len(), 1);
+        assert_eq!(initial_skills[0].name, "artifact_fulfillment");
+
+        let initial_system_prompt = build_system_prompt_with_mode(
+            workspace.path(),
+            "test-model",
+            &[],
+            &initial_skills,
+            Some(&config.identity),
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            AutonomyLevel::default(),
+        );
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new(initial_system_prompt),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(config.workspace_dir.clone()),
+            prompt_config: Arc::new(config.clone()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-fresh".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-allowlist".to_string(),
+                content: "hello".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0].0, "system");
+        assert!(
+            calls[0][0].1.contains("<name>artifact_fulfillment</name>"),
+            "fresh-session prompt should include allowed skills"
+        );
+        assert!(
+            !calls[0][0].1.contains("<name>refresh-test</name>"),
+            "fresh-session prompt should hide unallowed skills"
+        );
     }
 
     #[tokio::test]
