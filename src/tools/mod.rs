@@ -46,8 +46,8 @@ pub mod hardware_memory_map;
 #[cfg(feature = "hardware")]
 pub mod hardware_memory_read;
 pub mod http_request;
-pub mod image_info;
 pub mod image_generate;
+pub mod image_info;
 pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;
@@ -119,8 +119,8 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 #[cfg(feature = "hardware")]
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
-pub use image_info::ImageInfoTool;
 pub use image_generate::ImageGenerateTool;
+pub use image_info::ImageInfoTool;
 pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
@@ -282,7 +282,8 @@ pub fn active_tool_specs(
         let is_activated = activation_sets
             .iter()
             .any(|set| set.lock().unwrap().is_activated(name));
-        if excluded.contains(name) || (!is_tool_active_by_default(name, skills_mode) && !is_activated)
+        if excluded.contains(name)
+            || (!is_tool_active_by_default(name, skills_mode) && !is_activated)
         {
             continue;
         }

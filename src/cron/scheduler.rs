@@ -244,10 +244,11 @@ async fn run_agent_job(
         );
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
-    let resolved_prompt = match resolve_agent_job_prompt(config, job.prompt.as_deref().unwrap_or("")).await {
-        Ok(prompt) => prompt,
-        Err(error) => return (false, error),
-    };
+    let resolved_prompt =
+        match resolve_agent_job_prompt(config, job.prompt.as_deref().unwrap_or("")).await {
+            Ok(prompt) => prompt,
+            Err(error) => return (false, error),
+        };
     let prompt = resolved_prompt.prompt.clone();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let selected_model = resolve_cron_model(config, job.model.as_deref());
@@ -306,7 +307,12 @@ async fn run_agent_job(
                 return (false, reason);
             }
             Ok(check) => check.quote_id,
-            Err(error) => return (false, format!("agent job failed: remote budget check failed: {error}")),
+            Err(error) => {
+                return (
+                    false,
+                    format!("agent job failed: remote budget check failed: {error}"),
+                )
+            }
         }
     } else {
         None
@@ -337,7 +343,8 @@ async fn run_agent_job(
                     .iter()
                     .map(|request| request.duration_ms)
                     .sum();
-                let event_id = format!("zeroclaw:cron:{}:{}", job.id, Utc::now().timestamp_millis());
+                let event_id =
+                    format!("zeroclaw:cron:{}:{}", job.id, Utc::now().timestamp_millis());
                 let consume_metadata = json!({
                     "source": "cron",
                     "jobId": job.id,
@@ -502,19 +509,35 @@ fn extract_cron_prompt_file_reference(prompt: &str) -> Option<&str> {
     let trimmed = prompt.trim();
     if let Some(raw_path) = trimmed.strip_prefix("@file:") {
         let candidate = raw_path.trim();
-        return if candidate.is_empty() { None } else { Some(candidate) };
+        return if candidate.is_empty() {
+            None
+        } else {
+            Some(candidate)
+        };
     }
     if let Some(raw_path) = trimmed.strip_prefix("@file") {
         let candidate = raw_path.trim();
-        return if candidate.is_empty() { None } else { Some(candidate) };
+        return if candidate.is_empty() {
+            None
+        } else {
+            Some(candidate)
+        };
     }
     if let Some(raw_path) = trimmed.strip_prefix("@tenant-service-execution") {
         let candidate = raw_path.trim();
-        return if candidate.is_empty() { None } else { Some(candidate) };
+        return if candidate.is_empty() {
+            None
+        } else {
+            Some(candidate)
+        };
     }
     if let Some(raw_path) = trimmed.strip_prefix("@tenant-service-announce") {
         let candidate = raw_path.trim();
-        return if candidate.is_empty() { None } else { Some(candidate) };
+        return if candidate.is_empty() {
+            None
+        } else {
+            Some(candidate)
+        };
     }
 
     for line in trimmed.lines() {
@@ -680,10 +703,7 @@ fn output_reports_cron_success_from_json(value: &Value) -> bool {
     {
         return true;
     }
-    value
-        .get("ok")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    value.get("ok").and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn extract_delivery_marker(output: &str) -> Option<String> {
@@ -713,9 +733,7 @@ fn resolve_cron_prompt_path(config: &Config, candidate: &str) -> PathBuf {
 }
 
 fn resolve_cron_model(config: &Config, raw_model: Option<&str>) -> Option<String> {
-    let requested = raw_model
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let requested = raw_model.map(str::trim).filter(|value| !value.is_empty())?;
     let default_provider = config.default_provider.as_deref().unwrap_or("openai");
 
     if default_provider.eq_ignore_ascii_case("openai") && requested.contains('/') {
@@ -922,7 +940,9 @@ pub(crate) async fn deliver_announcement(
                 tg.allowed_users.clone(),
                 tg.mention_only,
             );
-            channel.send(&SendMessage::new(&delivered_output, target)).await?;
+            channel
+                .send(&SendMessage::new(&delivered_output, target))
+                .await?;
         }
         "discord" => {
             let dc = config
@@ -937,7 +957,9 @@ pub(crate) async fn deliver_announcement(
                 dc.listen_to_bots,
                 dc.mention_only,
             );
-            channel.send(&SendMessage::new(&delivered_output, target)).await?;
+            channel
+                .send(&SendMessage::new(&delivered_output, target))
+                .await?;
         }
         "slack" => {
             let sl = config
@@ -953,7 +975,9 @@ pub(crate) async fn deliver_announcement(
                 sl.allowed_users.clone(),
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            channel.send(&SendMessage::new(&delivered_output, target)).await?;
+            channel
+                .send(&SendMessage::new(&delivered_output, target))
+                .await?;
         }
         "mattermost" => {
             let mm = config
@@ -969,7 +993,9 @@ pub(crate) async fn deliver_announcement(
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
             );
-            channel.send(&SendMessage::new(&delivered_output, target)).await?;
+            channel
+                .send(&SendMessage::new(&delivered_output, target))
+                .await?;
         }
         "signal" => {
             let sg = config
@@ -985,7 +1011,9 @@ pub(crate) async fn deliver_announcement(
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );
-            channel.send(&SendMessage::new(&delivered_output, target)).await?;
+            channel
+                .send(&SendMessage::new(&delivered_output, target))
+                .await?;
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -1005,7 +1033,9 @@ pub(crate) async fn deliver_announcement(
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 );
-                channel.send(&SendMessage::new(&delivered_output, target)).await?;
+                channel
+                    .send(&SendMessage::new(&delivered_output, target))
+                    .await?;
             }
             #[cfg(not(feature = "channel-matrix"))]
             {
@@ -1220,9 +1250,10 @@ mod tests {
             .await
             .unwrap();
 
-        let resolved = resolve_agent_job_prompt(&config, &format!("@file:{}", prompt_path.display()))
-            .await
-            .unwrap();
+        let resolved =
+            resolve_agent_job_prompt(&config, &format!("@file:{}", prompt_path.display()))
+                .await
+                .unwrap();
         assert!(resolved.prompt.contains("Use only http_request."));
         assert!(!resolved.prompt.contains("@file:"));
     }
@@ -1236,9 +1267,10 @@ mod tests {
             .await
             .unwrap();
 
-        let resolved = resolve_agent_job_prompt(&config, &format!("@file {}", prompt_path.display()))
-            .await
-            .unwrap();
+        let resolved =
+            resolve_agent_job_prompt(&config, &format!("@file {}", prompt_path.display()))
+                .await
+                .unwrap();
         assert!(resolved.prompt.contains("Use only http_request."));
     }
 
@@ -1247,9 +1279,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
 
-        let error = resolve_agent_job_prompt(&config, "@file:/tmp/definitely-missing-cron-prompt.txt")
-            .await
-            .unwrap_err();
+        let error =
+            resolve_agent_job_prompt(&config, "@file:/tmp/definitely-missing-cron-prompt.txt")
+                .await
+                .unwrap_err();
         assert!(error.contains("cron prompt file could not be read"));
     }
 

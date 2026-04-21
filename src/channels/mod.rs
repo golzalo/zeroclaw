@@ -374,6 +374,13 @@ struct ChannelRuntimeContext {
     /// approval since no operator is present on channel runs.
     approval_manager: Arc<ApprovalManager>,
     activated_tools: Option<std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Seconds of inactivity before a session is auto-archived and cleared.
+    /// `0` = disabled.
+    chat_purge_idle_time_secs: u64,
+    /// Tracks the last message time per sender key for idle-purge enforcement.
+    last_activity: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Workspace-relative path to the consolidation system prompt file.
+    consolidation_prompt_file: Option<String>,
 }
 
 #[derive(Clone)]
@@ -555,10 +562,15 @@ fn resolve_channel_model_pricing(
         })
 }
 
-fn estimate_channel_request_tokens(history: &[ChatMessage], max_tool_iterations: usize) -> (u64, u64) {
-    let estimated_input_tokens =
-        history.iter().map(|message| message.content.chars().count()).sum::<usize>().div_ceil(4)
-            as u64;
+fn estimate_channel_request_tokens(
+    history: &[ChatMessage],
+    max_tool_iterations: usize,
+) -> (u64, u64) {
+    let estimated_input_tokens = history
+        .iter()
+        .map(|message| message.content.chars().count())
+        .sum::<usize>()
+        .div_ceil(4) as u64;
     let estimated_output_tokens = (400 + (max_tool_iterations as u64 * 250)).max(400);
     (estimated_input_tokens, estimated_output_tokens)
 }
@@ -601,7 +613,9 @@ fn summarize_channel_usage(
     }
 }
 
-fn resolve_channel_remote_budget_context(msg: &traits::ChannelMessage) -> Option<ChannelRemoteBudgetContext> {
+fn resolve_channel_remote_budget_context(
+    msg: &traits::ChannelMessage,
+) -> Option<ChannelRemoteBudgetContext> {
     let actor_id = std::env::var("OWNER_ACTOR_ID")
         .ok()
         .map(|value| value.trim().to_string())
@@ -705,7 +719,8 @@ async fn remote_budget_consume_for_channel(
         .timeout(Duration::from_millis(remote_budget.timeout_ms.max(1)))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let url = build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.consume_path);
+    let url =
+        build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.consume_path);
     let mut request = client.post(url).json(&serde_json::json!({
         "eventId": format!("zeroclaw:channel:{}:{}:{}", remote_ctx.actor_id, msg.channel, msg.id),
         "actorId": remote_ctx.actor_id,
@@ -1023,7 +1038,9 @@ fn strip_tool_result_content(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix")
+    // Gonza note: enabling for all channels
+    //matches!(channel_name, "telegram" | "discord" | "matrix")
+    return true;
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -1045,6 +1062,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
+        /*
+        // Gonza note: removing the funcitonality that allows the client to switch models or providers at runtime.
         "/models" => {
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
@@ -1062,6 +1081,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        */
         "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
     }
@@ -1826,6 +1846,46 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::NewSession => {
+            // Snapshot history before clearing so we can consolidate it.
+            let history_snapshot: Vec<ChatMessage> = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&sender_key)
+                .cloned()
+                .unwrap_or_default();
+
+            if !history_snapshot.is_empty() {
+                match crate::memory::chat_dump::write_chat_dump(
+                    ctx.workspace_dir.as_ref(),
+                    &sender_key,
+                    &history_snapshot,
+                ) {
+                    Ok(dump_path) => {
+                        let provider = ctx.provider.clone();
+                        let model = ctx.model.to_string();
+                        let memory = ctx.memory.clone();
+                        let workspace_dir = ctx.workspace_dir.clone();
+                        let prompt_file = ctx.consolidation_prompt_file.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::memory::consolidation::consolidate_dump_file(
+                                &dump_path,
+                                provider.as_ref(),
+                                &model,
+                                memory.as_ref(),
+                                &workspace_dir,
+                                prompt_file.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::debug!("Session-reset consolidation failed: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::debug!("Failed to write chat dump on /new: {e}"),
+                }
+            }
+
             clear_sender_history(ctx, &sender_key);
             if let Some(ref store) = ctx.session_store {
                 if let Err(e) = store.delete_session(&sender_key) {
@@ -2069,7 +2129,11 @@ fn normalize_image_markers(message: &str, workspace_dir: &Path) -> (String, bool
         cleaned.push_str(&message[cursor..]);
     }
 
-    (cleaned.trim().to_string(), saw_image_marker, has_unresolved_marker)
+    (
+        cleaned.trim().to_string(),
+        saw_image_marker,
+        has_unresolved_marker,
+    )
 }
 
 fn is_likely_delivery_followup(text: &str) -> bool {
@@ -2095,16 +2159,7 @@ fn is_likely_delivery_followup(text: &str) -> bool {
     .any(|token| normalized.contains(token));
 
     let has_generation_word = [
-        "imagen",
-        "image",
-        "foto",
-        "photo",
-        "genera",
-        "generá",
-        "crea",
-        "creá",
-        "draw",
-        "illustr",
+        "imagen", "image", "foto", "photo", "genera", "generá", "crea", "creá", "draw", "illustr",
     ]
     .iter()
     .any(|token| normalized.contains(token));
@@ -2115,16 +2170,7 @@ fn is_likely_delivery_followup(text: &str) -> bool {
 fn is_likely_image_request(text: &str) -> bool {
     let normalized = text.trim().to_ascii_lowercase();
     [
-        "imagen",
-        "image",
-        "foto",
-        "photo",
-        "genera",
-        "generá",
-        "crea",
-        "creá",
-        "draw",
-        "illustr",
+        "imagen", "image", "foto", "photo", "genera", "generá", "crea", "creá", "draw", "illustr",
     ]
     .iter()
     .any(|token| normalized.contains(token))
@@ -2231,7 +2277,9 @@ async fn load_persistent_image_usage_sidecar(
 }
 
 async fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) -> Option<String> {
-    let script_path = workspace_dir.join("tools").join("persistent_image_generate.py");
+    let script_path = workspace_dir
+        .join("tools")
+        .join("persistent_image_generate.py");
     if !script_path.is_file() {
         tracing::warn!(
             script = %script_path.display(),
@@ -2281,7 +2329,9 @@ async fn generate_persistent_image_marker(workspace_dir: &Path, prompt: &str) ->
                             Some((remote_budget, provider, model, estimated_cost_usd, metadata));
                     }
                     Ok(_) => {
-                        tracing::info!("persistent image generator skipped because budget is exhausted");
+                        tracing::info!(
+                            "persistent image generator skipped because budget is exhausted"
+                        );
                         return None;
                     }
                     Err(error) => {
@@ -2436,8 +2486,8 @@ fn delivery_marker_kind_for_path(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some("IMAGE"),
-        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx"
-        | "xls" | "xlsx" | "ppt" | "pptx" => Some("DOCUMENT"),
+        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
+        | "xlsx" | "ppt" | "pptx" => Some("DOCUMENT"),
         "mp4" | "mov" | "mkv" | "avi" | "webm" => Some("VIDEO"),
         "mp3" | "m4a" | "wav" | "flac" => Some("AUDIO"),
         "ogg" | "oga" | "opus" => Some("VOICE"),
@@ -2477,15 +2527,24 @@ fn canonical_delivery_marker_kind(kind: &str) -> Option<&'static str> {
         return Some("DOCUMENT");
     }
 
-    if ["VIDEO"].iter().any(|marker| kind.eq_ignore_ascii_case(marker)) {
+    if ["VIDEO"]
+        .iter()
+        .any(|marker| kind.eq_ignore_ascii_case(marker))
+    {
         return Some("VIDEO");
     }
 
-    if ["AUDIO"].iter().any(|marker| kind.eq_ignore_ascii_case(marker)) {
+    if ["AUDIO"]
+        .iter()
+        .any(|marker| kind.eq_ignore_ascii_case(marker))
+    {
         return Some("AUDIO");
     }
 
-    if ["VOICE"].iter().any(|marker| kind.eq_ignore_ascii_case(marker)) {
+    if ["VOICE"]
+        .iter()
+        .any(|marker| kind.eq_ignore_ascii_case(marker))
+    {
         return Some("VOICE");
     }
 
@@ -2535,7 +2594,11 @@ fn resolve_delivery_artifact_path(candidate: &str, workspace_dir: &Path) -> Opti
         }
     };
 
-    if path.is_file() { Some(path) } else { None }
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn promote_delivery_path_line(line: &str, workspace_dir: &Path) -> Option<String> {
@@ -2990,6 +3053,71 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
+
+    // ── Idle-purge: archive and clear sessions that have been silent too long ──
+    if ctx.chat_purge_idle_time_secs > 0 {
+        let should_purge = ctx
+            .last_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&history_key)
+            .is_some_and(|last| last.elapsed().as_secs() >= ctx.chat_purge_idle_time_secs);
+
+        if should_purge {
+            let history_snapshot: Vec<ChatMessage> = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&history_key)
+                .cloned()
+                .unwrap_or_default();
+
+            if !history_snapshot.is_empty() {
+                match crate::memory::chat_dump::write_chat_dump(
+                    ctx.workspace_dir.as_ref(),
+                    &history_key,
+                    &history_snapshot,
+                ) {
+                    Ok(dump_path) => {
+                        let provider = ctx.provider.clone();
+                        let model = ctx.model.to_string();
+                        let memory = ctx.memory.clone();
+                        let workspace_dir = ctx.workspace_dir.clone();
+                        let prompt_file = ctx.consolidation_prompt_file.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::memory::consolidation::consolidate_dump_file(
+                                &dump_path,
+                                provider.as_ref(),
+                                &model,
+                                memory.as_ref(),
+                                &workspace_dir,
+                                prompt_file.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::debug!("Idle-purge consolidation failed: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::debug!("Failed to write chat dump on idle purge: {e}"),
+                }
+            }
+
+            clear_sender_history(ctx.as_ref(), &history_key);
+            mark_sender_for_new_session(ctx.as_ref(), &history_key);
+            tracing::info!(
+                key = %history_key,
+                idle_secs = ctx.chat_purge_idle_time_secs,
+                "Session idle-purged"
+            );
+        }
+
+        ctx.last_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(history_key.clone(), Instant::now());
+    }
+
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
     // ── Query classification: override route when a rule matches ──
@@ -3196,7 +3324,8 @@ async fn process_channel_message(
             .await
             {
                 Ok(Some(check)) if !check.allowed => {
-                    let error_text = "⚠️ LLM budget exceeded for this account. Please add credits to continue.";
+                    let error_text =
+                        "⚠️ LLM budget exceeded for this account. Please add credits to continue.";
                     runtime_trace::record_event(
                         "channel_message_budget_blocked",
                         Some(msg.channel.as_str()),
@@ -3625,28 +3754,6 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
-
-            // Fire-and-forget LLM-driven memory consolidation.
-            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                let provider = Arc::clone(&ctx.provider);
-                let model = ctx.model.to_string();
-                let memory = Arc::clone(&ctx.memory);
-                let user_msg = msg.content.clone();
-                let assistant_resp = delivered_response.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::memory::consolidation::consolidate_turn(
-                        provider.as_ref(),
-                        &model,
-                        memory.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
-                    {
-                        tracing::debug!("Memory consolidation skipped: {e}");
-                    }
-                });
-            }
 
             println!(
                 "  🤖 Reply ({}ms): {}",
@@ -4263,23 +4370,13 @@ pub fn build_system_prompt_with_mode_and_autonomy(
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
             load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-            append_extra_context_files(
-                &mut prompt,
-                workspace_dir,
-                extra_context_files,
-                max_chars,
-            );
+            append_extra_context_files(&mut prompt, workspace_dir, extra_context_files, max_chars);
         }
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
         load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-        append_extra_context_files(
-            &mut prompt,
-            workspace_dir,
-            extra_context_files,
-            max_chars,
-        );
+        append_extra_context_files(&mut prompt, workspace_dir, extra_context_files, max_chars);
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -5567,6 +5664,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
+        chat_purge_idle_time_secs: config.agent.chat_purge_idle_time_secs,
+        last_activity: Arc::new(Mutex::new(HashMap::new())),
+        consolidation_prompt_file: config.memory.consolidation.prompt_file.clone(),
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -5587,6 +5687,32 @@ pub async fn start_channels(config: Config) -> Result<()> {
         if hydrated > 0 {
             tracing::info!("📂 Restored {hydrated} session(s) from disk");
         }
+    }
+
+    // ── Consolidation recovery sweep ──────────────────────────────────────────
+    // If configured, spawn a background task that periodically retries stale
+    // dump files left by a crashed worker.
+    let recovery_interval = config.memory.consolidation.recovery_interval_secs;
+    if recovery_interval > 0 {
+        let sweep_provider = Arc::clone(&provider);
+        let sweep_model = model.clone();
+        let sweep_memory = Arc::clone(&mem);
+        let sweep_workspace = config.workspace_dir.clone();
+        let sweep_prompt_file = config.memory.consolidation.prompt_file.clone();
+        tokio::spawn(async move {
+            let interval = tokio::time::Duration::from_secs(recovery_interval);
+            loop {
+                tokio::time::sleep(interval).await;
+                crate::memory::consolidation::run_recovery_sweep(
+                    &sweep_workspace,
+                    sweep_provider.as_ref(),
+                    &sweep_model,
+                    sweep_memory.as_ref(),
+                    sweep_prompt_file.as_deref(),
+                )
+                .await;
+            }
+        });
     }
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -5871,6 +5997,9 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -5985,6 +6114,9 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6055,6 +6187,9 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6144,6 +6279,9 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -6712,6 +6850,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -6764,7 +6905,9 @@ BTC is currently around $65,000 based on latest tool output."#
             }),
         );
         let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve budget server");
+            axum::serve(listener, app)
+                .await
+                .expect("serve budget server");
         });
 
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -6827,6 +6970,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -6909,6 +7055,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7002,6 +7151,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7080,6 +7232,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7168,6 +7323,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7277,6 +7435,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7367,6 +7528,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7472,6 +7636,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7562,6 +7729,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7642,6 +7812,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -7833,6 +8006,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -7933,6 +8109,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8048,6 +8227,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8160,6 +8342,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8254,6 +8439,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -8332,6 +8520,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -9132,6 +9323,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -9261,6 +9455,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -9555,6 +9752,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -9659,6 +9859,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -10228,6 +10431,9 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -10313,6 +10519,9 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -10473,6 +10682,9 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -10582,6 +10794,9 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -10683,6 +10898,9 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -10804,6 +11022,9 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(
@@ -11058,6 +11279,9 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -11108,7 +11332,10 @@ This is an example JSON object for profile settings."#;
         let (provider, model, billing) = persistent_image_billing();
         assert_eq!(provider, "openai");
         assert_eq!(model, "gpt-image-1");
-        assert_eq!(billing.get("type").and_then(|value| value.as_str()), Some("per_image"));
+        assert_eq!(
+            billing.get("type").and_then(|value| value.as_str()),
+            Some("per_image")
+        );
         assert_eq!(
             billing.get("size").and_then(|value| value.as_str()),
             Some("1024x1024")

@@ -129,7 +129,10 @@ impl RemoteBudgetClient {
             request = request.bearer_auth(&self.api_token);
         }
 
-        let response = request.send().await.context("remote text budget check failed")?;
+        let response = request
+            .send()
+            .await
+            .context("remote text budget check failed")?;
         let status = response.status();
         if !status.is_success() && status != reqwest::StatusCode::PAYMENT_REQUIRED {
             anyhow::bail!("remote text budget check failed with status {status}");
@@ -200,7 +203,10 @@ impl RemoteBudgetClient {
             request = request.bearer_auth(&self.api_token);
         }
 
-        let response = request.send().await.context("remote explicit-cost budget check failed")?;
+        let response = request
+            .send()
+            .await
+            .context("remote explicit-cost budget check failed")?;
         let status = response.status();
         if !status.is_success() && status != reqwest::StatusCode::PAYMENT_REQUIRED {
             anyhow::bail!("remote explicit-cost budget check failed with status {status}");
@@ -291,7 +297,10 @@ impl RemoteBudgetClient {
             request = request.bearer_auth(&self.api_token);
         }
 
-        let response = request.send().await.context("remote pricing estimate failed")?;
+        let response = request
+            .send()
+            .await
+            .context("remote pricing estimate failed")?;
         let status = response.status();
         if !status.is_success() {
             anyhow::bail!("remote pricing estimate failed with status {status}");
@@ -350,7 +359,10 @@ impl RemoteBudgetClient {
             request = request.bearer_auth(&self.api_token);
         }
 
-        let response = request.send().await.context("remote budget consume failed")?;
+        let response = request
+            .send()
+            .await
+            .context("remote budget consume failed")?;
         let status = response.status();
         if !status.is_success() {
             anyhow::bail!("remote budget consume failed with status {status}");

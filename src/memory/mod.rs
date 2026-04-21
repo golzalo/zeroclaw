@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod chat_dump;
 pub mod chunker;
 pub mod cli;
 pub mod consolidation;

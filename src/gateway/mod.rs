@@ -1078,7 +1078,10 @@ async fn run_gateway_chat_simple(
                 iteration: 1,
                 duration_ms: 0,
                 input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),
-                output_tokens: response.usage.as_ref().and_then(|usage| usage.output_tokens),
+                output_tokens: response
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens),
                 cached_input_tokens: response
                     .usage
                     .as_ref()
@@ -1396,7 +1399,8 @@ async fn remote_budget_consume(
         .timeout(Duration::from_millis(remote_budget.timeout_ms.max(1)))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let url = build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.consume_path);
+    let url =
+        build_remote_budget_endpoint(&remote_budget.api_base_url, &remote_budget.consume_path);
     let effective_agentic = effective_webhook_agentic(webhook_body);
     let mut request = client.post(url).json(&serde_json::json!({
         "eventId": format!("zeroclaw:{}:{}:{}", actor_id, webhook_body.scope_id.clone().unwrap_or_else(|| "scope".to_string()), Uuid::new_v4()),
@@ -1571,22 +1575,22 @@ async fn handle_webhook(
 
     let remote_budget_check_result =
         match remote_budget_check(&state, &webhook_body, &provider_label, &model_label).await {
-        Ok(Some(check)) if !check.allowed => {
-            let body = serde_json::json!({
-                "error": "LLM budget exceeded",
-                "budget": check,
-            });
-            return (StatusCode::PAYMENT_REQUIRED, Json(body));
-        }
-        Ok(result) => result,
-        Err(error) => {
-            tracing::warn!("Remote budget precheck failed: {error}");
-            let body = serde_json::json!({
-                "error": "Remote budget check failed",
-            });
-            return (StatusCode::BAD_GATEWAY, Json(body));
-        }
-    };
+            Ok(Some(check)) if !check.allowed => {
+                let body = serde_json::json!({
+                    "error": "LLM budget exceeded",
+                    "budget": check,
+                });
+                return (StatusCode::PAYMENT_REQUIRED, Json(body));
+            }
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!("Remote budget precheck failed: {error}");
+                let body = serde_json::json!({
+                    "error": "Remote budget check failed",
+                });
+                return (StatusCode::BAD_GATEWAY, Json(body));
+            }
+        };
 
     let started_at = Instant::now();
 

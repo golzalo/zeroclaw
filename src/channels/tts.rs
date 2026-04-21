@@ -568,7 +568,10 @@ impl TtsManager {
     }
 }
 
-pub fn estimate_tts_billing(config: &TtsConfig, text: &str) -> Option<(String, String, serde_json::Value)> {
+pub fn estimate_tts_billing(
+    config: &TtsConfig,
+    text: &str,
+) -> Option<(String, String, serde_json::Value)> {
     let characters = text.chars().count();
     if characters == 0 {
         return None;

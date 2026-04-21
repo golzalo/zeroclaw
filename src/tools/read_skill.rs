@@ -27,7 +27,11 @@ impl ReadSkillTool {
             workspace_dir,
             open_skills_enabled,
             open_skills_dir,
-            allowed_skills: if allowed.is_empty() { None } else { Some(allowed) },
+            allowed_skills: if allowed.is_empty() {
+                None
+            } else {
+                Some(allowed)
+            },
         }
     }
 }

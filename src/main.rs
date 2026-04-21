@@ -101,8 +101,8 @@ mod peripherals;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
-mod runtime;
 mod remote_budget;
+mod runtime;
 mod security;
 mod service;
 mod skillforge;

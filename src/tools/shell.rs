@@ -138,7 +138,10 @@ fn append_usage_output_arg(command: &str, usage_output_rel: &str) -> String {
     if parse_shell_flag_value(command, "--usage-output").is_some() {
         command.to_string()
     } else {
-        format!("{command} --usage-output {}", shell_single_quote(usage_output_rel))
+        format!(
+            "{command} --usage-output {}",
+            shell_single_quote(usage_output_rel)
+        )
     }
 }
 
@@ -232,7 +235,10 @@ impl Tool for ShellTool {
             });
         }
 
-        match self.security.validate_command_execution(raw_command, approved) {
+        match self
+            .security
+            .validate_command_execution(raw_command, approved)
+        {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -407,7 +413,8 @@ impl Tool for ShellTool {
                     if let Some(charge) = pending_image_charge {
                         if let Some(marker) = extract_image_marker(&stdout) {
                             let usage_sidecar =
-                                load_persistent_image_usage_sidecar(&charge.usage_output_path).await;
+                                load_persistent_image_usage_sidecar(&charge.usage_output_path)
+                                    .await;
                             let result = if let Some(usage) =
                                 usage_sidecar.clone().and_then(|entry| entry.usage)
                             {
