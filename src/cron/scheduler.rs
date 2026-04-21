@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
 use serde_json::json;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::fs;
@@ -475,6 +475,9 @@ fn parse_tenant_service_cron_metadata(config: &Config, prompt: &str) -> TenantSe
         }
     }
     if let Some(prompt_file) = metadata.prompt_file.as_ref() {
+        if metadata.kind.is_none() {
+            metadata.kind = infer_tenant_service_prompt_kind(prompt_file);
+        }
         if let Some(job_name) = prompt_file.parent().and_then(|path| path.file_name()) {
             let slug = job_name.to_string_lossy();
             if metadata.run_command.is_none() {
@@ -492,6 +495,14 @@ fn parse_tenant_service_cron_metadata(config: &Config, prompt: &str) -> TenantSe
         }
     }
     metadata
+}
+
+fn infer_tenant_service_prompt_kind(prompt_file: &Path) -> Option<TenantServiceCronKind> {
+    match prompt_file.file_name().and_then(|value| value.to_str()) {
+        Some("execution_prompt.txt") => Some(TenantServiceCronKind::Execution),
+        Some("announce_prompt.txt") => Some(TenantServiceCronKind::Announce),
+        _ => None,
+    }
 }
 
 fn extract_cron_prompt_file_reference(prompt: &str) -> Option<&str> {
@@ -555,7 +566,8 @@ async fn normalize_tenant_service_cron_output(
 ) -> std::result::Result<String, String> {
     let trimmed = output.trim();
 
-    if metadata.kind == Some(TenantServiceCronKind::Announce) || metadata.delivery_command.is_some()
+    if metadata.kind == Some(TenantServiceCronKind::Announce)
+        || (metadata.kind.is_none() && metadata.delivery_command.is_some())
     {
         if let Some(marker) = extract_delivery_marker(trimmed) {
             return Ok(marker);
@@ -1339,6 +1351,66 @@ mod tests {
             resolved.tenant_service.delivery_command.as_deref(),
             Some("node tools/tenant_job_delivery.mjs --job sample --skip-run")
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_job_prompt_infers_execution_kind_from_file_prompt_reference() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let prompt_path = config
+            .workspace_dir
+            .join("tenant-app/server/jobs/sample/execution_prompt.txt");
+        tokio::fs::create_dir_all(prompt_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&prompt_path, "Use only http_request.\nReply with OK.\n")
+            .await
+            .unwrap();
+
+        let resolved = resolve_agent_job_prompt(
+            &config,
+            &format!("@file {}", prompt_path.display()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resolved.tenant_service.kind,
+            Some(TenantServiceCronKind::Execution)
+        );
+        assert_eq!(
+            resolved.tenant_service.run_command.as_deref(),
+            Some("node tools/tenant_job_runner.mjs invoke --job sample")
+        );
+        assert_eq!(
+            resolved.tenant_service.delivery_command.as_deref(),
+            Some("node tools/tenant_job_delivery.mjs --job sample --skip-run")
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_cron_output_does_not_materialize_delivery_helper() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let metadata = TenantServiceCronMetadata {
+            kind: Some(TenantServiceCronKind::Execution),
+            prompt_file: None,
+            run_command: Some("node tools/tenant_job_runner.mjs invoke --job sample".to_string()),
+            delivery_command: Some(
+                "node tools/tenant_job_delivery.mjs --job sample --skip-run".to_string(),
+            ),
+        };
+
+        let normalized = normalize_tenant_service_cron_output(
+            &config,
+            &metadata,
+            "OK",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(normalized, "OK");
     }
 
     #[test]

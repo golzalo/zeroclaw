@@ -82,6 +82,10 @@ pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
+pub mod whatsapp_list_groups;
+pub mod whatsapp_list_observed_groups;
+pub mod whatsapp_observe_group;
+pub mod whatsapp_unobserve_group;
 pub mod workspace_tool;
 
 pub use backup_tool::BackupTool;
@@ -151,6 +155,10 @@ pub use traits::Tool;
 pub use traits::{ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
+pub use whatsapp_list_groups::WhatsAppListGroupsTool;
+pub use whatsapp_list_observed_groups::WhatsAppListObservedGroupsTool;
+pub use whatsapp_observe_group::WhatsAppObserveGroupTool;
+pub use whatsapp_unobserve_group::WhatsAppUnobserveGroupTool;
 pub use workspace_tool::WorkspaceTool;
 
 use crate::config::{Config, DelegateAgentConfig, SkillsPromptInjectionMode};
@@ -411,6 +419,18 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
         Arc::new(CalculatorTool::new()),
+        Arc::new(WhatsAppListGroupsTool::new(workspace_dir.to_path_buf())),
+        Arc::new(WhatsAppListObservedGroupsTool::new(
+            workspace_dir.to_path_buf(),
+        )),
+        Arc::new(WhatsAppObserveGroupTool::new(
+            workspace_dir.to_path_buf(),
+            security.clone(),
+        )),
+        Arc::new(WhatsAppUnobserveGroupTool::new(
+            workspace_dir.to_path_buf(),
+            security.clone(),
+        )),
     ];
 
     if matches!(

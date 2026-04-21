@@ -50,6 +50,7 @@ pub mod wati;
 pub mod webhook;
 pub mod wecom;
 pub mod whatsapp;
+pub mod whatsapp_observation;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
@@ -3295,19 +3296,8 @@ async fn process_channel_message(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
+    let system_prompt =
         build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
-    let runtime_directive = runtime_router::build_runtime_directive(&msg.content);
-    if let Some(directive) = runtime_directive.as_ref() {
-        tracing::info!(
-            channel = %msg.channel,
-            sender = %msg.sender,
-            directive_kind = ?directive.kind,
-            "Applied dedicated runtime routing directive"
-        );
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&directive.content);
-    }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let remote_budget_context = resolve_channel_remote_budget_context(&msg);

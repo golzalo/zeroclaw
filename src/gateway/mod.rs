@@ -1099,29 +1099,21 @@ async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
+    runtime_context: Option<&crate::channels::runtime_router::RuntimeWebhookContext>,
 ) -> anyhow::Result<crate::agent::loop_::ProcessMessageReport> {
     let config = state.config.lock().clone();
-    let effective_message = crate::channels::runtime_router::build_runtime_directive(message)
-        .map(|directive| directive.content)
-        .unwrap_or_else(|| message.to_string());
+    let _ = runtime_context;
     Box::pin(crate::agent::process_message(
         config,
-        &effective_message,
+        message,
         session_id,
         None,
     ))
     .await
 }
 
-fn dedicated_runtime_forces_agentic_webhook() -> bool {
-    std::env::var("ZEROCLAW_DEDICATED_ROUTING_MODE")
-        .ok()
-        .as_deref()
-        == Some("agents_mktp")
-}
-
 fn effective_webhook_agentic(webhook_body: &WebhookBody) -> bool {
-    webhook_body.agentic || dedicated_runtime_forces_agentic_webhook()
+    webhook_body.agentic
 }
 
 fn resolve_model_pricing(
@@ -1471,6 +1463,8 @@ pub struct WebhookBody {
     pub subscription: Option<serde_json::Value>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub runtime_context: Option<crate::channels::runtime_router::RuntimeWebhookContext>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -1616,7 +1610,13 @@ async fn handle_webhook(
 
     let effective_agentic = effective_webhook_agentic(&webhook_body);
     let response_result = if effective_agentic {
-        run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await
+        run_gateway_chat_with_tools(
+            &state,
+            message,
+            session_id.as_deref(),
+            webhook_body.runtime_context.as_ref(),
+        )
+        .await
     } else {
         run_gateway_chat_simple(&state, message).await
     };
@@ -1869,6 +1869,7 @@ async fn handle_whatsapp_message(
             &state,
             &msg.content,
             Some(&session_id),
+            None,
         ))
         .await
         {
@@ -1989,6 +1990,7 @@ async fn handle_linq_webhook(
             &state,
             &msg.content,
             Some(&session_id),
+            None,
         ))
         .await
         {
@@ -2093,6 +2095,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
             &state,
             &msg.content,
             Some(&session_id),
+            None,
         ))
         .await
         {
@@ -2209,6 +2212,7 @@ async fn handle_nextcloud_talk_webhook(
             &state,
             &msg.content,
             Some(&session_id),
+            None,
         ))
         .await
         {
@@ -2377,6 +2381,29 @@ mod tests {
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn webhook_body_accepts_runtime_context() {
+        let valid = r#"{
+            "message": "hola",
+            "runtime_context": {
+                "recent_inbound_messages": [
+                    {
+                        "text": "quiero una web inspirada en www.super86.app",
+                        "from": "chat-1",
+                        "sender": "user-1"
+                    }
+                ]
+            }
+        }"#;
+        let parsed: WebhookBody = serde_json::from_str(valid).expect("valid webhook body");
+        let runtime_context = parsed.runtime_context.expect("runtime context");
+        assert_eq!(runtime_context.recent_inbound_messages.len(), 1);
+        assert_eq!(
+            runtime_context.recent_inbound_messages[0].text,
+            "quiero una web inspirada en www.super86.app"
+        );
     }
 
     #[test]

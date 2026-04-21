@@ -466,33 +466,26 @@ fn latest_user_message(history: &[ChatMessage]) -> Option<&str> {
         .map(|message| message.content.as_str())
 }
 
+fn message_has_tool_first_directive_block(message: &str) -> bool {
+    message.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("DEDICATED_RUNTIME_REQUEST")
+            || trimmed.starts_with("IMPLEMENTATION DIRECTIVE:")
+            || trimmed.starts_with("SERVICE IMPLEMENTATION DIRECTIVE:")
+            || trimmed.starts_with("PROCESS IMPLEMENTATION DIRECTIVE:")
+    })
+}
+
 fn latest_user_message_requests_tool_first_execution(history: &[ChatMessage]) -> bool {
     let Some(last_user) = latest_user_message(history) else {
         return history.iter().any(|message| {
-            message.role == "system"
-                && (message.content.contains("IMPLEMENTATION DIRECTIVE:")
-                    || message
-                        .content
-                        .contains("SERVICE IMPLEMENTATION DIRECTIVE:")
-                    || message
-                        .content
-                        .contains("PROCESS IMPLEMENTATION DIRECTIVE:"))
+            message.role == "system" && message_has_tool_first_directive_block(&message.content)
         });
     };
 
-    let trimmed = last_user.trim_start();
-    trimmed.starts_with("IMPLEMENTATION DIRECTIVE:")
-        || trimmed.starts_with("SERVICE IMPLEMENTATION DIRECTIVE:")
-        || trimmed.starts_with("PROCESS IMPLEMENTATION DIRECTIVE:")
+    message_has_tool_first_directive_block(last_user)
         || history.iter().any(|message| {
-            message.role == "system"
-                && (message.content.contains("IMPLEMENTATION DIRECTIVE:")
-                    || message
-                        .content
-                        .contains("SERVICE IMPLEMENTATION DIRECTIVE:")
-                    || message
-                        .content
-                        .contains("PROCESS IMPLEMENTATION DIRECTIVE:"))
+            message.role == "system" && message_has_tool_first_directive_block(&message.content)
         })
 }
 
@@ -8256,7 +8249,7 @@ Tail"#;
     #[test]
     fn latest_user_message_requests_tool_first_execution_detects_runtime_directives() {
         let history = vec![ChatMessage::user(
-            "SERVICE IMPLEMENTATION DIRECTIVE:\nOnly reply after a concrete implementation step succeeded or you hit a specific blocker.",
+            "DEDICATED_RUNTIME_REQUEST\n```json\n{\"request_kind\":\"service\"}\n```",
         )];
 
         assert!(latest_user_message_requests_tool_first_execution(&history));
@@ -8276,7 +8269,7 @@ Tail"#;
     ) {
         let history = vec![
             ChatMessage::system(
-                "base system\n\nSERVICE IMPLEMENTATION DIRECTIVE:\nOnly reply after a concrete implementation step succeeded or you hit a specific blocker.",
+                "base system\n\nDEDICATED_RUNTIME_REQUEST\n```json\n{\"request_kind\":\"service\"}\n```",
             ),
             ChatMessage::user(
                 "quiero hacer un proceso que entre a https://dolarhoy.com/ cada 2 minutos",
@@ -8284,6 +8277,19 @@ Tail"#;
         ];
 
         assert!(latest_user_message_requests_tool_first_execution(&history));
+    }
+
+    #[test]
+    fn latest_user_message_requests_tool_first_execution_ignores_context_docs_that_mention_directives(
+    ) {
+        let history = vec![
+            ChatMessage::system(
+                "Requests may arrive in one of two forms:\n1. plain\n2. A structured block that starts with `DEDICATED_RUNTIME_REQUEST` followed by JSON.",
+            ),
+            ChatMessage::user("hola, como andas?"),
+        ];
+
+        assert!(!latest_user_message_requests_tool_first_execution(&history));
     }
 
     #[test]
