@@ -82,6 +82,8 @@ pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
+pub mod whatsapp_create_topic_group;
+pub mod whatsapp_enable_community;
 pub mod whatsapp_list_groups;
 pub mod whatsapp_list_observed_groups;
 pub mod whatsapp_observe_group;
@@ -155,6 +157,8 @@ pub use traits::Tool;
 pub use traits::{ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
+pub use whatsapp_create_topic_group::WhatsAppCreateTopicGroupTool;
+pub use whatsapp_enable_community::WhatsAppEnableCommunityTool;
 pub use whatsapp_list_groups::WhatsAppListGroupsTool;
 pub use whatsapp_list_observed_groups::WhatsAppListObservedGroupsTool;
 pub use whatsapp_observe_group::WhatsAppObserveGroupTool;
@@ -238,6 +242,8 @@ const SKILL_GATED_TOOL_NAMES: &[&str] = &[
     "screenshot",
     "image_info",
     "image_generate",
+    "whatsapp_create_topic_group",
+    "whatsapp_enable_community",
 ];
 
 pub fn is_skill_gated_tool(name: &str) -> bool {
@@ -419,6 +425,8 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
         Arc::new(CalculatorTool::new()),
+        Arc::new(WhatsAppCreateTopicGroupTool::new(security.clone())),
+        Arc::new(WhatsAppEnableCommunityTool::new(security.clone())),
         Arc::new(WhatsAppListGroupsTool::new(workspace_dir.to_path_buf())),
         Arc::new(WhatsAppListObservedGroupsTool::new(
             workspace_dir.to_path_buf(),
