@@ -1037,7 +1037,7 @@ fn strip_tool_result_content(text: &str) -> String {
     cleaned.to_string()
 }
 
-fn supports_runtime_model_switch(channel_name: &str) -> bool {
+fn supports_runtime_model_switch(_channel_name: &str) -> bool {
     // Gonza note: enabling for all channels
     //matches!(channel_name, "telegram" | "discord" | "matrix")
     return true;
