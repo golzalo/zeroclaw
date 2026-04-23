@@ -1780,31 +1780,6 @@ impl WhatsAppWebChannel {
             "WhatsApp Web support provisioning group ensured after General stability"
         );
 
-        let participant = Self::support_participant_jid()?;
-        let participant_present = match Self::fetch_all_visible_groups_extended(&client).await {
-            Ok(visible_groups) => {
-                Self::group_has_participant(&visible_groups, &support_group_jid, &participant)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    group_jid = %support_group_jid,
-                    participant = %participant,
-                    "WhatsApp Web could not confirm support participant presence before add: {err}"
-                );
-                false
-            }
-        };
-
-        if participant_present {
-            tracing::info!(
-                group_jid = %support_group_jid,
-                participant = %participant,
-                "WhatsApp Web support participant already present in support group"
-            );
-        } else {
-            Self::ensure_support_participant(&client, &support_group_jid).await?;
-        }
-
         Self::activate_managed_group(
             WHATSAPP_SUPPORT_GROUP_SUBJECT,
             &support_group_jid.to_string(),
@@ -1815,7 +1790,7 @@ impl WhatsAppWebChannel {
             &support_state,
             SupportProvisioningState::SupportProvisioning,
             SupportProvisioningState::SupportReady,
-            "support group and participant fully provisioned after General stability",
+            "support group fully provisioned after General stability",
         );
         Ok(())
     }

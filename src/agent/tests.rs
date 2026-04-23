@@ -473,11 +473,10 @@ async fn turn_bails_out_at_max_iterations() {
     let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
 
     let result = agent.turn("infinite loop").await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let response = result.expect("max-iteration bailout should return a continuation checkpoint");
     assert!(
-        err.contains("maximum tool iterations"),
-        "Expected max iterations error, got: {err}"
+        response.to_ascii_lowercase().contains("continue"),
+        "Expected continuation prompt, got: {response}"
     );
 }
 
