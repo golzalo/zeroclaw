@@ -115,6 +115,7 @@ mod tests {
             completed_iterations: 5,
             max_iterations: 5,
             autonomous_approved: false,
+            continuation_target: None,
         };
 
         save_checkpoint(tmp.path(), "session-1", "builder", &checkpoint)
