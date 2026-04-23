@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::{build_resume_from_checkpoint_message, run_tool_call_loop};
+use crate::agent::loop_::{
+    build_delegate_resume_prompt, build_resume_from_checkpoint_message, run_tool_call_loop,
+};
 use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -574,11 +576,10 @@ impl DelegateTool {
         } else {
             None
         };
-        let effective_prompt = if resume_checkpoint.is_some() {
-            "Resume the saved task from the checkpoint and complete only the remaining work."
-        } else {
-            full_prompt
-        };
+        let effective_prompt = resume_checkpoint
+            .as_ref()
+            .map(|checkpoint| build_delegate_resume_prompt(agent_name, full_prompt, checkpoint))
+            .unwrap_or_else(|| full_prompt.to_string());
         let resume_directive = resume_checkpoint
             .as_ref()
             .map(build_resume_from_checkpoint_message);
@@ -631,13 +632,13 @@ impl DelegateTool {
             history.push(message.clone());
         }
 
-        history.push(ChatMessage::user(effective_prompt.to_string()));
+        history.push(ChatMessage::user(effective_prompt.clone()));
 
         let quote = if let Some(remote_budget) = remote_budget {
             let budget_prompt = if let Some(message) = resume_directive.as_ref() {
                 format!("{}\n\n{}", message.content, effective_prompt)
             } else {
-                effective_prompt.to_string()
+                effective_prompt.clone()
             };
             let (estimated_input_tokens, estimated_output_tokens) = estimate_delegate_tokens(
                 agent_config.system_prompt.as_deref(),
@@ -1081,6 +1082,57 @@ mod tests {
             skills: Vec::new(),
             context_files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn build_delegate_resume_prompt_uses_existing_job_for_service_builder() {
+        let checkpoint = crate::agent::loop_::ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "NEW_JOB: true\nImplementar un proceso recurrente".to_string(),
+            completed_work: "Scaffold listo.".to_string(),
+            pending_work: "Falta validar el cron.".to_string(),
+            resume_hint: "Continuar desde el job ya creado.".to_string(),
+            user_message: "Checkpoint".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: false,
+            continuation_target: Some(crate::agent::loop_::ContinuationTarget {
+                kind: "service_job".to_string(),
+                id: "infobae-headlines-csv".to_string(),
+            }),
+        };
+
+        let prompt = build_delegate_resume_prompt("service_builder", "continue", &checkpoint);
+
+        assert!(prompt.starts_with("EXISTING_JOB: infobae-headlines-csv"));
+        assert!(!prompt.contains("NEW_JOB: true"));
+        assert!(prompt.contains("Implementar un proceso recurrente"));
+    }
+
+    #[test]
+    fn build_delegate_resume_prompt_preserves_nontrivial_feedback_for_generic_agents() {
+        let checkpoint = crate::agent::loop_::ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "Refactor the handler".to_string(),
+            completed_work: "Done".to_string(),
+            pending_work: "Need to finish".to_string(),
+            resume_hint: "Continue from the last good state.".to_string(),
+            user_message: "Checkpoint".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: false,
+            continuation_target: None,
+        };
+
+        let prompt = build_delegate_resume_prompt(
+            "coder",
+            "Please finish the publish step and fix the probe failure.",
+            &checkpoint,
+        );
+
+        assert!(prompt.contains("Current instruction / user feedback"));
+        assert!(prompt.contains("Please finish the publish step and fix the probe failure."));
+        assert!(prompt.contains("Refactor the handler"));
     }
 
     #[test]
