@@ -1,5 +1,8 @@
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::{
+    build_delegate_resume_prompt, build_resume_from_checkpoint_message, run_tool_call_loop,
+};
+use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
@@ -13,6 +16,42 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn looks_like_delegate_continue_request(prompt: &str) -> bool {
+    matches!(
+        prompt
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['\n', '\r', '\t'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .as_str(),
+        "continue"
+            | "continue please"
+            | "go ahead"
+            | "go on"
+            | "keep going"
+            | "please continue"
+            | "proceed"
+            | "resume"
+            | "yes"
+            | "yes please"
+            | "dale"
+            | "continua"
+            | "continúa"
+            | "segui"
+            | "seguí"
+            | "seguir"
+            | "si"
+            | "sí"
+            | "avanza"
+    )
+}
+
+fn delegate_task_scope(scope_key: &str, agent_name: &str) -> String {
+    format!("{scope_key}::delegate::{agent_name}")
+}
 
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
@@ -232,6 +271,15 @@ impl Tool for DelegateTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .unwrap_or("");
+        let continuation_scope = args
+            .get("_continuation_scope")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let resume_request = args
+            .get("_resume_request")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Look up agent config
         let agent_config = match self.agents.get(agent_name) {
@@ -325,6 +373,8 @@ impl Tool for DelegateTool {
                     &full_prompt,
                     temperature,
                     remote_budget.as_ref(),
+                    continuation_scope,
+                    resume_request,
                 )
                 .await;
         }
@@ -452,6 +502,8 @@ impl DelegateTool {
         full_prompt: &str,
         temperature: f64,
         remote_budget: Option<&RemoteBudgetClient>,
+        continuation_scope: Option<&str>,
+        resume_request: bool,
     ) -> anyhow::Result<ToolResult> {
         if agent_config.allowed_tools.is_empty() {
             return Ok(ToolResult {
@@ -503,6 +555,35 @@ impl DelegateTool {
             });
         }
 
+        let delegate_scope = continuation_scope
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|scope_key| delegate_task_scope(scope_key, agent_name));
+        let resume_checkpoint = if resume_request || looks_like_delegate_continue_request(full_prompt)
+        {
+            match (self.workspace_dir.as_deref(), delegate_scope.as_deref()) {
+                (Some(workspace_dir), Some(scope_key)) => {
+                    task_checkpoint_store::load_checkpoint(
+                        workspace_dir,
+                        scope_key,
+                        ROOT_TASK_CHECKPOINT_AGENT,
+                    )
+                    .ok()
+                    .flatten()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let effective_prompt = resume_checkpoint
+            .as_ref()
+            .map(|checkpoint| build_delegate_resume_prompt(agent_name, full_prompt, checkpoint))
+            .unwrap_or_else(|| full_prompt.to_string());
+        let resume_directive = resume_checkpoint
+            .as_ref()
+            .map(build_resume_from_checkpoint_message);
+
         let mut history = Vec::new();
         if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
@@ -547,12 +628,21 @@ impl DelegateTool {
             }
         }
 
-        history.push(ChatMessage::user(full_prompt.to_string()));
+        if let Some(message) = resume_directive.as_ref() {
+            history.push(message.clone());
+        }
+
+        history.push(ChatMessage::user(effective_prompt.clone()));
 
         let quote = if let Some(remote_budget) = remote_budget {
+            let budget_prompt = if let Some(message) = resume_directive.as_ref() {
+                format!("{}\n\n{}", message.content, effective_prompt)
+            } else {
+                effective_prompt.clone()
+            };
             let (estimated_input_tokens, estimated_output_tokens) = estimate_delegate_tokens(
                 agent_config.system_prompt.as_deref(),
-                full_prompt,
+                &budget_prompt,
                 true,
                 agent_config.max_iterations,
             );
@@ -615,6 +705,8 @@ impl DelegateTool {
                 None,
                 None,
                 None,
+                self.workspace_dir.as_deref(),
+                delegate_scope.as_deref(),
             ),
         )
         .await;
@@ -668,12 +760,28 @@ impl DelegateTool {
                         .await;
                 }
 
+                let rendered_output = if let Some(checkpoint) = response.continuation.as_ref() {
+                    crate::agent::loop_::render_continuation_history_message(
+                        checkpoint,
+                        &checkpoint.user_message,
+                    )
+                } else {
+                    rendered.clone()
+                };
+                let status_suffix = if response.continuation.is_some() {
+                    ", continuation checkpoint"
+                } else {
+                    ""
+                };
+
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "[Agent '{agent_name}' ({provider}/{model}, agentic)]\n{rendered}",
+                        "[Agent '{agent_name}' ({provider}/{model}, agentic{status_suffix})]\n{rendered_output}",
                         provider = agent_config.provider,
-                        model = agent_config.model
+                        model = agent_config.model,
+                        status_suffix = status_suffix,
+                        rendered_output = rendered_output,
                     ),
                     error: None,
                 })
@@ -974,6 +1082,57 @@ mod tests {
             skills: Vec::new(),
             context_files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn build_delegate_resume_prompt_uses_existing_job_for_service_builder() {
+        let checkpoint = crate::agent::loop_::ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "NEW_JOB: true\nImplementar un proceso recurrente".to_string(),
+            completed_work: "Scaffold listo.".to_string(),
+            pending_work: "Falta validar el cron.".to_string(),
+            resume_hint: "Continuar desde el job ya creado.".to_string(),
+            user_message: "Checkpoint".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: false,
+            continuation_target: Some(crate::agent::loop_::ContinuationTarget {
+                kind: "service_job".to_string(),
+                id: "infobae-headlines-csv".to_string(),
+            }),
+        };
+
+        let prompt = build_delegate_resume_prompt("service_builder", "continue", &checkpoint);
+
+        assert!(prompt.starts_with("EXISTING_JOB: infobae-headlines-csv"));
+        assert!(!prompt.contains("NEW_JOB: true"));
+        assert!(prompt.contains("Implementar un proceso recurrente"));
+    }
+
+    #[test]
+    fn build_delegate_resume_prompt_preserves_nontrivial_feedback_for_generic_agents() {
+        let checkpoint = crate::agent::loop_::ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "Refactor the handler".to_string(),
+            completed_work: "Done".to_string(),
+            pending_work: "Need to finish".to_string(),
+            resume_hint: "Continue from the last good state.".to_string(),
+            user_message: "Checkpoint".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: false,
+            continuation_target: None,
+        };
+
+        let prompt = build_delegate_resume_prompt(
+            "coder",
+            "Please finish the publish step and fix the probe failure.",
+            &checkpoint,
+        );
+
+        assert!(prompt.contains("Current instruction / user feedback"));
+        assert!(prompt.contains("Please finish the publish step and fix the probe failure."));
+        assert!(prompt.contains("Refactor the handler"));
     }
 
     #[test]
@@ -1325,7 +1484,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false)
             .await
             .unwrap();
 
@@ -1347,7 +1506,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false)
             .await
             .unwrap();
 
@@ -1367,16 +1526,15 @@ mod tests {
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false)
             .await
             .unwrap();
 
-        assert!(!result.success);
+        assert!(result.success);
         assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("maximum tool iterations (2)"));
+            .output
+            .contains("continuation checkpoint"));
+        assert!(result.output.contains("<continuation_checkpoint>"));
     }
 
     #[tokio::test]
@@ -1387,7 +1545,7 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false)
             .await
             .unwrap();
 
@@ -1483,7 +1641,7 @@ mod tests {
 
         let provider = McpToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2, None)
+            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2, None, None, false)
             .await
             .unwrap();
 

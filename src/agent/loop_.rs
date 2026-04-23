@@ -1,4 +1,5 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
 use crate::config::Config;
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -94,6 +95,7 @@ const SCHEDULING_REQUEST_HINTS: &[&str] = &[
 const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
     "avisar",
     "avisare",
+    "configurad",
     "cumpl",
     "en cuanto se cumpla",
     "i'll send",
@@ -182,9 +184,32 @@ pub struct ProcessMessageReport {
     pub usage: UsageSummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ContinuationTarget {
+    pub kind: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContinuationCheckpoint {
+    pub reason: String,
+    pub original_request: String,
+    pub completed_work: String,
+    pub pending_work: String,
+    pub resume_hint: String,
+    pub user_message: String,
+    pub completed_iterations: usize,
+    pub max_iterations: usize,
+    #[serde(default)]
+    pub autonomous_approved: bool,
+    #[serde(default)]
+    pub continuation_target: Option<ContinuationTarget>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AgentTurnOutcome {
     pub(crate) output: String,
+    pub(crate) continuation: Option<ContinuationCheckpoint>,
     pub(crate) requests: Vec<LlmCallUsage>,
 }
 
@@ -384,6 +409,244 @@ const SCHEDULING_FAILURE_HINTS: &[&str] = &[
     "unable",
 ];
 
+const CONTINUATION_CHECKPOINT_OPEN_TAG: &str = "<continuation_checkpoint>";
+const CONTINUATION_CHECKPOINT_CLOSE_TAG: &str = "</continuation_checkpoint>";
+const CONTINUATION_CHECKPOINT_REF_OPEN_TAG: &str = "<continuation_checkpoint_ref>";
+const CONTINUATION_CHECKPOINT_REF_CLOSE_TAG: &str = "</continuation_checkpoint_ref>";
+const CONTINUATION_CHECKPOINT_SOURCE_CHAR_LIMIT: usize = 12_000;
+const CONTINUATION_CHECKPOINT_FIELD_CHAR_LIMIT: usize = 900;
+
+const CONTINUE_REQUEST_HINTS: &[&str] = &[
+    "continue",
+    "continue please",
+    "continue with that",
+    "go ahead",
+    "go on",
+    "keep going",
+    "please continue",
+    "proceed",
+    "resume",
+    "yes",
+    "yes please",
+    "dale",
+    "continua",
+    "continua con eso",
+    "continúa",
+    "continúa con eso",
+    "segui",
+    "segui con eso",
+    "seguí",
+    "seguí con eso",
+    "seguir",
+    "si",
+    "si dale",
+    "sí",
+    "sí dale",
+    "avanza",
+];
+
+const AUTONOMOUS_CONTINUATION_HINTS: &[&str] = &[
+    "do not ask again",
+    "do not ask for confirmation",
+    "dont ask again",
+    "finish it without further questions",
+    "keep going without asking",
+    "no me pidas permiso",
+    "no more permission requests",
+    "no more questions",
+    "no pidas permiso",
+    "no preguntes mas",
+    "no preguntes más",
+    "sin pedir permiso",
+];
+
+const AUTONOMOUS_CONTINUATION_USER_PREFIX: &str = "[Autonomous continuation]";
+const AUTONOMOUS_ROOT_CONTINUATION_MARKER: &str = "AUTONOMOUS ROOT CONTINUATION DIRECTIVE:";
+const MAX_AUTONOMOUS_ROOT_CONTINUATIONS: usize = 4;
+const MAX_AUTONOMOUS_DELEGATE_CONTINUATIONS: usize = 3;
+const RESUME_DIRECTIVE_ORIGINAL_REQUEST_CHAR_LIMIT: usize = 480;
+const RESUME_DIRECTIVE_PROGRESS_FIELD_CHAR_LIMIT: usize = 360;
+const AUTONOMOUS_CONTINUATION_FIELD_CHAR_LIMIT: usize = 320;
+const CONTINUATION_TARGET_KIND_SERVICE_JOB: &str = "service_job";
+
+const CONTINUATION_CHECKPOINT_SYSTEM_PROMPT: &str = r#"You are a task-checkpointing engine for an AI agent that reached its tool-iteration limit.
+
+Given the transcript for the current request, respond ONLY with valid JSON:
+{
+  "completed_work": "short bullet list or short paragraph of concrete work already completed",
+  "pending_work": "short bullet list or short paragraph of what still remains",
+  "resume_hint": "short instruction telling the agent how to continue from this exact state without repeating completed work",
+  "user_message": "short user-facing message in the same language as the transcript, summarizing progress, saying the task is complex, and asking whether the user wants to continue"
+}
+
+Rules:
+- Do not invent progress that is not supported by the transcript.
+- Prefer concise concrete wording.
+- Keep each field under 900 characters.
+- Mention blockers only if they are explicit in the transcript.
+- The user_message must explicitly ask whether to keep going."#;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ContinuationCheckpointDraft {
+    #[serde(default)]
+    completed_work: String,
+    #[serde(default)]
+    pending_work: String,
+    #[serde(default)]
+    resume_hint: String,
+    #[serde(default)]
+    user_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContinuationCheckpointRef {
+    scope_key: String,
+    agent_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseLanguagePolicy {
+    MatchUser,
+    Spanish,
+    English,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ConversationRuntimePolicy {
+    autonomous_continuation: Option<bool>,
+    response_language: Option<ResponseLanguagePolicy>,
+}
+
+static SERVICE_JOB_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"tenant-app/server/jobs/([A-Za-z0-9._-]+)/").expect("valid service job path regex")
+});
+static SERVICE_JOB_API_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"/api/jobs/([A-Za-z0-9._-]+)/").expect("valid service job api regex")
+});
+static SERVICE_JOB_COMMAND_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:--name|--job)\s+"?([A-Za-z0-9._-]+)"?"#)
+        .expect("valid service job command regex")
+});
+
+fn build_service_job_continuation_target(slug: &str) -> ContinuationTarget {
+    ContinuationTarget {
+        kind: CONTINUATION_TARGET_KIND_SERVICE_JOB.to_string(),
+        id: slug.to_string(),
+    }
+}
+
+fn continuation_target_canonical_signal(target: &ContinuationTarget) -> Option<String> {
+    match target.kind.as_str() {
+        CONTINUATION_TARGET_KIND_SERVICE_JOB => Some(format!("EXISTING_JOB: {}", target.id)),
+        _ => None,
+    }
+}
+
+fn render_continuation_target_section(target: Option<&ContinuationTarget>) -> String {
+    let Some(target) = target else {
+        return String::new();
+    };
+
+    let mut section = format!(
+        "\n\n[Continuation target]\nkind: {}\nid: {}",
+        target.kind, target.id
+    );
+    if let Some(signal) = continuation_target_canonical_signal(target) {
+        let _ = write!(section, "\ncanonical_resume_signal: {signal}");
+    }
+    section
+}
+
+fn normalize_resume_instruction_for_comparison(text: &str) -> String {
+    text.trim()
+        .to_ascii_lowercase()
+        .replace(['\n', '\r', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_service_job_signal_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("NEW_JOB:") || trimmed.starts_with("EXISTING_JOB:"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn build_delegate_resume_instruction(full_prompt: &str, checkpoint: &ContinuationCheckpoint) -> String {
+    let trimmed_prompt = full_prompt.trim();
+    let original_request = checkpoint.original_request.trim();
+
+    if trimmed_prompt.is_empty() || looks_like_continue_request(trimmed_prompt) {
+        return original_request.to_string();
+    }
+
+    let normalized_prompt = normalize_resume_instruction_for_comparison(trimmed_prompt);
+    let generic_resume_prompt = normalize_resume_instruction_for_comparison(
+        "Resume the saved task from the checkpoint and complete only the remaining work.",
+    );
+
+    if normalized_prompt == generic_resume_prompt {
+        return original_request.to_string();
+    }
+
+    let normalized_original = normalize_resume_instruction_for_comparison(original_request);
+    if original_request.is_empty() || normalized_prompt == normalized_original {
+        trimmed_prompt.to_string()
+    } else {
+        format!(
+            "Original request:\n{}\n\nCurrent instruction / user feedback:\n{}",
+            original_request, trimmed_prompt
+        )
+    }
+}
+
+pub(crate) fn build_delegate_resume_prompt(
+    agent_name: &str,
+    full_prompt: &str,
+    checkpoint: &ContinuationCheckpoint,
+) -> String {
+    let mut instruction = build_delegate_resume_instruction(full_prompt, checkpoint);
+
+    if agent_name == "service_builder" {
+        instruction = strip_service_job_signal_lines(&instruction);
+        if instruction.is_empty() {
+            instruction = "Continue the previously started service work and complete only the remaining steps."
+                .to_string();
+        }
+    }
+
+    if let Some(target) = checkpoint.continuation_target.as_ref() {
+        if let Some(signal) = continuation_target_canonical_signal(target) {
+            if agent_name == "service_builder"
+                && target.kind == CONTINUATION_TARGET_KIND_SERVICE_JOB
+            {
+                return format!(
+                    "{signal}\n\nContinue the same service job from the saved checkpoint. Reuse completed work and focus only on the remaining steps.\n\n{}",
+                    instruction.trim()
+                );
+            }
+        }
+
+        return format!(
+            "Continue the same task from the saved checkpoint. Reuse completed work and focus only on the remaining steps.\n\nCONTINUATION_TARGET:\n- kind: {}\n- id: {}\n\n{}",
+            target.kind,
+            target.id,
+            instruction.trim()
+        );
+    }
+
+    format!(
+        "Continue the same task from the saved checkpoint. Reuse completed work and focus only on the remaining steps.\n\n{}",
+        instruction.trim()
+    )
+}
+
 /// Callback type for checking if model has been switched during tool execution.
 /// Returns Some((provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
@@ -466,6 +729,20 @@ fn latest_user_message(history: &[ChatMessage]) -> Option<&str> {
         .map(|message| message.content.as_str())
 }
 
+fn is_runtime_user_message(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("[Tool results]")
+        || trimmed.starts_with(AUTONOMOUS_CONTINUATION_USER_PREFIX)
+}
+
+fn latest_human_user_message(history: &[ChatMessage]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_runtime_user_message(&message.content))
+        .map(|message| message.content.as_str())
+}
+
 fn message_has_tool_first_directive_block(message: &str) -> bool {
     message.lines().any(|line| {
         let trimmed = line.trim_start();
@@ -499,6 +776,924 @@ fn internal_repair_message(instruction: impl AsRef<str>) -> ChatMessage {
          - After repairing, continue the task normally.\n\n{}",
         instruction.as_ref()
     ))
+}
+
+pub(crate) fn render_continuation_checkpoint_block(checkpoint: &ContinuationCheckpoint) -> String {
+    let payload = serde_json::to_string(checkpoint).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "{CONTINUATION_CHECKPOINT_OPEN_TAG}\n{payload}\n{CONTINUATION_CHECKPOINT_CLOSE_TAG}"
+    )
+}
+
+fn render_continuation_checkpoint_reference_block(scope_key: &str, agent_name: &str) -> String {
+    let payload = serde_json::to_string(&ContinuationCheckpointRef {
+        scope_key: scope_key.to_string(),
+        agent_name: agent_name.to_string(),
+    })
+    .unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "{CONTINUATION_CHECKPOINT_REF_OPEN_TAG}\n{payload}\n{CONTINUATION_CHECKPOINT_REF_CLOSE_TAG}"
+    )
+}
+
+pub(crate) fn render_continuation_history_message(
+    checkpoint: &ContinuationCheckpoint,
+    visible_response: &str,
+) -> String {
+    let visible = visible_response.trim();
+    if visible.is_empty() {
+        render_continuation_checkpoint_block(checkpoint)
+    } else {
+        format!(
+            "{}\n{}",
+            render_continuation_checkpoint_block(checkpoint),
+            visible
+        )
+    }
+}
+
+pub(crate) fn render_continuation_history_message_with_reference(
+    scope_key: &str,
+    agent_name: &str,
+    visible_response: &str,
+) -> String {
+    let visible = visible_response.trim();
+    let reference = render_continuation_checkpoint_reference_block(scope_key, agent_name);
+    if visible.is_empty() {
+        reference
+    } else {
+        format!("{reference}\n{visible}")
+    }
+}
+
+fn extract_continuation_checkpoint(content: &str) -> Option<ContinuationCheckpoint> {
+    let start = content.find(CONTINUATION_CHECKPOINT_OPEN_TAG)?;
+    let after_open = &content[start + CONTINUATION_CHECKPOINT_OPEN_TAG.len()..];
+    let end = after_open.find(CONTINUATION_CHECKPOINT_CLOSE_TAG)?;
+    serde_json::from_str(after_open[..end].trim()).ok()
+}
+
+fn looks_like_continue_request(message: &str) -> bool {
+    let normalized = message
+        .trim()
+        .strip_prefix(AUTONOMOUS_CONTINUATION_USER_PREFIX)
+        .map(str::trim)
+        .unwrap_or_else(|| message.trim())
+        .to_ascii_lowercase()
+        .replace(['\n', '\r', '\t'], " ");
+    if normalized.is_empty() || normalized.chars().count() > 80 {
+        return false;
+    }
+
+    let normalized = normalized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    CONTINUE_REQUEST_HINTS
+        .iter()
+        .any(|hint| normalized == *hint || normalized.starts_with(&format!("{hint} ")))
+}
+
+fn resume_directive_already_injected(
+    history: &[ChatMessage],
+    last_user_index: usize,
+    checkpoint: &ContinuationCheckpoint,
+) -> bool {
+    history[..last_user_index].iter().rev().any(|message| {
+        message.role == "system"
+            && message.content.contains("CONTINUATION RESUME DIRECTIVE:")
+            && message.content.contains(checkpoint.resume_hint.trim())
+    })
+}
+
+fn latest_continuation_checkpoint_before(
+    history: &[ChatMessage],
+    before_index: usize,
+) -> Option<ContinuationCheckpoint> {
+    history[..before_index]
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .and_then(|message| extract_continuation_checkpoint(&message.content))
+}
+
+fn extract_resume_directive_original_request(message: &str) -> Option<String> {
+    if !message.contains("CONTINUATION RESUME DIRECTIVE:") {
+        return None;
+    }
+
+    let original_marker = "[Original request]\n";
+    let completed_marker = "\n\n[Completed work]\n";
+    let start = message.find(original_marker)? + original_marker.len();
+    let rest = &message[start..];
+    let end = rest.find(completed_marker)?;
+    let original_request = rest[..end].trim();
+    if original_request.is_empty() {
+        None
+    } else {
+        Some(original_request.to_string())
+    }
+}
+
+fn extract_resume_directive_autonomous_approval(message: &str) -> Option<bool> {
+    if !message.contains("CONTINUATION RESUME DIRECTIVE:") {
+        return None;
+    }
+
+    let marker = "[Autonomous continuation approved]\n";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let value = rest.lines().next()?.trim().to_ascii_lowercase();
+
+    match value.as_str() {
+        "true" | "yes" => Some(true),
+        "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn latest_effective_original_request(history: &[ChatMessage]) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.role == "system" {
+                extract_resume_directive_original_request(&message.content)
+            } else {
+                None
+            }
+        })
+        .or_else(|| latest_human_user_message(history).map(|message| message.trim().to_string()))
+}
+
+fn latest_autonomous_continuation_approval(history: &[ChatMessage]) -> Option<bool> {
+    for message in history.iter().rev() {
+        if message.role == "system" {
+            if let Some(value) = extract_resume_directive_autonomous_approval(&message.content) {
+                return Some(value);
+            }
+            continue;
+        }
+
+        if message.role == "assistant" {
+            return extract_continuation_checkpoint(&message.content)
+                .map(|checkpoint| checkpoint.autonomous_approved);
+        }
+    }
+
+    None
+}
+
+fn extract_policy_attribute_value(content: &str, attribute: &str) -> Option<String> {
+    let normalized = normalize_text_for_matching(content);
+    let start = normalized.find("<zeroclaw_policy")?;
+    let rest = &normalized[start..];
+    let end = rest.find('>')?;
+    let header = &rest[..end];
+    let marker = format!(r#"{attribute}=""#);
+    let value_start = header.find(&marker)? + marker.len();
+    let value_rest = &header[value_start..];
+    let value_end = value_rest.find('"')?;
+    let value = value_rest[..value_end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn extract_policy_tag_value(content: &str, tag: &str) -> Option<String> {
+    let normalized = normalize_text_for_matching(content);
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = normalized.find(&open)? + open.len();
+    let rest = &normalized[start..];
+    let end = rest.find(&close)?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn extract_policy_setting_value(content: &str, key: &str) -> Option<String> {
+    let normalized = normalize_text_for_matching(content);
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        for separator in ["=", ":"] {
+            let marker = format!("{key} {separator}");
+            if let Some(value) = trimmed.strip_prefix(&marker) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_autonomous_policy_value(raw: &str) -> Option<bool> {
+    match raw.trim() {
+        "always" | "enabled" | "on" | "true" | "yes" => Some(true),
+        "ask" | "disabled" | "false" | "manual" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_response_language_policy_value(raw: &str) -> Option<ResponseLanguagePolicy> {
+    let value = raw.trim();
+    if matches!(value, "match-user" | "match_user" | "auto") {
+        Some(ResponseLanguagePolicy::MatchUser)
+    } else if value.starts_with("es") || matches!(value, "spanish" | "castellano") {
+        Some(ResponseLanguagePolicy::Spanish)
+    } else if value.starts_with("en") || value == "english" {
+        Some(ResponseLanguagePolicy::English)
+    } else {
+        None
+    }
+}
+
+fn system_message_runtime_policy(message: &str) -> ConversationRuntimePolicy {
+    let autonomous_continuation = extract_policy_attribute_value(
+        message,
+        "autonomous_continuation",
+    )
+    .or_else(|| extract_policy_tag_value(message, "autonomous_continuation"))
+    .or_else(|| {
+        extract_policy_setting_value(message, "zeroclaw.autonomous_continuation")
+    })
+    .and_then(|value| parse_autonomous_policy_value(&value));
+
+    let response_language = extract_policy_attribute_value(message, "response_language")
+        .or_else(|| extract_policy_tag_value(message, "response_language"))
+        .or_else(|| extract_policy_setting_value(message, "zeroclaw.response_language"))
+        .and_then(|value| parse_response_language_policy_value(&value));
+
+    ConversationRuntimePolicy {
+        autonomous_continuation,
+        response_language,
+    }
+}
+
+fn conversation_runtime_policy(history: &[ChatMessage]) -> ConversationRuntimePolicy {
+    let mut policy = ConversationRuntimePolicy::default();
+
+    for message in history.iter().filter(|message| message.role == "system") {
+        let parsed = system_message_runtime_policy(&message.content);
+        if parsed.autonomous_continuation.is_some() {
+            policy.autonomous_continuation = parsed.autonomous_continuation;
+        }
+        if parsed.response_language.is_some() {
+            policy.response_language = parsed.response_language;
+        }
+    }
+
+    policy
+}
+
+fn user_preapproved_autonomous_continuation(history: &[ChatMessage]) -> bool {
+    history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user" && !is_runtime_user_message(&message.content))
+        .take(8)
+        .any(|message| {
+            let normalized = message
+                .content
+                .to_ascii_lowercase()
+                .replace(['\n', '\r', '\t'], " ");
+            AUTONOMOUS_CONTINUATION_HINTS
+                .iter()
+                .any(|hint| normalized.contains(hint))
+        })
+}
+
+fn autonomous_continuation_authorized(history: &[ChatMessage]) -> bool {
+    user_preapproved_autonomous_continuation(history)
+        || latest_autonomous_continuation_approval(history).unwrap_or(false)
+}
+
+pub(crate) fn build_resume_from_checkpoint_message(checkpoint: &ContinuationCheckpoint) -> ChatMessage {
+    let original_request =
+        truncate_resume_directive_original_request(&checkpoint.original_request);
+    let completed_work =
+        truncate_resume_directive_progress_field(&checkpoint.completed_work);
+    let pending_work =
+        truncate_resume_directive_progress_field(&checkpoint.pending_work);
+    let target_section =
+        render_continuation_target_section(checkpoint.continuation_target.as_ref());
+    let target_section_break = if target_section.is_empty() { "" } else { "\n" };
+
+    ChatMessage::system(format!(
+        "CONTINUATION RESUME DIRECTIVE:\n\
+         - This is not a user-visible message.\n\
+         - The user explicitly asked to continue a previously checkpointed task.\n\
+         - Resume from the saved checkpoint below.\n\
+         - Do not restart from scratch or repeat completed work unless required.\n\
+         - Reuse the progress already captured in this conversation.\n\
+         - If you still need more work after this turn, leave another checkpoint instead of failing abruptly.\n\n\
+         [Original request]\n{}\n\n\
+         [Completed work]\n{}\n\n\
+         [Pending work]\n{}\n\n\
+         [Autonomous continuation approved]\n{}{}{}\n\n\
+         [Resume hint]\n{}",
+        original_request,
+        completed_work,
+        pending_work,
+        checkpoint.autonomous_approved,
+        target_section,
+        target_section_break,
+        checkpoint.resume_hint.trim()
+    ))
+}
+
+pub(crate) fn maybe_inject_resume_from_checkpoint(history: &mut Vec<ChatMessage>) -> bool {
+    let Some(last_user_index) = history.iter().rposition(|message| message.role == "user") else {
+        return false;
+    };
+
+    let user_message = history[last_user_index].content.clone();
+    if !looks_like_continue_request(&user_message) {
+        return false;
+    }
+
+    let Some(checkpoint) = latest_continuation_checkpoint_before(history, last_user_index) else {
+        return false;
+    };
+
+    if resume_directive_already_injected(history, last_user_index, &checkpoint) {
+        return false;
+    }
+
+    history.insert(
+        last_user_index,
+        build_resume_from_checkpoint_message(&checkpoint),
+    );
+    true
+}
+
+pub(crate) fn maybe_inject_resume_from_persistent_checkpoint(
+    history: &mut Vec<ChatMessage>,
+    workspace_dir: &Path,
+    scope_key: &str,
+    agent_name: &str,
+) -> bool {
+    let Some(last_user_index) = history.iter().rposition(|message| message.role == "user") else {
+        return false;
+    };
+
+    let user_message = history[last_user_index].content.clone();
+    if !looks_like_continue_request(&user_message) {
+        return false;
+    }
+
+    if latest_continuation_checkpoint_before(history, last_user_index).is_some() {
+        return false;
+    }
+
+    let Ok(Some(checkpoint)) = task_checkpoint_store::load_checkpoint(workspace_dir, scope_key, agent_name) else {
+        return false;
+    };
+
+    if resume_directive_already_injected(history, last_user_index, &checkpoint) {
+        return false;
+    }
+
+    history.insert(
+        last_user_index,
+        build_resume_from_checkpoint_message(&checkpoint),
+    );
+    true
+}
+
+fn checkpoint_source_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    let start = history
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(0);
+    history[start..]
+        .iter()
+        .filter(|message| {
+            !(message.role == "assistant" && extract_continuation_checkpoint(&message.content).is_some())
+        })
+        .cloned()
+        .collect()
+}
+
+fn record_service_job_slug_candidates(text: &str, counts: &mut HashMap<String, usize>) {
+    for regex in [
+        &*SERVICE_JOB_PATH_REGEX,
+        &*SERVICE_JOB_API_REGEX,
+        &*SERVICE_JOB_COMMAND_REGEX,
+    ] {
+        for captures in regex.captures_iter(text) {
+            let Some(slug) = captures.get(1).map(|value| value.as_str().trim()) else {
+                continue;
+            };
+            if slug.is_empty() {
+                continue;
+            }
+            *counts.entry(slug.to_string()).or_default() += 1;
+        }
+    }
+}
+
+fn infer_continuation_target_from_texts<'a, I>(texts: I) -> Option<ContinuationTarget>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut counts = HashMap::new();
+    for text in texts {
+        record_service_job_slug_candidates(text, &mut counts);
+    }
+
+    counts
+        .into_iter()
+        .max_by(|(left_slug, left_count), (right_slug, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| left_slug.cmp(right_slug))
+        })
+        .map(|(slug, _)| build_service_job_continuation_target(&slug))
+}
+
+fn infer_continuation_target(
+    history: &[ChatMessage],
+    draft: Option<&ContinuationCheckpointDraft>,
+) -> Option<ContinuationTarget> {
+    let source_messages = checkpoint_source_messages(history);
+    let mut counts = HashMap::new();
+
+    for message in &source_messages {
+        record_service_job_slug_candidates(&message.content, &mut counts);
+    }
+    if let Some(original_request) = latest_effective_original_request(history) {
+        record_service_job_slug_candidates(&original_request, &mut counts);
+    }
+    if let Some(draft) = draft {
+        record_service_job_slug_candidates(&draft.completed_work, &mut counts);
+        record_service_job_slug_candidates(&draft.pending_work, &mut counts);
+        record_service_job_slug_candidates(&draft.resume_hint, &mut counts);
+        record_service_job_slug_candidates(&draft.user_message, &mut counts);
+    }
+
+    counts
+        .into_iter()
+        .max_by(|(left_slug, left_count), (right_slug, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| left_slug.cmp(right_slug))
+        })
+        .map(|(slug, _)| build_service_job_continuation_target(&slug))
+}
+
+fn normalize_text_for_matching(sample: &str) -> String {
+    sample
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|ch| match ch {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'ñ' => 'n',
+            _ => ch,
+        })
+        .collect()
+}
+
+fn checkpoint_fallback_is_spanish(history: &[ChatMessage]) -> bool {
+    latest_human_user_message(history)
+        .map(text_prefers_spanish)
+        .unwrap_or(false)
+}
+
+fn history_prefers_spanish(history: &[ChatMessage]) -> bool {
+    let recent_human_messages: Vec<&str> = history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user" && !is_runtime_user_message(&message.content))
+        .take(8)
+        .map(|message| message.content.as_str())
+        .collect();
+
+    if recent_human_messages.is_empty() {
+        return false;
+    }
+
+    if text_prefers_spanish(recent_human_messages[0]) {
+        return true;
+    }
+
+    recent_human_messages
+        .iter()
+        .filter(|message| text_prefers_spanish(message))
+        .count()
+        >= 2
+}
+
+fn prefers_spanish_for_user_message(
+    history: &[ChatMessage],
+    checkpoint: Option<&ContinuationCheckpoint>,
+    fallback: Option<&ContinuationCheckpoint>,
+) -> bool {
+    match conversation_runtime_policy(history).response_language {
+        Some(ResponseLanguagePolicy::Spanish) => true,
+        Some(ResponseLanguagePolicy::English) => false,
+        Some(ResponseLanguagePolicy::MatchUser) => history_prefers_spanish(history),
+        None => {
+            if history_prefers_spanish(history) {
+                true
+            } else {
+                checkpoint
+                    .map(continuation_checkpoint_prefers_spanish)
+                    .unwrap_or(false)
+                    || fallback
+                        .map(continuation_checkpoint_prefers_spanish)
+                        .unwrap_or(false)
+            }
+        }
+    }
+}
+
+fn text_prefers_spanish(sample: &str) -> bool {
+    let sample = normalize_text_for_matching(sample);
+    if matches!(
+        sample.trim(),
+        "dale" | "si" | "avanza" | "continua" | "segui"
+    ) {
+        return true;
+    }
+    [
+        " el ",
+        " la ",
+        " los ",
+        " las ",
+        " por ",
+        " para ",
+        " que ",
+        " segu",
+        " tarea",
+        " agente",
+        " iteraciones",
+        " noticias",
+        " proceso",
+        " quiero",
+        " podes",
+        " autorizacion",
+        " credito",
+        " idioma",
+        " habl",
+        " avanza",
+        " segui",
+        " continua",
+        " queres",
+        " volve",
+    ]
+    .iter()
+    .any(|hint| sample.contains(hint) || sample.starts_with(hint.trim()))
+}
+
+fn continuation_checkpoint_prefers_spanish(checkpoint: &ContinuationCheckpoint) -> bool {
+    text_prefers_spanish(&checkpoint.original_request)
+        || text_prefers_spanish(&checkpoint.completed_work)
+        || text_prefers_spanish(&checkpoint.pending_work)
+}
+
+fn truncate_resume_directive_original_request(text: &str) -> String {
+    truncate_with_ellipsis(text.trim(), RESUME_DIRECTIVE_ORIGINAL_REQUEST_CHAR_LIMIT)
+}
+
+fn truncate_resume_directive_progress_field(text: &str) -> String {
+    truncate_with_ellipsis(text.trim(), RESUME_DIRECTIVE_PROGRESS_FIELD_CHAR_LIMIT)
+}
+
+fn truncate_autonomous_continuation_field(text: &str) -> String {
+    truncate_with_ellipsis(text.trim(), AUTONOMOUS_CONTINUATION_FIELD_CHAR_LIMIT)
+}
+
+fn build_user_facing_continuation_message(
+    checkpoint: &ContinuationCheckpoint,
+    ask_to_continue: bool,
+    prefers_spanish: bool,
+) -> String {
+    let completed_work = truncate_with_ellipsis(checkpoint.completed_work.trim(), 320);
+    let pending_work = truncate_with_ellipsis(checkpoint.pending_work.trim(), 320);
+
+    if prefers_spanish {
+        if ask_to_continue {
+            format!(
+                "Avancé hasta acá: {completed_work}\n\nQueda pendiente: {pending_work}\n\nLlegué al límite de {} iteraciones de esta corrida. Dejé un checkpoint para retomar sin repetir trabajo. ¿Querés continuar?",
+                checkpoint.max_iterations
+            )
+        } else {
+            format!(
+                "Avancé hasta acá: {completed_work}\n\nQueda pendiente: {pending_work}\n\nLlegué al límite de {} iteraciones de esta corrida. Dejé un checkpoint para retomar sin repetir trabajo y voy a seguir.",
+                checkpoint.max_iterations
+            )
+        }
+    } else {
+        if ask_to_continue {
+            format!(
+                "I got this far: {completed_work}\n\nStill pending: {pending_work}\n\nI reached the limit of {} iterations for this run. I saved a checkpoint so I can resume without repeating work. Do you want me to keep going?",
+                checkpoint.max_iterations
+            )
+        } else {
+            format!(
+                "I got this far: {completed_work}\n\nStill pending: {pending_work}\n\nI reached the limit of {} iterations for this run. I saved a checkpoint so I can resume without repeating work, and I'll keep going.",
+                checkpoint.max_iterations
+            )
+        }
+    }
+}
+
+fn localized_checkpoint_for_user_message(
+    checkpoint: &ContinuationCheckpoint,
+    fallback: &ContinuationCheckpoint,
+    prefers_spanish: bool,
+) -> ContinuationCheckpoint {
+    let mut localized = checkpoint.clone();
+
+    if prefers_spanish {
+        if !text_prefers_spanish(&localized.completed_work) {
+            localized.completed_work = fallback.completed_work.clone();
+        }
+        if !text_prefers_spanish(&localized.pending_work) {
+            localized.pending_work = fallback.pending_work.clone();
+        }
+    } else {
+        if text_prefers_spanish(&localized.completed_work) {
+            localized.completed_work = fallback.completed_work.clone();
+        }
+        if text_prefers_spanish(&localized.pending_work) {
+            localized.pending_work = fallback.pending_work.clone();
+        }
+    }
+
+    localized
+}
+
+fn sanitized_model_user_message(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(CONTINUATION_CHECKPOINT_OPEN_TAG)
+        || trimmed.contains(CONTINUATION_CHECKPOINT_CLOSE_TAG)
+        || trimmed.contains("AUTONOMOUS ROOT CONTINUATION DIRECTIVE:")
+        || trimmed.contains("AUTONOMOUS CONTINUATION DIRECTIVE:")
+    {
+        return None;
+    }
+
+    Some(truncate_checkpoint_field(trimmed))
+}
+
+fn collect_checkpoint_tool_names(history: &[ChatMessage]) -> Vec<String> {
+    let mut tool_names = Vec::new();
+    let mut seen = HashSet::new();
+
+    let source = checkpoint_source_messages(history);
+    for message in source {
+        if message.role == "assistant" {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&message.content) {
+                if let Some(calls) = val.get("tool_calls").and_then(|c| c.as_array()) {
+                    for call in calls {
+                        let name = call
+                            .get("name")
+                            .or_else(|| call.get("function").and_then(|value| value.get("name")))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .trim();
+                        if !name.is_empty() && seen.insert(name.to_string()) {
+                            tool_names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+            for capture in Regex::new(r#""name"\s*:\s*"([^"]+)""#)
+                .unwrap()
+                .captures_iter(&message.content)
+            {
+                let Some(name) = capture.get(1).map(|value| value.as_str().trim()) else {
+                    continue;
+                };
+                if !name.is_empty() && seen.insert(name.to_string()) {
+                    tool_names.push(name.to_string());
+                }
+            }
+        } else if message.role == "user" && message.content.contains("[Tool results]") {
+            for capture in Regex::new(r#"<tool_result name="([^"]+)">"#)
+                .unwrap()
+                .captures_iter(&message.content)
+            {
+                let Some(name) = capture.get(1).map(|value| value.as_str().trim()) else {
+                    continue;
+                };
+                if !name.is_empty() && seen.insert(name.to_string()) {
+                    tool_names.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    tool_names
+}
+
+fn truncate_checkpoint_field(text: &str) -> String {
+    truncate_with_ellipsis(text.trim(), CONTINUATION_CHECKPOINT_FIELD_CHAR_LIMIT)
+}
+
+fn fallback_continuation_checkpoint(
+    history: &[ChatMessage],
+    completed_iterations: usize,
+    max_iterations: usize,
+) -> ContinuationCheckpoint {
+    let original_request = latest_effective_original_request(history).unwrap_or_default();
+    let continuation_target = infer_continuation_target(history, None);
+    let tool_names = collect_checkpoint_tool_names(history);
+    let tool_summary = if tool_names.is_empty() {
+        String::new()
+    } else {
+        format!("Tools used so far: {}.", tool_names.join(", "))
+    };
+    let is_spanish = checkpoint_fallback_is_spanish(history);
+    let autonomous_approved = autonomous_continuation_authorized(history);
+    let ask_to_continue = !autonomous_approved;
+
+    if is_spanish {
+        let completed_work = if tool_summary.is_empty() {
+            "Avance la investigacion y deje trazado el trabajo ya ejecutado en esta corrida."
+                .to_string()
+        } else {
+            format!("Avance la tarea y deje registro del trabajo ya ejecutado. {tool_summary}")
+        };
+        let mut checkpoint = ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request,
+            completed_work: truncate_checkpoint_field(&completed_work),
+            pending_work: truncate_checkpoint_field(
+                "Queda retomar desde el ultimo estado util, completar los pasos restantes y cerrar la respuesta final sin repetir trabajo ya hecho.",
+            ),
+            resume_hint: truncate_checkpoint_field(
+                "Retoma desde el ultimo resultado de herramientas de esta conversacion. No reinicies desde cero; usa el trabajo ya hecho y enfocate solo en los pendientes.",
+            ),
+            user_message: String::new(),
+            completed_iterations,
+            max_iterations,
+            autonomous_approved,
+            continuation_target,
+        };
+        checkpoint.user_message =
+            build_user_facing_continuation_message(&checkpoint, ask_to_continue, is_spanish);
+        checkpoint
+    } else {
+        let completed_work = if tool_summary.is_empty() {
+            "I made progress on the task and preserved the work already completed in this run."
+                .to_string()
+        } else {
+            format!("I made progress on the task. {tool_summary}")
+        };
+        let mut checkpoint = ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request,
+            completed_work: truncate_checkpoint_field(&completed_work),
+            pending_work: truncate_checkpoint_field(
+                "It still needs to resume from the latest useful state, finish the remaining steps, and produce the final answer without repeating completed work.",
+            ),
+            resume_hint: truncate_checkpoint_field(
+                "Resume from the latest tool results in this conversation. Do not restart from scratch; reuse the completed work and focus only on the remaining steps.",
+            ),
+            user_message: String::new(),
+            completed_iterations,
+            max_iterations,
+            autonomous_approved,
+            continuation_target,
+        };
+        checkpoint.user_message =
+            build_user_facing_continuation_message(&checkpoint, ask_to_continue, is_spanish);
+        checkpoint
+    }
+}
+
+fn parse_continuation_checkpoint_response(
+    raw: &str,
+    history: &[ChatMessage],
+    completed_iterations: usize,
+    max_iterations: usize,
+) -> ContinuationCheckpoint {
+    let trimmed = raw.trim();
+    let candidate = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(str::trim)
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+
+    let parsed = serde_json::from_str::<ContinuationCheckpointDraft>(candidate).ok();
+    let Some(parsed) = parsed else {
+        return fallback_continuation_checkpoint(history, completed_iterations, max_iterations);
+    };
+
+    let fallback = fallback_continuation_checkpoint(history, completed_iterations, max_iterations);
+    let continuation_target =
+        infer_continuation_target(history, Some(&parsed)).or(fallback.continuation_target.clone());
+
+    let completed_work = if parsed.completed_work.trim().is_empty() {
+        fallback.completed_work.clone()
+    } else {
+        truncate_checkpoint_field(&parsed.completed_work)
+    };
+    let pending_work = if parsed.pending_work.trim().is_empty() {
+        fallback.pending_work.clone()
+    } else {
+        truncate_checkpoint_field(&parsed.pending_work)
+    };
+    let resume_hint = if parsed.resume_hint.trim().is_empty() {
+        fallback.resume_hint.clone()
+    } else {
+        truncate_checkpoint_field(&parsed.resume_hint)
+    };
+    let mut checkpoint = ContinuationCheckpoint {
+        reason: "max_tool_iterations".to_string(),
+        original_request: fallback.original_request.clone(),
+        completed_work,
+        pending_work,
+        resume_hint,
+        user_message: String::new(),
+        completed_iterations,
+        max_iterations,
+        autonomous_approved: fallback.autonomous_approved,
+        continuation_target,
+    };
+    checkpoint.user_message = sanitized_model_user_message(&parsed.user_message).unwrap_or_else(
+        || {
+            build_user_facing_continuation_message(
+                &checkpoint,
+                !autonomous_continuation_authorized(history),
+                checkpoint_fallback_is_spanish(history),
+            )
+        },
+    );
+    checkpoint
+}
+
+pub(crate) async fn build_tool_loop_continuation_checkpoint(
+    provider: &dyn Provider,
+    model: &str,
+    history: &[ChatMessage],
+    completed_iterations: usize,
+    max_iterations: usize,
+) -> (ContinuationCheckpoint, Option<LlmCallUsage>) {
+    let source_messages = checkpoint_source_messages(history);
+    let transcript = build_compaction_transcript(&source_messages);
+    let truncated_transcript =
+        truncate_with_ellipsis(&transcript, CONTINUATION_CHECKPOINT_SOURCE_CHAR_LIMIT);
+    let prompt_messages = vec![
+        ChatMessage::system(CONTINUATION_CHECKPOINT_SYSTEM_PROMPT),
+        ChatMessage::user(truncated_transcript.clone()),
+    ];
+    let prompt_breakdown = analyze_prompt_messages(&prompt_messages);
+    let started_at = Instant::now();
+
+    let response = provider
+        .chat_with_system(
+            Some(CONTINUATION_CHECKPOINT_SYSTEM_PROMPT),
+            &truncated_transcript,
+            model,
+            0.1,
+        )
+        .await;
+
+    match response {
+        Ok(raw) => {
+            let usage = LlmCallUsage {
+                iteration: completed_iterations + 1,
+                #[allow(clippy::cast_possible_truncation)]
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                input_tokens: Some(prompt_breakdown.estimated_total_tokens),
+                output_tokens: Some(estimated_tokens_from_chars(raw.chars().count())),
+                cached_input_tokens: None,
+                prompt: prompt_breakdown,
+            };
+            (
+                parse_continuation_checkpoint_response(
+                    &raw,
+                    history,
+                    completed_iterations,
+                    max_iterations,
+                ),
+                Some(usage),
+            )
+        }
+        Err(_) => (
+            fallback_continuation_checkpoint(history, completed_iterations, max_iterations),
+            None,
+        ),
+    }
 }
 
 fn extract_artifact_references(text: &str) -> Vec<String> {
@@ -3082,6 +4277,8 @@ pub(crate) async fn agent_turn(
         activated_tools,
         skill_activations,
         model_switch_callback,
+        None,
+        None,
     )
     .await?;
     Ok(outcome.output)
@@ -3217,6 +4414,134 @@ fn maybe_inject_channel_delivery_defaults(
     }
 }
 
+fn maybe_inject_delegate_resume_metadata(
+    history: &[ChatMessage],
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    continuation_scope: Option<&str>,
+) {
+    if tool_name != "delegate" {
+        return;
+    }
+
+    let Some(args) = tool_args.as_object_mut() else {
+        return;
+    };
+
+    if let Some(scope_key) = continuation_scope
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.entry("_continuation_scope".to_string())
+            .or_insert_with(|| serde_json::Value::String(scope_key.to_string()));
+    }
+
+    let resume_requested = latest_user_message(history)
+        .map(looks_like_continue_request)
+        .unwrap_or(false)
+        || history.iter().rev().take(6).any(|message| {
+            message.role == "system"
+                && message
+                    .content
+                    .contains("AUTONOMOUS CONTINUATION DIRECTIVE:")
+        });
+
+    if resume_requested {
+        args.entry("_resume_request".to_string())
+            .or_insert_with(|| serde_json::Value::Bool(true));
+    }
+}
+
+fn normalize_tool_output_for_history(
+    tool_name: &str,
+    output: &str,
+    auto_continue_delegate_checkpoints: bool,
+) -> (String, Option<ContinuationCheckpoint>) {
+    if tool_name == "delegate" {
+        if let Some(checkpoint) = extract_continuation_checkpoint(output) {
+            let prefix = if auto_continue_delegate_checkpoints {
+                "[Delegate continuation checkpoint retained for autonomous continuation]"
+            } else {
+                "[Delegate continuation checkpoint]"
+            };
+            return (prefix.to_string(), Some(checkpoint));
+        }
+    }
+
+    (
+        compact_tool_output_for_history(output),
+        None,
+    )
+}
+
+fn build_autonomous_delegate_continuation_message(
+    checkpoint: &ContinuationCheckpoint,
+) -> ChatMessage {
+    let completed_work = truncate_autonomous_continuation_field(&checkpoint.completed_work);
+    let pending_work = truncate_autonomous_continuation_field(&checkpoint.pending_work);
+    let target_section =
+        render_continuation_target_section(checkpoint.continuation_target.as_ref());
+
+    ChatMessage::system(format!(
+        "AUTONOMOUS CONTINUATION DIRECTIVE:\n\
+         - This is not a user-visible message.\n\
+         - The user explicitly authorized continuing without more permission requests.\n\
+         - A delegated agent returned a continuation checkpoint, so the delegated work is NOT complete.\n\
+         - Do not ask the user for confirmation and do not claim the task is finished yet.\n\
+         - Continue immediately from the saved checkpoint and only answer the user after the delegated work completes or a concrete external blocker remains.\n\n\
+         [Completed work]\n{}\n\n\
+         [Pending work]\n{}{}",
+        completed_work,
+        pending_work,
+        target_section
+    ))
+}
+
+fn autonomous_root_continuation_attempts(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .filter(|message| {
+            message.role == "system"
+                && message
+                    .content
+                    .contains(AUTONOMOUS_ROOT_CONTINUATION_MARKER)
+        })
+        .count()
+}
+
+fn build_autonomous_root_continuation_message(
+    checkpoint: &ContinuationCheckpoint,
+    attempt: usize,
+) -> ChatMessage {
+    let completed_work = truncate_autonomous_continuation_field(&checkpoint.completed_work);
+    let pending_work = truncate_autonomous_continuation_field(&checkpoint.pending_work);
+    let resume_hint = truncate_autonomous_continuation_field(&checkpoint.resume_hint);
+    let target_section =
+        render_continuation_target_section(checkpoint.continuation_target.as_ref());
+
+    ChatMessage::system(format!(
+        "{AUTONOMOUS_ROOT_CONTINUATION_MARKER}\n\
+         - This is not a user-visible message.\n\
+         - The user explicitly authorized continuing without more permission requests.\n\
+         - This run exhausted its current tool-iteration batch and must resume from the saved checkpoint.\n\
+         - Do not ask the user for confirmation and do not claim the task is finished yet.\n\
+         - Reuse the completed work below and focus only on the remaining steps.\n\
+         - Keep tool usage tight and avoid re-reading or redoing work unless required.\n\
+         - This is autonomous continuation batch {attempt} of {MAX_AUTONOMOUS_ROOT_CONTINUATIONS}.\n\n\
+         [Completed work]\n{}\n\n\
+         [Pending work]\n{}\n\n\
+         [Resume hint]\n{}{}",
+        completed_work,
+        pending_work,
+        resume_hint,
+        target_section
+    ))
+}
+
+fn autonomous_continue_user_message() -> ChatMessage {
+    ChatMessage::user(format!("{AUTONOMOUS_CONTINUATION_USER_PREFIX}\ncontinue"))
+}
+
 async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -3305,6 +4630,85 @@ async fn execute_one_tool(
             })
         }
     }
+}
+
+fn build_delegate_autonomous_resume_args(
+    original_args: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut args = original_args.clone();
+    let object = args.as_object_mut()?;
+    object.insert("_resume_request".to_string(), serde_json::Value::Bool(true));
+    Some(args)
+}
+
+async fn continue_delegate_tool_autonomously(
+    call: &ParsedToolCall,
+    mut outcome: ToolExecutionOutcome,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    channel_name: &str,
+    provider_name: &str,
+    model: &str,
+    turn_id: &str,
+    iteration: usize,
+) -> Result<ToolExecutionOutcome> {
+    if call.name != "delegate" || extract_continuation_checkpoint(&outcome.output).is_none() {
+        return Ok(outcome);
+    }
+
+    let Some(resume_args) = build_delegate_autonomous_resume_args(&call.arguments) else {
+        return Ok(outcome);
+    };
+
+    let mut total_duration = outcome.duration;
+
+    for attempt in 1..=MAX_AUTONOMOUS_DELEGATE_CONTINUATIONS {
+        runtime_trace::record_event(
+            "delegate_autonomous_resume",
+            Some(channel_name),
+            Some(provider_name),
+            Some(model),
+            Some(turn_id),
+            None,
+            None,
+            serde_json::json!({
+                "iteration": iteration + 1,
+                "attempt": attempt,
+                "tool": call.name,
+            }),
+        );
+
+        if let Some(tx) = on_delta {
+            let _ = tx
+                .send("⏭️ delegate: continuing from saved progress...\n".to_string())
+                .await;
+        }
+
+        let resumed_outcome = execute_one_tool(
+            &call.name,
+            resume_args.clone(),
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token,
+        )
+        .await?;
+
+        total_duration += resumed_outcome.duration;
+        outcome = ToolExecutionOutcome {
+            duration: total_duration,
+            ..resumed_outcome
+        };
+
+        if extract_continuation_checkpoint(&outcome.output).is_none() {
+            break;
+        }
+    }
+
+    Ok(outcome)
 }
 
 struct ToolExecutionOutcome {
@@ -3453,7 +4857,24 @@ pub(crate) async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     skill_activations: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
+    workspace_dir: Option<&Path>,
+    continuation_scope: Option<&str>,
 ) -> Result<AgentTurnOutcome> {
+    maybe_inject_resume_from_checkpoint(history);
+    if let (Some(workspace_dir), Some(scope_key)) = (
+        workspace_dir,
+        continuation_scope
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        maybe_inject_resume_from_persistent_checkpoint(
+            history,
+            workspace_dir,
+            scope_key,
+            ROOT_TASK_CHECKPOINT_AGENT,
+        );
+    }
+
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -3933,8 +5354,21 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
+            if let (Some(workspace_dir), Some(scope_key)) = (
+                workspace_dir,
+                continuation_scope
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            ) {
+                let _ = task_checkpoint_store::clear_checkpoint(
+                    workspace_dir,
+                    scope_key,
+                    ROOT_TASK_CHECKPOINT_AGENT,
+                );
+            }
             return Ok(AgentTurnOutcome {
                 output: display_text,
+                continuation: None,
                 requests,
             });
         }
@@ -3958,8 +5392,11 @@ pub(crate) async fn run_tool_call_loop(
         //
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
+        let auto_continue_delegate_checkpoints =
+            autonomous_continuation_authorized(history);
         let mut tool_results = String::new();
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
+        let mut delegate_checkpoint_for_turn: Option<ContinuationCheckpoint> = None;
         let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
             (0..tool_calls.len()).map(|_| None).collect();
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
@@ -4025,6 +5462,12 @@ pub(crate) async fn run_tool_call_loop(
                 &mut tool_args,
                 channel_name,
                 channel_reply_target,
+            );
+            maybe_inject_delegate_resume_metadata(
+                history,
+                &tool_name,
+                &mut tool_args,
+                continuation_scope,
             );
 
             // ── Approval hook ────────────────────────────────
@@ -4181,6 +5624,7 @@ pub(crate) async fn run_tool_call_loop(
             .zip(executable_calls.iter())
             .zip(executed_outcomes.into_iter())
         {
+            let outcome = outcome;
             if outcome.success {
                 if call.name == "cron_add" {
                     scheduled_delivery_created = true;
@@ -4257,7 +5701,14 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            let compact_output = compact_tool_output_for_history(&outcome.output);
+            let (compact_output, delegate_checkpoint) = normalize_tool_output_for_history(
+                &tool_name,
+                &outcome.output,
+                auto_continue_delegate_checkpoints,
+            );
+            if delegate_checkpoint_for_turn.is_none() {
+                delegate_checkpoint_for_turn = delegate_checkpoint;
+            }
             individual_results.push((tool_call_id, compact_output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -4316,6 +5767,123 @@ pub(crate) async fn run_tool_call_loop(
             );
             return Err(requested_switch.into());
         }
+
+        if let Some(checkpoint) = delegate_checkpoint_for_turn {
+            if auto_continue_delegate_checkpoints {
+                history.push(build_autonomous_delegate_continuation_message(&checkpoint));
+                continue;
+            }
+
+            let continuation_message = continuation_scope
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|scope_key| {
+                    render_continuation_history_message_with_reference(
+                        scope_key,
+                        ROOT_TASK_CHECKPOINT_AGENT,
+                        &checkpoint.user_message,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    render_continuation_history_message(&checkpoint, &checkpoint.user_message)
+                });
+            history.push(ChatMessage::assistant(continuation_message));
+
+            if let (Some(workspace_dir), Some(scope_key)) = (
+                workspace_dir,
+                continuation_scope
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            ) {
+                let _ = task_checkpoint_store::save_checkpoint(
+                    workspace_dir,
+                    scope_key,
+                    ROOT_TASK_CHECKPOINT_AGENT,
+                    &checkpoint,
+                );
+            }
+
+            runtime_trace::record_event(
+                "delegate_continuation_checkpoint",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(&turn_id),
+                Some(true),
+                Some("delegate returned a continuation checkpoint and the parent surfaced it directly"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "completed_work": checkpoint.completed_work,
+                    "pending_work": checkpoint.pending_work,
+                }),
+            );
+
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                let _ = tx.send(checkpoint.user_message.clone()).await;
+            }
+
+            return Ok(AgentTurnOutcome {
+                output: checkpoint.user_message.clone(),
+                continuation: Some(checkpoint),
+                requests,
+            });
+        }
+    }
+
+    let autonomous_root_attempts = autonomous_root_continuation_attempts(history);
+    let auto_continue_root_checkpoint = autonomous_continuation_authorized(history)
+        && autonomous_root_attempts < MAX_AUTONOMOUS_ROOT_CONTINUATIONS;
+
+    if let Some(ref tx) = on_delta {
+        let progress = if auto_continue_root_checkpoint {
+            "⏭️ Iteration limit reached; continuing automatically from the saved checkpoint...\n"
+        } else {
+            "⏸️ Iteration limit reached; preparing a continuation checkpoint...\n"
+        };
+        let _ = tx.send(progress.to_string()).await;
+    }
+
+    let (checkpoint, checkpoint_usage) =
+        build_tool_loop_continuation_checkpoint(
+            provider,
+            model,
+            history,
+            max_iterations,
+            max_iterations,
+        )
+        .await;
+    if let Some(usage) = checkpoint_usage {
+        requests.push(usage);
+    }
+
+    let continuation_message = continuation_scope
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|scope_key| {
+            render_continuation_history_message_with_reference(
+                scope_key,
+                ROOT_TASK_CHECKPOINT_AGENT,
+                &checkpoint.user_message,
+            )
+        })
+        .unwrap_or_else(|| {
+            render_continuation_history_message(&checkpoint, &checkpoint.user_message)
+        });
+    history.push(ChatMessage::assistant(continuation_message));
+
+    if let (Some(workspace_dir), Some(scope_key)) = (
+        workspace_dir,
+        continuation_scope
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        let _ = task_checkpoint_store::save_checkpoint(
+            workspace_dir,
+            scope_key,
+            ROOT_TASK_CHECKPOINT_AGENT,
+            &checkpoint,
+        );
     }
 
     runtime_trace::record_event(
@@ -4324,13 +5892,85 @@ pub(crate) async fn run_tool_call_loop(
         Some(provider_name),
         Some(model),
         Some(&turn_id),
-        Some(false),
-        Some("agent exceeded maximum tool iterations"),
+        Some(true),
+        Some("agent reached maximum tool iterations and returned a continuation checkpoint"),
         serde_json::json!({
             "max_iterations": max_iterations,
+            "completed_work": checkpoint.completed_work,
+            "pending_work": checkpoint.pending_work,
         }),
     );
-    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+
+    if auto_continue_root_checkpoint {
+        runtime_trace::record_event(
+            "tool_loop_exhausted_autonomous_continue",
+            Some(channel_name),
+            Some(provider_name),
+            Some(model),
+            Some(&turn_id),
+            Some(true),
+            Some("agent reached the iteration limit and resumed automatically from a saved checkpoint"),
+            serde_json::json!({
+                "max_iterations": max_iterations,
+                "autonomous_root_attempt": autonomous_root_attempts + 1,
+                "completed_work": checkpoint.completed_work,
+                "pending_work": checkpoint.pending_work,
+            }),
+        );
+
+        history.push(build_autonomous_root_continuation_message(
+            &checkpoint,
+            autonomous_root_attempts + 1,
+        ));
+        history.push(autonomous_continue_user_message());
+
+        let mut resumed = Box::pin(run_tool_call_loop(
+            provider,
+            history,
+            tools_registry,
+            skills,
+            tool_descriptions,
+            skills_prompt_mode,
+            observer,
+            provider_name,
+            model,
+            temperature,
+            silent,
+            approval,
+            channel_name,
+            channel_reply_target,
+            multimodal_config,
+            max_tool_iterations,
+            cancellation_token,
+            on_delta,
+            hooks,
+            excluded_tools,
+            dedup_exempt_tools,
+            activated_tools,
+            skill_activations,
+            model_switch_callback,
+            workspace_dir,
+            continuation_scope,
+        ))
+        .await?;
+        requests.append(&mut resumed.requests);
+        return Ok(AgentTurnOutcome {
+            output: resumed.output,
+            continuation: resumed.continuation,
+            requests,
+        });
+    }
+
+    if let Some(ref tx) = on_delta {
+        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+        let _ = tx.send(checkpoint.user_message.clone()).await;
+    }
+
+    Ok(AgentTurnOutcome {
+        output: checkpoint.user_message.clone(),
+        continuation: Some(checkpoint),
+        requests,
+    })
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -4756,6 +6396,8 @@ pub async fn run(
                 activated_handle.as_ref(),
                 Some(&skill_activations),
                 Some(model_switch_callback.clone()),
+                Some(config.workspace_dir.as_path()),
+                None,
             )
             .await
             {
@@ -5003,6 +6645,8 @@ pub async fn run(
                     activated_handle.as_ref(),
                     Some(&skill_activations),
                     Some(model_switch_callback.clone()),
+                    Some(config.workspace_dir.as_path()),
+                    None,
                 )
                 .await
                 {
@@ -5427,6 +7071,8 @@ async fn run_single_turn_with_report(
             activated_handle.as_ref(),
             Some(&skill_activations),
             Some(model_switch_callback.clone()),
+            Some(config.workspace_dir.as_path()),
+            None,
         )
         .await
         {
@@ -5827,6 +7473,8 @@ pub async fn process_message(
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         Some(&skill_activations),
+        None,
+        Some(config.workspace_dir.as_path()),
         None,
     )
     .await?;
@@ -6428,6 +8076,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -6482,6 +8132,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -6527,6 +8179,8 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
             None,
             None,
             None,
@@ -6664,6 +8318,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -6735,6 +8391,8 @@ mod tests {
             None,
             None,
             Some(get_model_switch_state()),
+            None,
+            None,
         )
         .await
         .expect_err("model switch should interrupt the loop before another LLM response");
@@ -6804,6 +8462,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6870,6 +8530,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6928,6 +8590,8 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
             None,
             None,
             None,
@@ -7004,6 +8668,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -7065,6 +8731,8 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
+            None,
             None,
             None,
             None,
@@ -7152,6 +8820,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -7210,6 +8880,8 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
             None,
             None,
             None,
@@ -7295,6 +8967,8 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
             None,
             None,
             None,
@@ -8218,6 +9892,13 @@ Tail"#;
     #[test]
     fn response_claims_schedule_success_detects_actual_schedule_confirmation() {
         let response = "Ya esta programado y te avisare manana.";
+
+        assert!(response_claims_schedule_success(response));
+    }
+
+    #[test]
+    fn response_claims_schedule_success_detects_configured_recurring_service_claims() {
+        let response = "El proceso ya quedó configurado y funcionando cada 2 minutos.";
 
         assert!(response_claims_schedule_success(response));
     }
@@ -9590,6 +11271,8 @@ Let me check the result."#;
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("tool loop should complete");
@@ -9666,5 +11349,581 @@ Let me check the result."#;
         let allowed: Vec<String> = vec![];
         let result = filter_by_allowed_tools(specs, Some(&allowed));
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn continuation_checkpoint_history_message_round_trips() {
+        let checkpoint = ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "Build the feature".to_string(),
+            completed_work: "Inspected the repo and updated the main service.".to_string(),
+            pending_work: "Need to finish the remaining integration path.".to_string(),
+            resume_hint: "Resume from the latest tool results and avoid redoing the inspection."
+                .to_string(),
+            user_message: "This task is complex. Do you want me to keep going?".to_string(),
+            completed_iterations: 3,
+            max_iterations: 3,
+            autonomous_approved: false,
+            continuation_target: None,
+        };
+
+        let message = render_continuation_history_message(&checkpoint, &checkpoint.user_message);
+        let parsed = extract_continuation_checkpoint(&message)
+            .expect("checkpoint block should be readable from history message");
+
+        assert_eq!(parsed.original_request, checkpoint.original_request);
+        assert_eq!(parsed.pending_work, checkpoint.pending_work);
+        assert!(message.contains("Do you want me to keep going?"));
+    }
+
+    #[test]
+    fn continuation_checkpoint_history_reference_stays_compact() {
+        let message = render_continuation_history_message_with_reference(
+            "session-42",
+            ROOT_TASK_CHECKPOINT_AGENT,
+            "Do you want me to keep going?",
+        );
+
+        assert!(message.contains(CONTINUATION_CHECKPOINT_REF_OPEN_TAG));
+        assert!(!message.contains(CONTINUATION_CHECKPOINT_OPEN_TAG));
+        assert!(message.contains("session-42"));
+        assert!(message.contains("Do you want me to keep going?"));
+    }
+
+    #[test]
+    fn maybe_inject_resume_from_checkpoint_inserts_system_message_before_continue_request() {
+        let checkpoint = ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "Refactor the handler".to_string(),
+            completed_work: "Refactored the first half.".to_string(),
+            pending_work: "Need to finish the remaining branches.".to_string(),
+            resume_hint: "Continue from the saved checkpoint.".to_string(),
+            user_message: "The task is complex. Do you want me to keep going?".to_string(),
+            completed_iterations: 2,
+            max_iterations: 2,
+            autonomous_approved: false,
+            continuation_target: None,
+        };
+
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant(render_continuation_history_message(
+                &checkpoint,
+                &checkpoint.user_message,
+            )),
+            ChatMessage::user("continue"),
+        ];
+
+        let injected = maybe_inject_resume_from_checkpoint(&mut history);
+        assert!(injected);
+        assert_eq!(history[2].role, "system");
+        assert!(history[2]
+            .content
+            .contains("CONTINUATION RESUME DIRECTIVE:"));
+        assert_eq!(history[3].role, "user");
+    }
+
+    #[test]
+    fn maybe_inject_resume_from_persistent_checkpoint_reads_store() {
+        let tmp = tempfile::TempDir::new().expect("temp dir should exist");
+        let checkpoint = ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "Implement the service".to_string(),
+            completed_work: "Scaffold created.".to_string(),
+            pending_work: "Need to finish the runtime wiring.".to_string(),
+            resume_hint: "Resume from the saved checkpoint.".to_string(),
+            user_message: "Do you want me to keep going?".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: true,
+            continuation_target: None,
+        };
+        crate::agent::task_checkpoint_store::save_checkpoint(
+            tmp.path(),
+            "session-1::delegate::builder",
+            crate::agent::task_checkpoint_store::ROOT_TASK_CHECKPOINT_AGENT,
+            &checkpoint,
+        )
+        .expect("checkpoint should persist");
+
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("continue"),
+        ];
+
+        let injected = maybe_inject_resume_from_persistent_checkpoint(
+            &mut history,
+            tmp.path(),
+            "session-1::delegate::builder",
+            crate::agent::task_checkpoint_store::ROOT_TASK_CHECKPOINT_AGENT,
+        );
+
+        assert!(injected);
+        assert_eq!(history[1].role, "system");
+        assert!(history[1].content.contains("CONTINUATION RESUME DIRECTIVE:"));
+        assert_eq!(history[2].role, "user");
+    }
+
+    #[test]
+    fn infer_continuation_target_detects_service_job_slug_from_transcript() {
+        let target = infer_continuation_target_from_texts([
+            "tenant-app/server/jobs/infobae-headlines-csv/job.js",
+            "python3 tools/tenant_service_builder.py status --name \"infobae-headlines-csv\"",
+            "node tools/tenant_job_runner.mjs invoke --job infobae-headlines-csv",
+        ])
+        .expect("service job slug should be inferred");
+
+        assert_eq!(target.kind, CONTINUATION_TARGET_KIND_SERVICE_JOB);
+        assert_eq!(target.id, "infobae-headlines-csv");
+    }
+
+    #[test]
+    fn build_resume_from_checkpoint_message_includes_continuation_target() {
+        let checkpoint = ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "Implement the service".to_string(),
+            completed_work: "Scaffold created.".to_string(),
+            pending_work: "Need to finish the runtime wiring.".to_string(),
+            resume_hint: "Resume from the saved checkpoint.".to_string(),
+            user_message: "Do you want me to keep going?".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: true,
+            continuation_target: Some(ContinuationTarget {
+                kind: CONTINUATION_TARGET_KIND_SERVICE_JOB.to_string(),
+                id: "infobae-headlines-csv".to_string(),
+            }),
+        };
+
+        let message = build_resume_from_checkpoint_message(&checkpoint);
+
+        assert!(message.content.contains("[Continuation target]"));
+        assert!(message.content.contains("kind: service_job"));
+        assert!(message.content.contains("id: infobae-headlines-csv"));
+        assert!(message.content.contains("canonical_resume_signal: EXISTING_JOB: infobae-headlines-csv"));
+    }
+
+    #[test]
+    fn latest_effective_original_request_ignores_runtime_user_messages() {
+        let history = vec![
+            ChatMessage::user("Implement the process end to end"),
+            ChatMessage::user("[Tool results]\n<tool_result name=\"shell\">ok</tool_result>"),
+            ChatMessage::user(format!("{AUTONOMOUS_CONTINUATION_USER_PREFIX}\ncontinue")),
+        ];
+
+        assert_eq!(
+            latest_effective_original_request(&history).as_deref(),
+            Some("Implement the process end to end")
+        );
+    }
+
+    #[test]
+    fn user_preapproved_autonomous_continuation_ignores_runtime_user_messages() {
+        let history = vec![
+            ChatMessage::user("Dale y no preguntes mas"),
+            ChatMessage::user("[Tool results]\n<tool_result name=\"delegate\">checkpoint</tool_result>"),
+            ChatMessage::user(format!("{AUTONOMOUS_CONTINUATION_USER_PREFIX}\ncontinue")),
+        ];
+
+        assert!(user_preapproved_autonomous_continuation(&history));
+    }
+
+    #[test]
+    fn user_preapproved_autonomous_continuation_matches_stage_phrases() {
+        for message in [
+            "Dale y no preguntes mas",
+            "seguí sin pedir permiso",
+            "keep going without asking",
+        ] {
+            let history = vec![ChatMessage::user(message)];
+            assert!(
+                user_preapproved_autonomous_continuation(&history),
+                "expected phrase to authorize autonomous continuation: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn autonomous_continuation_authorized_uses_resume_directive_flag() {
+        let checkpoint = ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "Implement the service".to_string(),
+            completed_work: "Scaffold created.".to_string(),
+            pending_work: "Need to finish the runtime wiring.".to_string(),
+            resume_hint: "Resume from the saved checkpoint.".to_string(),
+            user_message: "Do you want me to keep going?".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: true,
+            continuation_target: None,
+        };
+        let history = vec![
+            ChatMessage::system("system"),
+            build_resume_from_checkpoint_message(&checkpoint),
+            ChatMessage::user("si"),
+        ];
+
+        assert!(autonomous_continuation_authorized(&history));
+    }
+
+    #[test]
+    fn maybe_inject_delegate_resume_metadata_marks_autonomous_delegate_retries() {
+        let history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("Implement the workflow y no preguntes mas"),
+            ChatMessage::assistant("delegate call"),
+            ChatMessage::user("[Tool results]\n[Delegate continuation checkpoint retained for autonomous continuation]"),
+            ChatMessage::system(
+                "AUTONOMOUS CONTINUATION DIRECTIVE:\n- Continue immediately from the saved checkpoint."
+            ),
+        ];
+        let mut args = serde_json::json!({
+            "agent": "service_builder",
+            "prompt": "Continue the implementation"
+        });
+
+        maybe_inject_delegate_resume_metadata(
+            &history,
+            "delegate",
+            &mut args,
+            Some("session-1"),
+        );
+
+        let object = args.as_object().expect("args should stay as object");
+        assert_eq!(
+            object
+                .get("_resume_request")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            object
+                .get("_continuation_scope")
+                .and_then(serde_json::Value::as_str),
+            Some("session-1")
+        );
+    }
+
+    struct DelegateCheckpointTool {
+        checkpoint: ContinuationCheckpoint,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl DelegateCheckpointTool {
+        fn new(checkpoint: ContinuationCheckpoint, invocations: Arc<AtomicUsize>) -> Self {
+            Self {
+                checkpoint,
+                invocations,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for DelegateCheckpointTool {
+        fn name(&self) -> &str {
+            "delegate"
+        }
+
+        fn description(&self) -> &str {
+            "Returns a synthetic delegate continuation checkpoint for regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "prompt": {"type": "string"}
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            let rendered = render_continuation_history_message(
+                &self.checkpoint,
+                &self.checkpoint.user_message,
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!(
+                    "[Agent 'service_builder' (mock-provider/mock-model, agentic, continuation checkpoint)]\n{rendered}"
+                ),
+                error: None,
+            })
+        }
+    }
+
+    struct ResumableDelegateTool {
+        checkpoint: ContinuationCheckpoint,
+        completion_output: String,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl ResumableDelegateTool {
+        fn new(
+            checkpoint: ContinuationCheckpoint,
+            completion_output: &str,
+            invocations: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                checkpoint,
+                completion_output: completion_output.to_string(),
+                invocations,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ResumableDelegateTool {
+        fn name(&self) -> &str {
+            "delegate"
+        }
+
+        fn description(&self) -> &str {
+            "Returns a checkpoint once, then completes on the next autonomous resume"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "prompt": {"type": "string"}
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let invocation = self.invocations.fetch_add(1, Ordering::SeqCst);
+            if invocation == 0 {
+                let rendered = render_continuation_history_message(
+                    &self.checkpoint,
+                    &self.checkpoint.user_message,
+                );
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: format!(
+                        "[Agent 'service_builder' (mock-provider/mock-model, agentic, continuation checkpoint)]\n{rendered}"
+                    ),
+                    error: None,
+                })
+            } else {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: self.completion_output.clone(),
+                    error: None,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_surfaces_delegate_checkpoint_without_rephrasing() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"Implement it"}}
+</tool_call>"#,
+        ]);
+        let checkpoint = ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "Implement it".to_string(),
+            completed_work: "Built the base job.".to_string(),
+            pending_work: "Need to validate the final delivery.".to_string(),
+            resume_hint: "Resume from the saved delegate checkpoint.".to_string(),
+            user_message: "I got this far: Built the base job.\n\nStill pending: Need to validate the final delivery.\n\nI can continue from this point without redoing the work so far. Do you want me to continue?".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: false,
+            continuation_target: None,
+        };
+        let delegate_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelegateCheckpointTool::new(
+            checkpoint.clone(),
+            delegate_invocations.clone(),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("Implement the workflow"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &NoopObserver,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should surface the delegate checkpoint");
+
+        assert_eq!(delegate_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(result.output, checkpoint.user_message);
+        assert!(result.continuation.is_some());
+        assert!(history.iter().any(|message| {
+            message.role == "assistant"
+                && message.content.contains(CONTINUATION_CHECKPOINT_OPEN_TAG)
+        }));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_autonomously_continues_delegate_checkpoint_when_preapproved() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"Implement it"}}
+</tool_call>"#,
+            "Completed end to end.",
+        ]);
+        let delegate_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ResumableDelegateTool::new(
+            ContinuationCheckpoint {
+                reason: "max_tool_iterations".to_string(),
+                original_request: "Implement it".to_string(),
+                completed_work: "Built the base job.".to_string(),
+                pending_work: "Need to validate the final delivery.".to_string(),
+                resume_hint: "Resume from the saved delegate checkpoint.".to_string(),
+                user_message: "Checkpoint".to_string(),
+                completed_iterations: 5,
+                max_iterations: 5,
+                autonomous_approved: true,
+                continuation_target: None,
+            },
+            "Delegate completed the remaining work.",
+            delegate_invocations.clone(),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("Implement the workflow and no more permission requests"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &NoopObserver,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should continue past the delegate checkpoint");
+
+        assert_eq!(delegate_invocations.load(Ordering::SeqCst), 2);
+        assert_eq!(result.output, "Completed end to end.");
+        assert!(result.continuation.is_none());
+        assert!(history.iter().any(|message| {
+            message.role == "system"
+                && message.content.contains("AUTONOMOUS CONTINUATION DIRECTIVE:")
+        }));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_autonomously_continues_root_checkpoint_when_preapproved() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"work"}}
+</tool_call>"#,
+            "Completed end to end.",
+        ]);
+        let tool_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            tool_invocations.clone(),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("Implement the workflow and no preguntes mas"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &NoopObserver,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            1,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should continue automatically after exhausting the root batch");
+
+        assert_eq!(tool_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(result.output, "Completed end to end.");
+        assert!(result.continuation.is_none());
+        assert!(history.iter().any(|message| {
+            message.role == "system"
+                && message
+                    .content
+                    .contains(AUTONOMOUS_ROOT_CONTINUATION_MARKER)
+        }));
+        assert!(!history.iter().any(|message| {
+            message.role == "assistant"
+                && message.content.contains(CONTINUATION_CHECKPOINT_OPEN_TAG)
+        }));
     }
 }
