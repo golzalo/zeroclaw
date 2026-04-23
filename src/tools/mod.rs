@@ -24,6 +24,7 @@ pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
 pub mod composio;
+pub mod content_extraction;
 pub mod content_search;
 pub mod cron_add;
 pub mod cron_list;

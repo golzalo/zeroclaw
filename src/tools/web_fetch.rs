@@ -1,17 +1,19 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
+use crate::tools::content_extraction::{extract_html_for_llm, HtmlOutputFormat};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Web fetch tool: fetches a web page and converts HTML to plain text for LLM consumption.
+/// Web fetch tool: fetches a web page and converts HTML for LLM consumption.
 ///
 /// Unlike `http_request` (an API client returning raw responses), this tool:
 /// - Only supports GET
 /// - Follows redirects (up to 10)
-/// - Converts HTML to clean plain text via `nanohtml2text`
+/// - Extracts main HTML content via `rs-trafilatura`
+/// - Converts HTML to Markdown via `html-to-markdown-rs`
 /// - Passes through text/plain, text/markdown, and application/json as-is
 /// - Sets a descriptive User-Agent
 pub struct WebFetchTool {
@@ -87,8 +89,8 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a web page and return its content as clean plain text. \
-         HTML pages are automatically converted to readable text. \
+        "Fetch a web page and return its content as readable Markdown or text. \
+         HTML pages are automatically extracted and converted to readable Markdown by default. \
          JSON and plain text responses are returned as-is. \
          Only GET requests; follows redirects. \
          Security: allowlist-only domains, no local/private hosts."
@@ -101,6 +103,12 @@ impl Tool for WebFetchTool {
                 "url": {
                     "type": "string",
                     "description": "The HTTP or HTTPS URL to fetch"
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["markdown", "text"],
+                    "default": "markdown",
+                    "description": "Output format for HTML responses. Non-HTML responses are returned as-is."
                 }
             },
             "required": ["url"]
@@ -120,6 +128,18 @@ impl Tool for WebFetchTool {
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
+
+        let html_output_format =
+            match HtmlOutputFormat::parse(args.get("format").and_then(|v| v.as_str())) {
+                Ok(format) => format,
+                Err(err) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(err.to_string()),
+                    })
+                }
+            };
 
         if !self.security.record_action() {
             return Ok(ToolResult {
@@ -249,7 +269,16 @@ impl Tool for WebFetchTool {
         };
 
         let text = if body_mode == "html" {
-            nanohtml2text::html2text(&body)
+            match extract_html_for_llm(&body, &url, html_output_format) {
+                Ok(text) => text,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to extract HTML content: {e}")),
+                    })
+                }
+            }
         } else {
             body
         };
@@ -549,12 +578,14 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("url")));
     }
 
-    // ── HTML to text conversion ──────────────────────────────────
+    // ── HTML conversion ──────────────────────────────────────────
 
     #[test]
-    fn html_to_text_conversion() {
+    fn html_to_markdown_conversion() {
         let html = "<html><body><h1>Title</h1><p>Hello <b>world</b></p></body></html>";
-        let text = nanohtml2text::html2text(html);
+        let text =
+            extract_html_for_llm(html, "https://example.com/page", HtmlOutputFormat::Markdown)
+                .unwrap();
         assert!(text.contains("Title"));
         assert!(text.contains("Hello"));
         assert!(text.contains("world"));
