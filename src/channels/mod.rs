@@ -3558,6 +3558,8 @@ async fn process_channel_message(
                 ctx.activated_tools.as_ref(),
                 Some(&skill_activations),
                 None,
+                Some(ctx.workspace_dir.as_ref()),
+                Some(history_key.as_str()),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3648,6 +3650,7 @@ async fn process_channel_message(
                     }
                 }
             }
+            let continuation = outcome.continuation.clone();
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = outcome.output;
             if let Some(hooks) = &ctx.hooks {
@@ -3743,10 +3746,19 @@ async fn process_channel_message(
             // added during run_tool_call_loop, so the LLM retains awareness
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
+            let persisted_response = if continuation.is_some() {
+                crate::agent::loop_::render_continuation_history_message_with_reference(
+                    &history_key,
+                    crate::agent::task_checkpoint_store::ROOT_TASK_CHECKPOINT_AGENT,
+                    &delivered_response,
+                )
             } else {
-                format!("{tool_summary}\n{delivered_response}")
+                delivered_response.clone()
+            };
+            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
+                persisted_response.clone()
+            } else {
+                format!("{tool_summary}\n{persisted_response}")
             };
 
             append_sender_turn(
@@ -7816,6 +7828,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_activity: Arc::new(Mutex::new(HashMap::new())),
             consolidation_prompt_file: None,
         });
+        let runtime_ctx_for_assertions = Arc::clone(&runtime_ctx);
 
         process_channel_message(
             runtime_ctx,
@@ -7837,7 +7850,23 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!sent_messages.is_empty());
         let reply = sent_messages.last().unwrap();
         assert!(reply.starts_with("chat-iter-fail:"));
-        assert!(reply.contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
+        assert!(!reply.contains("⚠️ Error:"));
+        assert!(reply.to_ascii_lowercase().contains("continue"));
+
+        let stored_history = runtime_ctx_for_assertions
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("test-channel_chat-iter-fail_bob")
+            .cloned()
+            .unwrap_or_default();
+        let persisted_assistant = stored_history
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        assert!(persisted_assistant.contains("<continuation_checkpoint>"));
     }
 
     struct NoopMemory;
@@ -9665,6 +9694,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            chat_purge_idle_time_secs: 0,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            consolidation_prompt_file: None,
         });
 
         process_channel_message(

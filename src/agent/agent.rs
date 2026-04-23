@@ -603,7 +603,8 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let mut messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            crate::agent::loop_::maybe_inject_resume_from_checkpoint(&mut messages);
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
             let cache_key = if self.temperature == 0.0 {
@@ -714,10 +715,25 @@ impl Agent {
             self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
+        let mut messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        crate::agent::loop_::maybe_inject_resume_from_checkpoint(&mut messages);
+        let (checkpoint, _usage) = crate::agent::loop_::build_tool_loop_continuation_checkpoint(
+            &*self.provider,
+            &effective_model,
+            &messages,
+            self.config.max_tool_iterations,
+            self.config.max_tool_iterations,
         )
+        .await;
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(
+                crate::agent::loop_::render_continuation_history_message(
+                    &checkpoint,
+                    &checkpoint.user_message,
+                ),
+            )));
+        self.trim_history();
+        Ok(checkpoint.user_message)
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
