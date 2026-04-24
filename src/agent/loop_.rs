@@ -33,7 +33,6 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
-
 const ARTIFACT_CREATION_HINTS: &[&str] = &[
     "create",
     "crear",
@@ -3099,7 +3098,7 @@ fn maybe_inject_channel_delivery_defaults(
 
     if !matches!(
         channel_name,
-        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "whatsapp"
     ) {
         return;
     }
