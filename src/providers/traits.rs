@@ -306,6 +306,31 @@ pub trait Provider: Send + Sync {
         temperature: f64,
     ) -> anyhow::Result<String>;
 
+    /// One-shot chat that preserves provider usage metadata when available.
+    async fn chat_with_system_response(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let mut messages = Vec::with_capacity(if system_prompt.is_some() { 2 } else { 1 });
+        if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            messages.push(ChatMessage::system(system_prompt));
+        }
+        messages.push(ChatMessage::user(message));
+
+        self.chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            model,
+            temperature,
+        )
+        .await
+    }
+
     /// Multi-turn conversation. Default implementation extracts the last user
     /// message and delegates to `chat_with_system`.
     async fn chat_with_history(

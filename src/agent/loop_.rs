@@ -7,6 +7,7 @@ use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
+use crate::remote_budget::RemoteBudgetClient;
 use crate::runtime;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
@@ -330,38 +331,20 @@ fn build_prompt_component_breakdown(
     }
 }
 
-fn pricing_for_model(
-    prices: &HashMap<String, crate::config::schema::ModelPricing>,
-    model_name: &str,
-) -> crate::config::schema::ModelPricing {
-    prices
-        .get(model_name)
-        .cloned()
-        .or_else(|| {
-            prices.iter().find_map(|(configured_model, pricing)| {
-                if configured_model.eq_ignore_ascii_case(model_name) {
-                    Some(pricing.clone())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or(crate::config::schema::ModelPricing {
-            input: 0.0,
-            output: 0.0,
-        })
-}
-
 fn compute_usage_cost_usd(
     prices: &HashMap<String, crate::config::schema::ModelPricing>,
     model_name: &str,
     input_tokens: u64,
+    cached_input_tokens: u64,
     output_tokens: u64,
 ) -> f64 {
-    let pricing = pricing_for_model(prices, model_name);
-    let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input.max(0.0);
-    let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output.max(0.0);
-    input_cost + output_cost
+    crate::cost::compute_usage_cost_usd(
+        prices,
+        model_name,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+    )
 }
 
 const SCHEDULING_FAILURE_HINTS: &[&str] = &[
@@ -987,7 +970,10 @@ fn apply_compaction_summary(
 async fn auto_compact_history(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
+    provider_name: &str,
     model: &str,
+    observer: &dyn Observer,
+    prices: &HashMap<String, crate::config::schema::ModelPricing>,
     max_history: usize,
     max_context_tokens: usize,
 ) -> Result<bool> {
@@ -1032,13 +1018,104 @@ async fn auto_compact_history(
         transcript
     );
 
-    let summary_raw = provider
-        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
+    observer.record_event(&ObserverEvent::LlmRequest {
+        provider: provider_name.to_string(),
+        model: model.to_string(),
+        messages_count: 2,
+    });
+    let llm_started_at = Instant::now();
+    let summary_raw = match provider
+        .chat_with_system_response(Some(summarizer_system), &summarizer_user, model, 0.2)
         .await
-        .unwrap_or_else(|_| {
+    {
+        Ok(resp) => {
+            let duration = llm_started_at.elapsed();
+            let resp_input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
+            let resp_output_tokens = resp.usage.as_ref().and_then(|usage| usage.output_tokens);
+            observer.record_event(&ObserverEvent::LlmResponse {
+                provider: provider_name.to_string(),
+                model: model.to_string(),
+                duration,
+                success: true,
+                error_message: None,
+                input_tokens: resp_input_tokens,
+                output_tokens: resp_output_tokens,
+            });
+
+            if let Some(usage) = resp.usage.as_ref() {
+                let input_tokens = usage.input_tokens.unwrap_or(0);
+                let output_tokens = usage.output_tokens.unwrap_or(0);
+                let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
+                let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                let cost_usd = compute_usage_cost_usd(
+                    prices,
+                    model,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                );
+
+                tracing::info!(
+                    provider = %provider_name,
+                    model = %model,
+                    scope_id = "history:compaction",
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    cost_usd,
+                    "background.llm_usage"
+                );
+
+                if (input_tokens > 0 || output_tokens > 0 || cached_input_tokens > 0)
+                    && cost_usd.is_finite()
+                {
+                    if let Some(remote_budget) = RemoteBudgetClient::from_env() {
+                        if let Err(error) = remote_budget
+                            .consume_explicit_usage(
+                                Some("history:compaction"),
+                                &format!("zeroclaw:history:compaction:{}", Uuid::new_v4()),
+                                "cli_housekeeping",
+                                provider_name,
+                                model,
+                                input_tokens,
+                                output_tokens,
+                                cached_input_tokens,
+                                duration_ms,
+                                cost_usd,
+                                serde_json::json!({
+                                    "operation": "history_compaction",
+                                    "estimatedHistoryTokens": estimated_tokens,
+                                    "sourceMessageCount": to_compact.len(),
+                                }),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                err = %error,
+                                "Failed to record history compaction remote budget usage"
+                            );
+                        }
+                    }
+                }
+            }
+
+            resp.text_or_empty().to_string()
+        }
+        Err(error) => {
+            observer.record_event(&ObserverEvent::LlmResponse {
+                provider: provider_name.to_string(),
+                model: model.to_string(),
+                duration: llm_started_at.elapsed(),
+                success: false,
+                error_message: Some(error.to_string()),
+                input_tokens: None,
+                output_tokens: None,
+            });
             // Fallback to deterministic local truncation when summarization fails.
             truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
-        });
+        }
+    };
 
     let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
     apply_compaction_summary(history, start, compact_end, &summary);
@@ -5058,7 +5135,10 @@ pub async fn run(
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
+                &provider_name,
                 &model_name,
+                observer.as_ref(),
+                &config.cost.prices,
                 config.agent.max_history_messages,
                 config.agent.max_context_tokens,
             )
@@ -5484,6 +5564,7 @@ async fn run_single_turn_with_report(
         &config.cost.prices,
         &model_name,
         input_tokens,
+        cached_input_tokens,
         output_tokens,
     );
 
@@ -5849,6 +5930,7 @@ pub async fn process_message(
         &config.cost.prices,
         &model_name,
         input_tokens,
+        cached_input_tokens,
         output_tokens,
     );
 
@@ -8307,6 +8389,55 @@ Tail"#;
         assert!(history[1].content.contains("Compaction summary"));
         assert!(history[2].content.contains("recent 1"));
         assert!(history[3].content.contains("recent 2"));
+    }
+
+    #[tokio::test]
+    async fn auto_compact_history_uses_usage_aware_chat_path() {
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("- user prefers concise replies".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    cached_input_tokens: Some(0),
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+
+        let mut history = vec![ChatMessage::system("sys")];
+        for idx in 0..11 {
+            history.push(ChatMessage::user(format!("old user {idx}")));
+            history.push(ChatMessage::assistant(format!("old assistant {idx}")));
+        }
+
+        let mut prices = HashMap::new();
+        prices.insert(
+            "openai/gpt-5.1".to_string(),
+            crate::config::schema::ModelPricing {
+                input: 1.25,
+                cached_input: 0.125,
+                output: 10.0,
+            },
+        );
+
+        let compacted = auto_compact_history(
+            &mut history,
+            &provider,
+            "openrouter",
+            "openai/gpt-5.1",
+            &NoopObserver,
+            &prices,
+            DEFAULT_MAX_HISTORY_MESSAGES,
+            1,
+        )
+        .await
+        .expect("auto compaction should succeed");
+
+        assert!(compacted);
+        assert!(history.iter().any(|msg| msg.content.contains("Compaction summary")));
     }
 
     #[test]

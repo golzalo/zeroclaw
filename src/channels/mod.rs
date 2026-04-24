@@ -544,22 +544,7 @@ fn resolve_channel_model_pricing(
     prices: &HashMap<String, crate::config::schema::ModelPricing>,
     model_name: &str,
 ) -> crate::config::schema::ModelPricing {
-    prices
-        .get(model_name)
-        .cloned()
-        .or_else(|| {
-            prices.iter().find_map(|(configured_model, pricing)| {
-                if configured_model.eq_ignore_ascii_case(model_name) {
-                    Some(pricing.clone())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or(crate::config::schema::ModelPricing {
-            input: 0.0,
-            output: 0.0,
-        })
+    crate::cost::pricing_for_model(prices, model_name)
 }
 
 fn estimate_channel_request_tokens(
@@ -596,8 +581,12 @@ fn summarize_channel_usage(
         .map(|request| request.cached_input_tokens.unwrap_or(0))
         .sum();
     let pricing = resolve_channel_model_pricing(&config.cost.prices, model_name);
-    let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input.max(0.0);
-    let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output.max(0.0);
+    let cost_usd = crate::cost::compute_usage_cost_for_pricing(
+        &pricing,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+    );
 
     crate::agent::loop_::UsageSummary {
         request_count: outcome.requests.len(),
@@ -605,7 +594,7 @@ fn summarize_channel_usage(
         output_tokens,
         cached_input_tokens,
         total_tokens: input_tokens.saturating_add(output_tokens),
-        cost_usd: input_cost + output_cost,
+        cost_usd,
         prompt_components: crate::agent::loop_::PromptComponentBreakdown::default(),
         requests: outcome.requests.clone(),
         budget_consumed_remotely: false,
@@ -1863,7 +1852,9 @@ async fn handle_runtime_command_if_needed(
                 ) {
                     Ok(dump_path) => {
                         let provider = ctx.provider.clone();
+                        let provider_name = ctx.default_provider.as_ref().to_string();
                         let model = ctx.model.to_string();
+                        let prices = ctx.prompt_config.cost.prices.clone();
                         let memory = ctx.memory.clone();
                         let workspace_dir = ctx.workspace_dir.clone();
                         let prompt_file = ctx.consolidation_prompt_file.clone();
@@ -1871,7 +1862,9 @@ async fn handle_runtime_command_if_needed(
                             if let Err(e) = crate::memory::consolidation::consolidate_dump_file(
                                 &dump_path,
                                 provider.as_ref(),
+                                &provider_name,
                                 &model,
+                                &prices,
                                 memory.as_ref(),
                                 &workspace_dir,
                                 prompt_file.as_deref(),
@@ -3080,7 +3073,9 @@ async fn process_channel_message(
                 ) {
                     Ok(dump_path) => {
                         let provider = ctx.provider.clone();
+                        let provider_name = ctx.default_provider.as_ref().to_string();
                         let model = ctx.model.to_string();
+                        let prices = ctx.prompt_config.cost.prices.clone();
                         let memory = ctx.memory.clone();
                         let workspace_dir = ctx.workspace_dir.clone();
                         let prompt_file = ctx.consolidation_prompt_file.clone();
@@ -3088,7 +3083,9 @@ async fn process_channel_message(
                             if let Err(e) = crate::memory::consolidation::consolidate_dump_file(
                                 &dump_path,
                                 provider.as_ref(),
+                                &provider_name,
                                 &model,
+                                &prices,
                                 memory.as_ref(),
                                 &workspace_dir,
                                 prompt_file.as_deref(),
@@ -5699,6 +5696,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         let sweep_memory = Arc::clone(&mem);
         let sweep_workspace = config.workspace_dir.clone();
         let sweep_prompt_file = config.memory.consolidation.prompt_file.clone();
+        let sweep_provider_name = config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+        let sweep_prices = config.cost.prices.clone();
         tokio::spawn(async move {
             let interval = tokio::time::Duration::from_secs(recovery_interval);
             loop {
@@ -5706,7 +5708,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 crate::memory::consolidation::run_recovery_sweep(
                     &sweep_workspace,
                     sweep_provider.as_ref(),
+                    &sweep_provider_name,
                     &sweep_model,
+                    &sweep_prices,
                     sweep_memory.as_ref(),
                     sweep_prompt_file.as_deref(),
                 )
