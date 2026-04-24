@@ -83,6 +83,36 @@ pub(crate) fn save_checkpoint(
     Ok(())
 }
 
+/// Returns the most-recently-updated delegate checkpoint whose scope_key starts with
+/// `"{root_scope}::delegate::"`, together with the full scope_key. Used by the root
+/// agent loop to auto-resume a paused delegate without going through the LLM.
+pub(crate) fn load_any_delegate_checkpoint(
+    workspace_dir: &Path,
+    root_scope: &str,
+) -> anyhow::Result<Option<(String, ContinuationCheckpoint)>> {
+    let conn = open_store(workspace_dir)?;
+    let prefix = format!("{root_scope}::delegate::");
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT scope_key, checkpoint_json
+             FROM task_checkpoints
+             WHERE scope_key LIKE ?1
+             ORDER BY updated_at DESC
+             LIMIT 1",
+            params![format!("{prefix}%")],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("failed to query delegate checkpoints")?;
+
+    let Some((scope_key, json)) = row else {
+        return Ok(None);
+    };
+    let checkpoint = serde_json::from_str::<ContinuationCheckpoint>(&json)
+        .context("failed to deserialize delegate checkpoint")?;
+    Ok(Some((scope_key, checkpoint)))
+}
+
 pub(crate) fn clear_checkpoint(
     workspace_dir: &Path,
     scope_key: &str,
@@ -116,6 +146,7 @@ mod tests {
             max_iterations: 5,
             autonomous_approved: false,
             continuation_target: None,
+            subagent_history_file: Some("subagent_history/service_builder_2026-04-24.json".into()),
         };
 
         save_checkpoint(tmp.path(), "session-1", "builder", &checkpoint)
