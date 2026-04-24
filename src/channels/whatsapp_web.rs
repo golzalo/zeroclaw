@@ -2031,7 +2031,12 @@ impl WhatsAppWebChannel {
         &self,
         client: Arc<wa_rs::Client>,
     ) -> Result<wa_rs_binary::jid::Jid> {
-        let previous_group_jid = self.official_group_jid.lock().clone();
+        if let Some(current) = self.official_group_jid.lock().clone() {
+            if let Ok(jid) = current.parse::<wa_rs_binary::jid::Jid>() {
+                return Ok(jid);
+            }
+        }
+
         let (group_jid, _created_now) = Self::ensure_managed_group(
             client,
             WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
@@ -2039,14 +2044,6 @@ impl WhatsAppWebChannel {
             self.managed_groups.clone(),
         )
         .await?;
-        let current_group_jid = group_jid.to_string();
-        if previous_group_jid.as_deref() != Some(current_group_jid.as_str()) {
-            tracing::info!(
-                previous_group_jid = previous_group_jid.as_deref().unwrap_or(""),
-                current_group_jid = current_group_jid,
-                "WhatsApp Web refreshed the official delivery target before send"
-            );
-        }
         Ok(group_jid)
     }
 
