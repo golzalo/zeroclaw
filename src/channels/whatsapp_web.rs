@@ -2037,6 +2037,23 @@ impl WhatsAppWebChannel {
             }
         }
 
+        let restored = Self::rehydrate_managed_groups(
+            Some(&self.official_group_jid),
+            &self.managed_groups,
+        );
+        if restored > 0 {
+            if let Some(current) = self.official_group_jid.lock().clone() {
+                if let Ok(jid) = current.parse::<wa_rs_binary::jid::Jid>() {
+                    tracing::info!(
+                        restored_groups = restored,
+                        group_jid = current,
+                        "WhatsApp Web restored the official delivery target from persisted state"
+                    );
+                    return Ok(jid);
+                }
+            }
+        }
+
         let (group_jid, _created_now) = Self::ensure_managed_group(
             client,
             WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
@@ -4919,14 +4936,11 @@ impl Channel for WhatsAppWebChannel {
             self.resolve_recipient_for_send(client.clone(), recipient).await?;
         if let Err(err) = client.chatstate().send_composing(&to).await {
             if official_target_delivery {
-                to = self
-                    .repair_official_group_for_delivery(client.clone(), err.to_string())
-                    .await?;
-                client
-                    .chatstate()
-                    .send_composing(&to)
-                    .await
-                    .map_err(|e| anyhow!("Failed to send typing state (composing): {e}"))?;
+                tracing::debug!(
+                    recipient,
+                    "WhatsApp Web skipped official-group repair after typing start failure: {err}"
+                );
+                return Ok(());
             } else {
                 return Err(anyhow!("Failed to send typing state (composing): {err}"));
             }
@@ -4957,14 +4971,11 @@ impl Channel for WhatsAppWebChannel {
             self.resolve_recipient_for_send(client.clone(), recipient).await?;
         if let Err(err) = client.chatstate().send_paused(&to).await {
             if official_target_delivery {
-                to = self
-                    .repair_official_group_for_delivery(client.clone(), err.to_string())
-                    .await?;
-                client
-                    .chatstate()
-                    .send_paused(&to)
-                    .await
-                    .map_err(|e| anyhow!("Failed to send typing state (paused): {e}"))?;
+                tracing::debug!(
+                    recipient,
+                    "WhatsApp Web skipped official-group repair after typing stop failure: {err}"
+                );
+                return Ok(());
             } else {
                 return Err(anyhow!("Failed to send typing state (paused): {err}"));
             }
