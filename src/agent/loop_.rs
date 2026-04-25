@@ -1328,6 +1328,9 @@ pub(crate) async fn maybe_auto_continue_delegate(
         }));
     }
 
+    // Subagent finished cleanly — push its output into history so the root LLM
+    // can see it, clear the checkpoint, then return None to let the root LLM
+    // run a synthesis turn instead of forwarding the raw subagent output.
     history.push(ChatMessage::assistant(display_text.clone()));
     if result.success {
         let _ = task_checkpoint_store::clear_checkpoint(
@@ -1338,11 +1341,7 @@ pub(crate) async fn maybe_auto_continue_delegate(
         let _ = crate::agent::subagent_history_store::clear_history(workspace_dir, root_scope);
     }
 
-    Ok(Some(AgentTurnOutcome {
-        output: display_text,
-        continuation: None,
-        requests: vec![],
-    }))
+    Ok(None)
 }
 
 pub(crate) fn maybe_inject_resume_from_checkpoint(history: &mut Vec<ChatMessage>) -> bool {
