@@ -9,10 +9,14 @@
 //! - A periodic recovery sweep retries any stale `.pending.md` /
 //!   `.working.md` files left by a crashed worker.
 
+use crate::config::schema::ModelPricing;
 use crate::memory::chat_dump::{rename_dump_state, CHAT_DUMPS_DIR};
 use crate::memory::traits::{Memory, MemoryCategory};
-use crate::providers::traits::Provider;
+use crate::providers::traits::{Provider, TokenUsage as ProviderTokenUsage};
+use crate::remote_budget::RemoteBudgetClient;
+use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -30,6 +34,14 @@ const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engi
 Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null}
 Do not include any text outside the JSON object."#;
 
+#[derive(Debug, Clone)]
+struct ConsolidationUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    duration_ms: u64,
+}
+
 /// Run two-phase LLM-driven consolidation on a conversation turn.
 ///
 /// Phase 1: Write a history entry to the Daily memory category.
@@ -38,7 +50,9 @@ Do not include any text outside the JSON object."#;
 /// This function is designed to be called fire-and-forget via `tokio::spawn`.
 pub async fn consolidate_turn(
     provider: &dyn Provider,
+    provider_name: &str,
     model: &str,
+    prices: &HashMap<String, ModelPricing>,
     memory: &dyn Memory,
     user_message: &str,
     assistant_response: &str,
@@ -59,9 +73,23 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
-    let raw = provider
-        .chat_with_system(Some(CONSOLIDATION_SYSTEM_PROMPT), &truncated, model, 0.1)
+    let started_at = Instant::now();
+    let response = provider
+        .chat_with_system_response(Some(CONSOLIDATION_SYSTEM_PROMPT), &truncated, model, 0.1)
         .await?;
+    let usage = provider_usage_to_consolidation_usage(response.usage.as_ref(), started_at.elapsed());
+    maybe_record_consolidation_usage(
+        provider_name,
+        model,
+        prices,
+        usage.as_ref(),
+        "turn",
+        serde_json::json!({
+            "operation": "turn_consolidation",
+        }),
+    )
+    .await;
+    let raw = response.text_or_empty().to_string();
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
 
@@ -112,7 +140,9 @@ fn load_consolidation_prompt(workspace_dir: &Path, prompt_file: Option<&str>) ->
 pub async fn consolidate_dump_file(
     dump_path: &Path,
     provider: &dyn Provider,
+    provider_name: &str,
     model: &str,
+    prices: &HashMap<String, ModelPricing>,
     memory: &dyn Memory,
     workspace_dir: &Path,
     prompt_file: Option<&str>,
@@ -124,7 +154,9 @@ pub async fn consolidate_dump_file(
     let result = do_consolidate_dump(
         &working_path,
         provider,
+        provider_name,
         model,
+        prices,
         memory,
         workspace_dir,
         prompt_file,
@@ -142,7 +174,9 @@ pub async fn consolidate_dump_file(
 async fn do_consolidate_dump(
     path: &Path,
     provider: &dyn Provider,
+    provider_name: &str,
     model: &str,
+    prices: &HashMap<String, ModelPricing>,
     memory: &dyn Memory,
     workspace_dir: &Path,
     prompt_file: Option<&str>,
@@ -167,9 +201,25 @@ async fn do_consolidate_dump(
         chat_text.clone()
     };
 
-    let raw = provider
-        .chat_with_system(Some(&system_prompt), &truncated, model, 0.1)
+    let started_at = Instant::now();
+    let response = provider
+        .chat_with_system_response(Some(&system_prompt), &truncated, model, 0.1)
         .await?;
+    let usage = provider_usage_to_consolidation_usage(response.usage.as_ref(), started_at.elapsed());
+    maybe_record_consolidation_usage(
+        provider_name,
+        model,
+        prices,
+        usage.as_ref(),
+        "chat_dump",
+        serde_json::json!({
+            "operation": "chat_dump_consolidation",
+            "dumpPath": path.display().to_string(),
+            "promptFile": prompt_file,
+        }),
+    )
+    .await;
+    let raw = response.text_or_empty().to_string();
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &chat_text);
 
@@ -218,7 +268,9 @@ fn strip_frontmatter(content: &str) -> String {
 pub async fn run_recovery_sweep(
     workspace_dir: &Path,
     provider: &dyn Provider,
+    provider_name: &str,
     model: &str,
+    prices: &HashMap<String, ModelPricing>,
     memory: &dyn Memory,
     prompt_file: Option<&str>,
 ) {
@@ -243,7 +295,9 @@ pub async fn run_recovery_sweep(
                 if let Err(e) = consolidate_dump_file(
                     &pending,
                     provider,
+                    provider_name,
                     model,
+                    prices,
                     memory,
                     workspace_dir,
                     prompt_file,
@@ -255,11 +309,96 @@ pub async fn run_recovery_sweep(
             }
         } else if name.ends_with(".pending.md") {
             if let Err(e) =
-                consolidate_dump_file(&path, provider, model, memory, workspace_dir, prompt_file)
-                    .await
+                consolidate_dump_file(
+                    &path,
+                    provider,
+                    provider_name,
+                    model,
+                    prices,
+                    memory,
+                    workspace_dir,
+                    prompt_file,
+                )
+                .await
             {
                 tracing::debug!("Recovery sweep: failed to consolidate {}: {e}", name);
             }
+        }
+    }
+}
+
+fn provider_usage_to_consolidation_usage(
+    usage: Option<&ProviderTokenUsage>,
+    duration: std::time::Duration,
+) -> Option<ConsolidationUsage> {
+    let usage = usage?;
+    Some(ConsolidationUsage {
+        input_tokens: usage.input_tokens.unwrap_or(0),
+        output_tokens: usage.output_tokens.unwrap_or(0),
+        cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+        duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
+async fn maybe_record_consolidation_usage(
+    provider_name: &str,
+    model: &str,
+    prices: &HashMap<String, ModelPricing>,
+    usage: Option<&ConsolidationUsage>,
+    scope_suffix: &str,
+    metadata: serde_json::Value,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+
+    let cost_usd = crate::cost::compute_usage_cost_usd(
+        prices,
+        model,
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+    );
+
+    tracing::info!(
+        provider = %provider_name,
+        model = %model,
+        scope_id = "memory:consolidation",
+        operation = %scope_suffix,
+        input_tokens = usage.input_tokens,
+        cached_input_tokens = usage.cached_input_tokens,
+        output_tokens = usage.output_tokens,
+        duration_ms = usage.duration_ms,
+        cost_usd,
+        "background.llm_usage"
+    );
+
+    if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.cached_input_tokens == 0 {
+        return;
+    }
+
+    if let Some(remote_budget) = RemoteBudgetClient::from_env() {
+        if let Err(error) = remote_budget
+            .consume_explicit_usage(
+                Some("memory:consolidation"),
+                &format!("zeroclaw:memory:consolidation:{}:{}", scope_suffix, uuid::Uuid::new_v4()),
+                "instance_memory",
+                provider_name,
+                model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens,
+                usage.duration_ms,
+                cost_usd,
+                metadata,
+            )
+            .await
+        {
+            tracing::warn!(
+                err = %error,
+                operation = %scope_suffix,
+                "Failed to record consolidation remote budget usage"
+            );
         }
     }
 }
@@ -298,6 +437,9 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::NoneMemory;
+    use crate::providers::{ChatRequest, ChatResponse};
+    use async_trait::async_trait;
 
     #[test]
     fn parse_valid_json_response() {
@@ -352,5 +494,60 @@ mod tests {
             .history_entry
             .is_char_boundary(result.history_entry.len()));
         assert!(result.history_entry.ends_with('…'));
+    }
+
+    struct UsageAwareProvider;
+
+    #[async_trait]
+    impl Provider for UsageAwareProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(
+                    r#"{"history_entry":"Consolidated the turn.","memory_update":null}"#
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    cached_input_tokens: Some(0),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn consolidate_turn_uses_usage_aware_chat_path() {
+        let provider = UsageAwareProvider;
+        let memory = NoneMemory::new();
+        let prices = HashMap::new();
+
+        consolidate_turn(
+            &provider,
+            "openrouter",
+            "openai/gpt-5.1",
+            &prices,
+            &memory,
+            "hello",
+            "hi",
+        )
+        .await
+        .expect("consolidation should succeed via chat()");
     }
 }

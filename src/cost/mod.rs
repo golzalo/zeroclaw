@@ -5,4 +5,7 @@ pub mod types;
 #[allow(unused_imports)]
 pub use tracker::CostTracker;
 #[allow(unused_imports)]
-pub use types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod};
+pub use types::{
+    compute_usage_cost_for_pricing, compute_usage_cost_usd, pricing_for_model, BudgetCheck,
+    CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod,
+};

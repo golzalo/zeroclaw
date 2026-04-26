@@ -79,6 +79,8 @@ const WHATSAPP_BOOTSTRAP_COMMUNITY_SUBJECT: &str = "S86";
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_BOOTSTRAP_GROUP_SUBJECT: &str = "S86 - Agente Principal";
 #[cfg(feature = "whatsapp-web")]
+const WHATSAPP_OFFICIAL_GROUP_DELIVERY_TARGET: &str = "__whatsapp_official_group__";
+#[cfg(feature = "whatsapp-web")]
 const WHATSAPP_BOOTSTRAP_GROUP_GREETING: &str = "Hola";
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_SUPPORT_GROUP_SUBJECT: &str = "S86 - Agente Soporte";
@@ -558,6 +560,14 @@ impl WhatsAppWebChannel {
                 SupportProvisioningState::BootstrapPending,
             )),
         };
+        let restored =
+            Self::rehydrate_managed_groups(Some(&channel.official_group_jid), &channel.managed_groups);
+        if restored > 0 {
+            tracing::info!(
+                restored_groups = restored,
+                "WhatsApp Web rehydrated managed groups from persisted state during channel init"
+            );
+        }
         Self::register_control_context(channel.client.clone(), channel.managed_groups.clone());
         channel
     }
@@ -819,6 +829,11 @@ impl WhatsAppWebChannel {
         recipient.trim().contains('@')
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn is_official_group_delivery_target(recipient: &str) -> bool {
+        recipient.trim() == WHATSAPP_OFFICIAL_GROUP_DELIVERY_TARGET
+    }
+
     /// Render a WhatsApp pairing QR payload into terminal-friendly text.
     #[cfg(feature = "whatsapp-web")]
     fn render_pairing_qr(code: &str) -> Result<String> {
@@ -892,6 +907,70 @@ impl WhatsAppWebChannel {
         group_jid: &str,
     ) -> Option<String> {
         managed_groups.lock().get(group_jid).cloned()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn managed_group_record_by_jid(group_jid: &str) -> Option<ManagedGroupRecord> {
+        Self::load_managed_group_records()
+            .into_values()
+            .find(|record| {
+                record.key != Self::community_record_key() && record.group_jid == group_jid
+            })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn rehydrate_managed_groups(
+        official_group_jid: Option<&Arc<Mutex<Option<String>>>>,
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> usize {
+        let records = Self::load_managed_group_records();
+        if records.is_empty() {
+            return 0;
+        }
+
+        let mut restored = 0usize;
+        for record in records.into_values() {
+            if record.key == Self::community_record_key() {
+                continue;
+            }
+
+            if let Some(official_group_jid) = official_group_jid {
+                if record.key
+                    == Self::managed_group_key_for_subject(WHATSAPP_BOOTSTRAP_GROUP_SUBJECT)
+                {
+                    *official_group_jid.lock() = Some(record.group_jid.clone());
+                }
+            }
+
+            let mut guard = managed_groups.lock();
+            if !guard.contains_key(&record.group_jid) {
+                guard.insert(record.group_jid.clone(), record.group_name.clone());
+                restored += 1;
+            }
+        }
+
+        restored
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn rehydrate_managed_group_by_jid(
+        group_jid: &str,
+        official_group_jid: Option<&Arc<Mutex<Option<String>>>>,
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Option<String> {
+        if let Some(group_name) = Self::managed_group_name(managed_groups, group_jid) {
+            return Some(group_name);
+        }
+
+        let record = Self::managed_group_record_by_jid(group_jid)?;
+        if let Some(official_group_jid) = official_group_jid {
+            if record.key == Self::managed_group_key_for_subject(WHATSAPP_BOOTSTRAP_GROUP_SUBJECT)
+            {
+                *official_group_jid.lock() = Some(record.group_jid.clone());
+            }
+        }
+        Self::register_managed_group(managed_groups, &record.group_jid, &record.group_name);
+        Some(record.group_name)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1089,6 +1168,60 @@ impl WhatsAppWebChannel {
             .iter()
             .find(|(_jid, name)| name == subject)
             .map(|(jid, _name)| jid.clone())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn recover_managed_group_from_visible_groups(
+        visible_groups: &[(String, String)],
+        group_name: &str,
+        official_group_jid: Option<&Arc<Mutex<Option<String>>>>,
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Result<Option<wa_rs_binary::jid::Jid>> {
+        let Some(group_jid) = Self::find_visible_group_jid_by_subject(visible_groups, group_name)
+        else {
+            return Ok(None);
+        };
+        Self::activate_managed_group(
+            group_name,
+            &group_jid,
+            official_group_jid,
+            managed_groups,
+        )?;
+        let jid = group_jid
+            .parse()
+            .map_err(|e| anyhow!("Invalid recovered WhatsApp JID `{group_jid}`: {e}"))?;
+        Ok(Some(jid))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn recover_managed_group_after_partial_creation(
+        client: Arc<wa_rs::Client>,
+        group_name: &str,
+        official_group_jid: Option<&Arc<Mutex<Option<String>>>>,
+        managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+        original_error: &anyhow::Error,
+    ) -> Result<Option<wa_rs_binary::jid::Jid>> {
+        let visible_groups = Self::fetch_all_visible_groups(&client, managed_groups)
+            .await
+            .map_err(|fetch_err| {
+                anyhow!(
+                    "WhatsApp group flow failed for `{group_name}` and recovery fetch also failed: original={original_error}; recovery={fetch_err}"
+                )
+            })?;
+        let recovered = Self::recover_managed_group_from_visible_groups(
+            &visible_groups,
+            group_name,
+            official_group_jid,
+            managed_groups,
+        )?;
+        if let Some(ref group_jid) = recovered {
+            tracing::warn!(
+                group_jid = %group_jid,
+                subject = %group_name,
+                "WhatsApp Web recovered a managed group after a partial creation failure: {original_error}"
+            );
+        }
+        Ok(recovered)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1496,13 +1629,47 @@ impl WhatsAppWebChannel {
         managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
     ) -> Result<(wa_rs_binary::jid::Jid, bool)> {
         let (group_jid, created) =
-            Self::ensure_group_binding(client, group_name, managed_groups.clone()).await?;
-        Self::activate_managed_group(
+            match Self::ensure_group_binding(client.clone(), group_name, managed_groups.clone())
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    if let Some(group_jid) = Self::recover_managed_group_after_partial_creation(
+                        client.clone(),
+                        group_name,
+                        official_group_jid.as_ref(),
+                        &managed_groups,
+                        &err,
+                    )
+                    .await?
+                    {
+                        return Ok((group_jid, false));
+                    }
+                    return Err(err);
+                }
+            };
+        match Self::activate_managed_group(
             group_name,
             &group_jid,
             official_group_jid.as_ref(),
             &managed_groups,
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                if let Some(group_jid) = Self::recover_managed_group_after_partial_creation(
+                    client,
+                    group_name,
+                    official_group_jid.as_ref(),
+                    &managed_groups,
+                    &err,
+                )
+                .await?
+                {
+                    return Ok((group_jid, created));
+                }
+                return Err(err);
+            }
+        }
         let jid = group_jid
             .parse()
             .map_err(|e| anyhow!("Invalid ensured WhatsApp JID `{group_jid}`: {e}"))?;
@@ -1835,6 +2002,79 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    async fn ensure_official_group_for_delivery(
+        &self,
+        client: Arc<wa_rs::Client>,
+    ) -> Result<wa_rs_binary::jid::Jid> {
+        if let Some(current) = self.official_group_jid.lock().clone() {
+            if let Ok(jid) = current.parse::<wa_rs_binary::jid::Jid>() {
+                return Ok(jid);
+            }
+        }
+
+        let restored = Self::rehydrate_managed_groups(
+            Some(&self.official_group_jid),
+            &self.managed_groups,
+        );
+        if restored > 0 {
+            if let Some(current) = self.official_group_jid.lock().clone() {
+                if let Ok(jid) = current.parse::<wa_rs_binary::jid::Jid>() {
+                    tracing::info!(
+                        restored_groups = restored,
+                        group_jid = current,
+                        "WhatsApp Web restored the official delivery target from persisted state"
+                    );
+                    return Ok(jid);
+                }
+            }
+        }
+
+        let (group_jid, _created_now) = Self::ensure_managed_group(
+            client,
+            WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
+            Some(self.official_group_jid.clone()),
+            self.managed_groups.clone(),
+        )
+        .await?;
+        Ok(group_jid)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn repair_official_group_for_delivery(
+        &self,
+        client: Arc<wa_rs::Client>,
+        original_error: impl AsRef<str>,
+    ) -> Result<wa_rs_binary::jid::Jid> {
+        *self.official_group_jid.lock() = None;
+        let (group_jid, created_now) = Self::ensure_managed_group(
+            client,
+            WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
+            Some(self.official_group_jid.clone()),
+            self.managed_groups.clone(),
+        )
+        .await?;
+        tracing::warn!(
+            group_jid = %group_jid,
+            created_now,
+            "WhatsApp Web repaired the official delivery target after a send failure: {}",
+            original_error.as_ref()
+        );
+        Ok(group_jid)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn resolve_recipient_for_send(
+        &self,
+        client: Arc<wa_rs::Client>,
+        recipient: &str,
+    ) -> Result<(wa_rs_binary::jid::Jid, bool)> {
+        if Self::is_official_group_delivery_target(recipient) {
+            return Ok((self.ensure_official_group_for_delivery(client).await?, true));
+        }
+        Ok((self.recipient_to_jid(recipient)?, false))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     async fn send_agent_text_message(
         client: &wa_rs::Client,
         to: &wa_rs_binary::jid::Jid,
@@ -1898,10 +2138,13 @@ impl WhatsAppWebChannel {
             ..Default::default()
         };
 
-        client
-            .send_message(group_jid.clone(), greeting)
-            .await
-            .map_err(|e| anyhow!("Failed to send topic greeting to WhatsApp group: {e}"))?;
+        if let Err(err) = client.send_message(group_jid.clone(), greeting).await {
+            tracing::warn!(
+                group_jid = %group_jid,
+                subject = %group_name,
+                "WhatsApp Web failed to send topic greeting after ensuring the group; leaving the group active: {err}"
+            );
+        }
 
         tracing::info!(
             group_jid = %group_jid,
@@ -1945,10 +2188,12 @@ impl WhatsAppWebChannel {
             ..Default::default()
         };
 
-        client
-            .send_message(group_jid.clone(), greeting)
-            .await
-            .map_err(|e| anyhow!("Failed to send bootstrap greeting to WhatsApp group: {e}"))?;
+        if let Err(err) = client.send_message(group_jid.clone(), greeting).await {
+            tracing::warn!(
+                group_jid = %group_jid,
+                "WhatsApp Web failed to send bootstrap greeting after ensuring S86 - Agente Principal; keeping the group active: {err}"
+            );
+        }
 
         tracing::info!(
             group_jid = %group_jid,
@@ -3513,7 +3758,12 @@ impl WhatsAppWebChannel {
         chat_is_lid: bool,
         mapped_chat_phone: Option<&str>,
         self_phone: Option<&str>,
+        official_group_jid: &Arc<Mutex<Option<String>>>,
     ) -> String {
+        if Self::is_official_general_chat(official_group_jid, chat) {
+            return WHATSAPP_OFFICIAL_GROUP_DELIVERY_TARGET.to_string();
+        }
+
         if matches!(chat_kind, WhatsAppChatKind::SelfChat) && chat_is_lid {
             mapped_chat_phone
                 .or(self_phone)
@@ -3687,12 +3937,16 @@ impl Channel for WhatsAppWebChannel {
         tracing::trace!(
             recipient = %message.recipient,
             is_jid = Self::is_jid(&message.recipient),
-            allowlist_skipped = Self::is_jid(&message.recipient),
+            allowlist_skipped =
+                Self::is_jid(&message.recipient)
+                    || Self::is_official_group_delivery_target(&message.recipient),
             "WhatsApp Web send recipient evaluation"
         );
 
         // Validate recipient allowlist only for direct phone-number targets.
-        if !Self::is_jid(&message.recipient) {
+        if !Self::is_jid(&message.recipient)
+            && !Self::is_official_group_delivery_target(&message.recipient)
+        {
             let normalized = self.normalize_phone(&message.recipient);
             if !self.is_number_allowed(&normalized) {
                 tracing::warn!(
@@ -3703,7 +3957,9 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(&message.recipient)?;
+        let (mut to, official_target_delivery) = self
+            .resolve_recipient_for_send(client.clone(), &message.recipient)
+            .await?;
         let (clean_content, attachments) = Self::extract_outgoing_attachments(&content);
         let prefixed_clean_content = Self::apply_agent_message_prefix(&clean_content);
 
@@ -3800,7 +4056,16 @@ impl Channel for WhatsAppWebChannel {
                     conversation: Some(prefixed_clean_content.clone()),
                     ..Default::default()
                 };
-                client.send_message(to.clone(), text_msg).await?;
+                if let Err(err) = client.send_message(to.clone(), text_msg.clone()).await {
+                    if official_target_delivery {
+                        to = self
+                            .repair_official_group_for_delivery(client.clone(), err.to_string())
+                            .await?;
+                        client.send_message(to.clone(), text_msg).await?;
+                    } else {
+                        return Err(err.into());
+                    }
+                }
                 if observation_service
                     .observed_group_config(&message.recipient)
                     .is_some()
@@ -3815,7 +4080,16 @@ impl Channel for WhatsAppWebChannel {
             }
 
             for attachment in attachments {
-                Self::send_attachment(&client, &to, &attachment).await?;
+                if let Err(err) = Self::send_attachment(&client, &to, &attachment).await {
+                    if official_target_delivery {
+                        to = self
+                            .repair_official_group_for_delivery(client.clone(), err.to_string())
+                            .await?;
+                        Self::send_attachment(&client, &to, &attachment).await?;
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
 
             if clean_content.is_empty()
@@ -3839,7 +4113,16 @@ impl Channel for WhatsAppWebChannel {
         }
 
         if let Some(attachment) = Self::parse_path_only_attachment(&clean_content) {
-            Self::send_attachment(&client, &to, &attachment).await?;
+            if let Err(err) = Self::send_attachment(&client, &to, &attachment).await {
+                if official_target_delivery {
+                    to = self
+                        .repair_official_group_for_delivery(client.clone(), err.to_string())
+                        .await?;
+                    Self::send_attachment(&client, &to, &attachment).await?;
+                } else {
+                    return Err(err);
+                }
+            }
             if observation_service
                 .observed_group_config(&message.recipient)
                 .is_some()
@@ -3868,7 +4151,19 @@ impl Channel for WhatsAppWebChannel {
             ..Default::default()
         };
 
-        let message_id = client.send_message(to, outgoing).await?;
+        let message_id = match client.send_message(to.clone(), outgoing.clone()).await {
+            Ok(message_id) => message_id,
+            Err(err) => {
+                if official_target_delivery {
+                    to = self
+                        .repair_official_group_for_delivery(client.clone(), err.to_string())
+                        .await?;
+                    client.send_message(to, outgoing).await?
+                } else {
+                    return Err(err.into());
+                }
+            }
+        };
         if observation_service
             .observed_group_config(&message.recipient)
             .is_some()
@@ -4043,7 +4338,20 @@ impl Channel for WhatsAppWebChannel {
                                 let managed_group_name = if decision.chat_kind
                                     == WhatsAppChatKind::Group
                                 {
-                                    Self::managed_group_name(&managed_groups, &chat)
+                                    let was_in_memory =
+                                        Self::managed_group_name(&managed_groups, &chat).is_some();
+                                    let rehydrated = Self::rehydrate_managed_group_by_jid(
+                                        &chat,
+                                        Some(&official_group_jid),
+                                        &managed_groups,
+                                    );
+                                    if rehydrated.is_some() && !was_in_memory {
+                                        tracing::debug!(
+                                            group_jid = %chat,
+                                            "WhatsApp Web restored managed group from persisted state during inbound policy evaluation"
+                                        );
+                                    }
+                                    rehydrated
                                 } else {
                                     None
                                 };
@@ -4280,6 +4588,7 @@ impl Channel for WhatsAppWebChannel {
                                     chat_is_lid,
                                     mapped_chat_phone.as_deref(),
                                     self_phone.as_deref(),
+                                    &official_group_jid,
                                 );
 
                                 if let Err(e) = tx_inner
@@ -4308,6 +4617,16 @@ impl Channel for WhatsAppWebChannel {
                             Event::Connected(_) => {
                                 tracing::info!("WhatsApp Web connected successfully");
                                 WhatsAppWebChannel::reset_retry(&retry_count);
+                                let restored = WhatsAppWebChannel::rehydrate_managed_groups(
+                                    Some(&official_group_jid),
+                                    &managed_groups,
+                                );
+                                if restored > 0 {
+                                    tracing::info!(
+                                        restored_groups = restored,
+                                        "WhatsApp Web rehydrated managed groups from persisted state after connect"
+                                    );
+                                }
 
                                 if bootstrap_group_done
                                     .compare_exchange(
@@ -4577,7 +4896,7 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        if !Self::is_jid(recipient) {
+        if !Self::is_jid(recipient) && !Self::is_official_group_delivery_target(recipient) {
             let normalized = self.normalize_phone(recipient);
             if !self.is_number_allowed(&normalized) {
                 tracing::warn!(
@@ -4588,12 +4907,19 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(recipient)?;
-        client
-            .chatstate()
-            .send_composing(&to)
-            .await
-            .map_err(|e| anyhow!("Failed to send typing state (composing): {e}"))?;
+        let (mut to, official_target_delivery) =
+            self.resolve_recipient_for_send(client.clone(), recipient).await?;
+        if let Err(err) = client.chatstate().send_composing(&to).await {
+            if official_target_delivery {
+                tracing::debug!(
+                    recipient,
+                    "WhatsApp Web skipped official-group repair after typing start failure: {err}"
+                );
+                return Ok(());
+            } else {
+                return Err(anyhow!("Failed to send typing state (composing): {err}"));
+            }
+        }
 
         tracing::debug!("WhatsApp Web: start typing for {}", recipient);
         Ok(())
@@ -4605,7 +4931,7 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        if !Self::is_jid(recipient) {
+        if !Self::is_jid(recipient) && !Self::is_official_group_delivery_target(recipient) {
             let normalized = self.normalize_phone(recipient);
             if !self.is_number_allowed(&normalized) {
                 tracing::warn!(
@@ -4616,12 +4942,19 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(recipient)?;
-        client
-            .chatstate()
-            .send_paused(&to)
-            .await
-            .map_err(|e| anyhow!("Failed to send typing state (paused): {e}"))?;
+        let (mut to, official_target_delivery) =
+            self.resolve_recipient_for_send(client.clone(), recipient).await?;
+        if let Err(err) = client.chatstate().send_paused(&to).await {
+            if official_target_delivery {
+                tracing::debug!(
+                    recipient,
+                    "WhatsApp Web skipped official-group repair after typing stop failure: {err}"
+                );
+                return Ok(());
+            } else {
+                return Err(anyhow!("Failed to send typing state (paused): {err}"));
+            }
+        }
 
         tracing::debug!("WhatsApp Web: stop typing for {}", recipient);
         Ok(())
@@ -5013,6 +5346,150 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_rehydrates_managed_group_by_jid_from_persisted_state() {
+        let _guard = env_lock().lock().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let previous_workspace = std::env::var("ZEROCLAW_WORKSPACE").ok();
+        std::env::set_var("ZEROCLAW_WORKSPACE", workspace.path());
+
+        let managed_groups = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let official_group_jid = Arc::new(Mutex::new(None));
+
+        WhatsAppWebChannel::persist_managed_group_record(
+            "topic:S86 - Drive",
+            "120363425547409121@g.us",
+            "S86 - Drive",
+        )
+        .unwrap();
+
+        assert_eq!(
+            WhatsAppWebChannel::rehydrate_managed_group_by_jid(
+                "120363425547409121@g.us",
+                Some(&official_group_jid),
+                &managed_groups,
+            ),
+            Some("S86 - Drive".to_string())
+        );
+        assert_eq!(
+            managed_groups
+                .lock()
+                .get("120363425547409121@g.us")
+                .cloned(),
+            Some("S86 - Drive".to_string())
+        );
+        assert_eq!(*official_group_jid.lock(), None);
+
+        if let Some(value) = previous_workspace {
+            std::env::set_var("ZEROCLAW_WORKSPACE", value);
+        } else {
+            std::env::remove_var("ZEROCLAW_WORKSPACE");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_rehydrates_official_group_from_persisted_state() {
+        let _guard = env_lock().lock().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let previous_workspace = std::env::var("ZEROCLAW_WORKSPACE").ok();
+        std::env::set_var("ZEROCLAW_WORKSPACE", workspace.path());
+
+        let managed_groups = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let official_group_jid = Arc::new(Mutex::new(None));
+
+        WhatsAppWebChannel::persist_managed_group_record(
+            "main",
+            "120363425113008737@g.us",
+            WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
+        )
+        .unwrap();
+        WhatsAppWebChannel::persist_managed_group_record(
+            "topic:S86 - Drive",
+            "120363425547409121@g.us",
+            "S86 - Drive",
+        )
+        .unwrap();
+
+        let restored = WhatsAppWebChannel::rehydrate_managed_groups(
+            Some(&official_group_jid),
+            &managed_groups,
+        );
+        assert_eq!(restored, 2);
+        assert_eq!(
+            *official_group_jid.lock(),
+            Some("120363425113008737@g.us".to_string())
+        );
+        assert_eq!(
+            managed_groups.lock().get("120363425113008737@g.us").cloned(),
+            Some(WHATSAPP_BOOTSTRAP_GROUP_SUBJECT.to_string())
+        );
+        assert_eq!(
+            managed_groups
+                .lock()
+                .get("120363425547409121@g.us")
+                .cloned(),
+            Some("S86 - Drive".to_string())
+        );
+
+        if let Some(value) = previous_workspace {
+            std::env::set_var("ZEROCLAW_WORKSPACE", value);
+        } else {
+            std::env::remove_var("ZEROCLAW_WORKSPACE");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_recovers_managed_group_from_visible_groups_by_subject() {
+        let _guard = env_lock().lock().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let previous_workspace = std::env::var("ZEROCLAW_WORKSPACE").ok();
+        std::env::set_var("ZEROCLAW_WORKSPACE", workspace.path());
+
+        let managed_groups = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let official_group_jid = Arc::new(Mutex::new(None));
+        let visible_groups = vec![(
+            "120363425777000111@g.us".to_string(),
+            "S86 - PEPE3".to_string(),
+        )];
+
+        let recovered = WhatsAppWebChannel::recover_managed_group_from_visible_groups(
+            &visible_groups,
+            "S86 - PEPE3",
+            Some(&official_group_jid),
+            &managed_groups,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recovered.map(|jid| jid.to_string()),
+            Some("120363425777000111@g.us".to_string())
+        );
+        assert_eq!(
+            managed_groups
+                .lock()
+                .get("120363425777000111@g.us")
+                .cloned(),
+            Some("S86 - PEPE3".to_string())
+        );
+        let persisted = WhatsAppWebChannel::load_managed_group_records();
+        assert_eq!(
+            persisted
+                .get("topic:S86 - PEPE3")
+                .map(|record| record.group_jid.clone()),
+            Some("120363425777000111@g.us".to_string())
+        );
+        assert_eq!(*official_group_jid.lock(), None);
+
+        if let Some(value) = previous_workspace {
+            std::env::set_var("ZEROCLAW_WORKSPACE", value);
+        } else {
+            std::env::remove_var("ZEROCLAW_WORKSPACE");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_find_visible_standalone_group_jid_excludes_parent_and_linked_groups() {
         let visible_groups = vec![
             WhatsAppVisibleGroup {
@@ -5369,14 +5846,33 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_resolve_reply_target_normalizes_self_chat_lid() {
+        let official_group_jid = Arc::new(Mutex::new(None));
         let reply_target = WhatsAppWebChannel::resolve_reply_target(
             "76188559093817@lid",
             WhatsAppChatKind::SelfChat,
             true,
             Some("15551234567"),
             Some("+15551234567"),
+            &official_group_jid,
         );
         assert_eq!(reply_target, "15551234567@s.whatsapp.net");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_resolve_reply_target_uses_official_group_alias() {
+        let official_group_jid = Arc::new(Mutex::new(Some(
+            "120363425113008737@g.us".to_string(),
+        )));
+        let reply_target = WhatsAppWebChannel::resolve_reply_target(
+            "120363425113008737@g.us",
+            WhatsAppChatKind::Group,
+            false,
+            None,
+            None,
+            &official_group_jid,
+        );
+        assert_eq!(reply_target, WHATSAPP_OFFICIAL_GROUP_DELIVERY_TARGET);
     }
 
     #[test]

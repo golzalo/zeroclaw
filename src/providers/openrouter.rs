@@ -132,6 +132,14 @@ struct UsageInfo {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +322,14 @@ impl OpenRouterProvider {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn map_usage(usage: Option<UsageInfo>) -> Option<TokenUsage> {
+        usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+        })
     }
 
     async fn read_response_body(
@@ -517,13 +533,9 @@ impl Provider for OpenRouterProvider {
         let body = Self::read_response_body("OpenRouter", response).await?;
         let native_response =
             Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
-        });
-        let message = native_response
-            .choices
+        let NativeChatResponse { choices, usage } = native_response;
+        let usage = Self::map_usage(usage);
+        let message = choices
             .into_iter()
             .next()
             .map(|c| c.message)
@@ -611,13 +623,9 @@ impl Provider for OpenRouterProvider {
         let body = Self::read_response_body("OpenRouter", response).await?;
         let native_response =
             Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
-        });
-        let message = native_response
-            .choices
+        let NativeChatResponse { choices, usage } = native_response;
+        let usage = Self::map_usage(usage);
+        let message = choices
             .into_iter()
             .next()
             .map(|c| c.message)
@@ -990,6 +998,23 @@ mod tests {
         let usage = resp.usage.unwrap();
         assert_eq!(usage.prompt_tokens, Some(42));
         assert_eq!(usage.completion_tokens, Some(15));
+    }
+
+    #[test]
+    fn native_response_parses_cached_usage_details() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+              "prompt_tokens": 42,
+              "completion_tokens": 15,
+              "prompt_tokens_details": {"cached_tokens": 11}
+            }
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = OpenRouterProvider::map_usage(resp.usage).unwrap();
+        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.output_tokens, Some(15));
+        assert_eq!(usage.cached_input_tokens, Some(11));
     }
 
     #[test]
