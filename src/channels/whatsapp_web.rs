@@ -42,6 +42,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 #[cfg(feature = "whatsapp-web")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "whatsapp-web")]
+use std::time::{Duration, Instant};
 use std::sync::{Arc, OnceLock};
 use tokio::{fs, select};
 #[cfg(feature = "whatsapp-web")]
@@ -94,6 +96,10 @@ const WHATSAPP_TOPIC_GROUP_PREFIX: &str = "S86 - ";
 const WHATSAPP_COMMUNITY_LINK_TOOL_TIMEOUT_SECS: u64 = 8;
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_COMMUNITY_LINK_TOOL_TOTAL_BUDGET_SECS: u64 = 20;
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_OFFICIAL_GROUP_VERIFY_INTERVAL: Duration = Duration::from_secs(3 * 60);
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_OFFICIAL_GROUP_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 #[cfg(feature = "whatsapp-web")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,6 +517,10 @@ pub struct WhatsAppWebChannel {
     managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Deferred support provisioning state for the official General flow.
     support_provisioning_state: Arc<Mutex<SupportProvisioningState>>,
+    /// Last successful remote visibility verification for the official group target.
+    official_group_last_verified_at: Arc<Mutex<Option<Instant>>>,
+    /// Cooldown after a rate-limited remote verification to avoid hammering WhatsApp.
+    official_group_verify_backoff_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl WhatsAppWebChannel {
@@ -559,6 +569,8 @@ impl WhatsAppWebChannel {
             support_provisioning_state: Arc::new(Mutex::new(
                 SupportProvisioningState::BootstrapPending,
             )),
+            official_group_last_verified_at: Arc::new(Mutex::new(None)),
+            official_group_verify_backoff_until: Arc::new(Mutex::new(None)),
         };
         let restored =
             Self::rehydrate_managed_groups(Some(&channel.official_group_jid), &channel.managed_groups);
@@ -971,6 +983,108 @@ impl WhatsAppWebChannel {
         }
         Self::register_managed_group(managed_groups, &record.group_jid, &record.group_name);
         Some(record.group_name)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn find_visible_group_jid_by_subject_extended(
+        visible_groups: &[WhatsAppVisibleGroup],
+        group_name: &str,
+    ) -> Option<String> {
+        visible_groups
+            .iter()
+            .find(|group| !group.is_parent && group.subject == group_name)
+            .map(|group| group.jid.clone())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn should_verify_official_group_remotely(&self) -> bool {
+        let now = Instant::now();
+        if self
+            .official_group_verify_backoff_until
+            .lock()
+            .is_some_and(|until| until > now)
+        {
+            return false;
+        }
+
+        match *self.official_group_last_verified_at.lock() {
+            Some(instant) => {
+                now.duration_since(instant) >= WHATSAPP_OFFICIAL_GROUP_VERIFY_INTERVAL
+            }
+            None => true,
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn note_official_group_remote_verification_success(&self) {
+        *self.official_group_last_verified_at.lock() = Some(Instant::now());
+        *self.official_group_verify_backoff_until.lock() = None;
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn note_official_group_remote_verification_rate_limit(&self) {
+        *self.official_group_verify_backoff_until.lock() =
+            Some(Instant::now() + WHATSAPP_OFFICIAL_GROUP_RATE_LIMIT_BACKOFF);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn refresh_official_group_delivery_target_if_due(
+        &self,
+        client: Arc<wa_rs::Client>,
+        current_jid: &wa_rs_binary::jid::Jid,
+    ) -> Result<Option<wa_rs_binary::jid::Jid>> {
+        if !self.should_verify_official_group_remotely() {
+            return Ok(Some(current_jid.clone()));
+        }
+
+        match Self::fetch_all_visible_groups_extended(&client).await {
+            Ok(visible_groups) => {
+                self.note_official_group_remote_verification_success();
+
+                if visible_groups
+                    .iter()
+                    .any(|group| !group.is_parent && group.jid == current_jid.to_string())
+                {
+                    return Ok(Some(current_jid.clone()));
+                }
+
+                if let Some(existing_group_jid) = Self::find_visible_group_jid_by_subject_extended(
+                    &visible_groups,
+                    WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
+                ) {
+                    Self::activate_managed_group(
+                        WHATSAPP_BOOTSTRAP_GROUP_SUBJECT,
+                        &existing_group_jid,
+                        Some(&self.official_group_jid),
+                        &self.managed_groups,
+                    )?;
+                    let jid = existing_group_jid.parse().map_err(|e| {
+                        anyhow!("Invalid ensured WhatsApp JID `{existing_group_jid}`: {e}")
+                    })?;
+                    tracing::info!(
+                        old_group_jid = %current_jid,
+                        group_jid = %jid,
+                        "WhatsApp Web refreshed the official delivery target from remote visibility"
+                    );
+                    return Ok(Some(jid));
+                }
+
+                *self.official_group_jid.lock() = None;
+                Ok(None)
+            }
+            Err(err) => {
+                if Self::is_whatsapp_rate_overlimit_error(&err) {
+                    self.note_official_group_remote_verification_rate_limit();
+                    tracing::debug!(
+                        group_jid = %current_jid,
+                        "WhatsApp Web skipped official-group remote refresh after rate limit: {err}"
+                    );
+                    Ok(Some(current_jid.clone()))
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2006,9 +2120,15 @@ impl WhatsAppWebChannel {
         &self,
         client: Arc<wa_rs::Client>,
     ) -> Result<wa_rs_binary::jid::Jid> {
-        if let Some(current) = self.official_group_jid.lock().clone() {
+        let cached_official_group_jid = { self.official_group_jid.lock().clone() };
+        if let Some(current) = cached_official_group_jid {
             if let Ok(jid) = current.parse::<wa_rs_binary::jid::Jid>() {
-                return Ok(jid);
+                if let Some(refreshed) = self
+                    .refresh_official_group_delivery_target_if_due(client.clone(), &jid)
+                    .await?
+                {
+                    return Ok(refreshed);
+                }
             }
         }
 
@@ -2036,6 +2156,7 @@ impl WhatsAppWebChannel {
             self.managed_groups.clone(),
         )
         .await?;
+        self.note_official_group_remote_verification_success();
         Ok(group_jid)
     }
 
@@ -2053,6 +2174,7 @@ impl WhatsAppWebChannel {
             self.managed_groups.clone(),
         )
         .await?;
+        self.note_official_group_remote_verification_success();
         tracing::warn!(
             group_jid = %group_jid,
             created_now,
@@ -4907,7 +5029,7 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let (mut to, official_target_delivery) =
+        let (to, official_target_delivery) =
             self.resolve_recipient_for_send(client.clone(), recipient).await?;
         if let Err(err) = client.chatstate().send_composing(&to).await {
             if official_target_delivery {
@@ -4942,7 +5064,7 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let (mut to, official_target_delivery) =
+        let (to, official_target_delivery) =
             self.resolve_recipient_for_send(client.clone(), recipient).await?;
         if let Err(err) = client.chatstate().send_paused(&to).await {
             if official_target_delivery {
