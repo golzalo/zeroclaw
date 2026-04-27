@@ -1120,22 +1120,7 @@ fn resolve_model_pricing(
     prices: &HashMap<String, crate::config::schema::ModelPricing>,
     model_name: &str,
 ) -> crate::config::schema::ModelPricing {
-    prices
-        .get(model_name)
-        .cloned()
-        .or_else(|| {
-            prices.iter().find_map(|(configured_model, pricing)| {
-                if configured_model.eq_ignore_ascii_case(model_name) {
-                    Some(pricing.clone())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or(crate::config::schema::ModelPricing {
-            input: 0.0,
-            output: 0.0,
-        })
+    crate::cost::pricing_for_model(prices, model_name)
 }
 
 fn enrich_usage_cost(
@@ -1144,9 +1129,12 @@ fn enrich_usage_cost(
     model_name: &str,
 ) {
     let pricing = resolve_model_pricing(prices, model_name);
-    let input_cost = (summary.input_tokens as f64 / 1_000_000.0) * pricing.input.max(0.0);
-    let output_cost = (summary.output_tokens as f64 / 1_000_000.0) * pricing.output.max(0.0);
-    summary.cost_usd = input_cost + output_cost;
+    summary.cost_usd = crate::cost::compute_usage_cost_for_pricing(
+        &pricing,
+        summary.input_tokens,
+        summary.cached_input_tokens,
+        summary.output_tokens,
+    );
 }
 
 fn maybe_record_cost_tracker_usage(
@@ -1169,8 +1157,10 @@ fn maybe_record_cost_tracker_usage(
     let usage = crate::cost::types::TokenUsage::new(
         model_name.to_string(),
         summary.input_tokens,
+        summary.cached_input_tokens,
         summary.output_tokens,
         pricing.input,
+        pricing.cached_input,
         pricing.output,
     );
     if let Err(error) = tracker.record_usage(usage) {

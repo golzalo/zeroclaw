@@ -438,7 +438,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
 
-        let usage = TokenUsage::new("test/model", 1000, 500, 1.0, 2.0);
+        let usage = TokenUsage::new("test/model", 1000, 0, 500, 1.0, 0.0, 2.0);
         tracker.record_usage(usage).unwrap();
 
         let summary = tracker.get_summary().unwrap();
@@ -459,7 +459,7 @@ mod tests {
         let tracker = CostTracker::new(config, tmp.path()).unwrap();
 
         // Record a usage that exceeds the limit
-        let usage = TokenUsage::new("test/model", 10000, 5000, 1.0, 2.0); // ~0.02 USD
+        let usage = TokenUsage::new("test/model", 10000, 0, 5000, 1.0, 0.0, 2.0); // ~0.02 USD
         tracker.record_usage(usage).unwrap();
 
         let check = tracker.check_budget(0.01).unwrap();
@@ -476,7 +476,7 @@ mod tests {
 
         let old_record = CostRecord::new(
             "old-session",
-            TokenUsage::new("legacy/model", 500, 500, 1.0, 1.0),
+            TokenUsage::new("legacy/model", 500, 0, 500, 1.0, 0.0, 1.0),
         );
         let mut file = OpenOptions::new()
             .create(true)
@@ -488,7 +488,7 @@ mod tests {
 
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
         tracker
-            .record_usage(TokenUsage::new("session/model", 1000, 1000, 1.0, 1.0))
+            .record_usage(TokenUsage::new("session/model", 1000, 0, 1000, 1.0, 0.0, 1.0))
             .unwrap();
 
         let summary = tracker.get_summary().unwrap();
@@ -505,7 +505,7 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
 
-        let valid_usage = TokenUsage::new("test/model", 1000, 0, 1.0, 1.0);
+        let valid_usage = TokenUsage::new("test/model", 1000, 0, 0, 1.0, 0.0, 1.0);
         let valid_record = CostRecord::new("session-a", valid_usage.clone());
 
         let mut file = OpenOptions::new()

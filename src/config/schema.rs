@@ -1400,7 +1400,7 @@ pub struct CostConfig {
     pub allow_override: bool,
 
     /// Per-model pricing (USD per 1M tokens)
-    #[serde(default)]
+    #[serde(default = "get_default_pricing")]
     pub prices: std::collections::HashMap<String, ModelPricing>,
 
     /// Optional remote budget API used by dedicated runtimes.
@@ -1446,6 +1446,11 @@ pub struct ModelPricing {
     /// Input price per 1M tokens
     #[serde(default)]
     pub input: f64,
+
+    /// Cached input price per 1M tokens. When omitted, cost calculation falls
+    /// back to the regular input price.
+    #[serde(default)]
+    pub cached_input: f64,
 
     /// Output price per 1M tokens
     #[serde(default)]
@@ -1499,6 +1504,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "anthropic/claude-sonnet-4-20250514".into(),
         ModelPricing {
             input: 3.0,
+            cached_input: 0.3,
             output: 15.0,
         },
     );
@@ -1506,6 +1512,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "anthropic/claude-opus-4-20250514".into(),
         ModelPricing {
             input: 15.0,
+            cached_input: 1.5,
             output: 75.0,
         },
     );
@@ -1513,6 +1520,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "anthropic/claude-3.5-sonnet".into(),
         ModelPricing {
             input: 3.0,
+            cached_input: 0.3,
             output: 15.0,
         },
     );
@@ -1520,6 +1528,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "anthropic/claude-3-haiku".into(),
         ModelPricing {
             input: 0.25,
+            cached_input: 0.025,
             output: 1.25,
         },
     );
@@ -1529,6 +1538,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "openai/gpt-4o".into(),
         ModelPricing {
             input: 5.0,
+            cached_input: 2.5,
             output: 15.0,
         },
     );
@@ -1536,6 +1546,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "openai/gpt-4o-mini".into(),
         ModelPricing {
             input: 0.15,
+            cached_input: 0.075,
             output: 0.60,
         },
     );
@@ -1543,6 +1554,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "openai/gpt-5-mini".into(),
         ModelPricing {
             input: 0.25,
+            cached_input: 0.025,
             output: 2.0,
         },
     );
@@ -1550,6 +1562,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "openai/gpt-5.1".into(),
         ModelPricing {
             input: 1.25,
+            cached_input: 0.125,
             output: 10.0,
         },
     );
@@ -1557,6 +1570,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "openai/o1-preview".into(),
         ModelPricing {
             input: 15.0,
+            cached_input: 0.0,
             output: 60.0,
         },
     );
@@ -1566,6 +1580,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "google/gemini-2.0-flash".into(),
         ModelPricing {
             input: 0.10,
+            cached_input: 0.025,
             output: 0.40,
         },
     );
@@ -1573,7 +1588,16 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         "google/gemini-1.5-pro".into(),
         ModelPricing {
             input: 1.25,
+            cached_input: 0.3125,
             output: 5.0,
+        },
+    );
+    prices.insert(
+        "google/gemma-4-31b-it".into(),
+        ModelPricing {
+            input: 0.129,
+            cached_input: 0.0645,
+            output: 0.394,
         },
     );
 
@@ -12154,6 +12178,38 @@ require_otp_to_resume = true
         );
 
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn partial_cost_section_preserves_default_model_pricing() {
+        let raw_toml = r#"
+default_provider = "openrouter"
+default_model = "google/gemma-4-31b-it"
+
+[cost.remote_budget]
+enabled = true
+api_base_url = "http://host.docker.internal:3001"
+"#;
+
+        let parsed: Config = toml::from_str(raw_toml).expect("deserialize config");
+        let gemma = parsed
+            .cost
+            .prices
+            .get("google/gemma-4-31b-it")
+            .expect("default Gemma pricing");
+        let gpt = parsed
+            .cost
+            .prices
+            .get("openai/gpt-5.1")
+            .expect("default GPT pricing");
+
+        assert!(parsed.cost.remote_budget.enabled);
+        assert_eq!(gemma.input, 0.129);
+        assert_eq!(gemma.cached_input, 0.0645);
+        assert_eq!(gemma.output, 0.394);
+        assert_eq!(gpt.input, 1.25);
+        assert_eq!(gpt.cached_input, 0.125);
+        assert_eq!(gpt.output, 10.0);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::{
-    build_delegate_resume_prompt, build_resume_from_checkpoint_message, run_tool_call_loop,
+    build_delegate_resume_prompt, run_tool_call_loop,
 };
+use crate::agent::subagent_history_store;
 use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -17,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn looks_like_delegate_continue_request(prompt: &str) -> bool {
+fn looks_like_delegate_batch_continue_request(prompt: &str) -> bool {
     matches!(
         prompt
             .trim()
@@ -27,26 +28,33 @@ fn looks_like_delegate_continue_request(prompt: &str) -> bool {
             .collect::<Vec<_>>()
             .join(" ")
             .as_str(),
-        "continue"
-            | "continue please"
-            | "go ahead"
-            | "go on"
-            | "keep going"
-            | "please continue"
-            | "proceed"
-            | "resume"
-            | "yes"
-            | "yes please"
-            | "dale"
-            | "continua"
-            | "continúa"
-            | "segui"
-            | "seguí"
-            | "seguir"
-            | "si"
-            | "sí"
-            | "avanza"
+        "10x" | "x10"
     )
+}
+
+fn is_legacy_delegate_resume_prompt(prompt: &str) -> bool {
+    let normalized = prompt
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['\n', '\r', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    normalized.contains("continue the same service job from the saved checkpoint")
+        || normalized.contains("continue the same task from the saved checkpoint")
+}
+
+fn build_delegate_resume_followup_message(full_prompt: &str) -> String {
+    let trimmed = full_prompt.trim();
+    if trimmed.is_empty()
+        || looks_like_delegate_batch_continue_request(trimmed)
+        || is_legacy_delegate_resume_prompt(trimmed)
+    {
+        "Continue.".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn delegate_task_scope(scope_key: &str, agent_name: &str) -> String {
@@ -280,6 +288,11 @@ impl Tool for DelegateTool {
             .get("_resume_request")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let iterations_multiplier = args
+            .get("_iterations_multiplier")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.max(1).min(10) as usize)
+            .unwrap_or(1);
 
         // Look up agent config
         let agent_config = match self.agents.get(agent_name) {
@@ -375,6 +388,7 @@ impl Tool for DelegateTool {
                     remote_budget.as_ref(),
                     continuation_scope,
                     resume_request,
+                    iterations_multiplier,
                 )
                 .await;
         }
@@ -503,7 +517,8 @@ impl DelegateTool {
         temperature: f64,
         remote_budget: Option<&RemoteBudgetClient>,
         continuation_scope: Option<&str>,
-        resume_request: bool,
+        _resume_request: bool,
+        iterations_multiplier: usize,
     ) -> anyhow::Result<ToolResult> {
         if agent_config.allowed_tools.is_empty() {
             return Ok(ToolResult {
@@ -559,30 +574,24 @@ impl DelegateTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|scope_key| delegate_task_scope(scope_key, agent_name));
-        let resume_checkpoint = if resume_request || looks_like_delegate_continue_request(full_prompt)
-        {
-            match (self.workspace_dir.as_deref(), delegate_scope.as_deref()) {
-                (Some(workspace_dir), Some(scope_key)) => {
-                    task_checkpoint_store::load_checkpoint(
-                        workspace_dir,
-                        scope_key,
-                        ROOT_TASK_CHECKPOINT_AGENT,
-                    )
-                    .ok()
-                    .flatten()
-                }
-                _ => None,
+
+        // Always load a saved checkpoint when the delegate scope has one — regardless of how
+        // the prompt is phrased. This fixes the iterate-mode bug where a natural-language
+        // prompt bypassed the gate and caused the subagent to restart from scratch.
+        let resume_checkpoint = match (self.workspace_dir.as_deref(), delegate_scope.as_deref()) {
+            (Some(workspace_dir), Some(scope_key)) => {
+                task_checkpoint_store::load_checkpoint(
+                    workspace_dir,
+                    scope_key,
+                    ROOT_TASK_CHECKPOINT_AGENT,
+                )
+                .ok()
+                .flatten()
             }
-        } else {
-            None
+            _ => None,
         };
-        let effective_prompt = resume_checkpoint
-            .as_ref()
-            .map(|checkpoint| build_delegate_resume_prompt(agent_name, full_prompt, checkpoint))
-            .unwrap_or_else(|| full_prompt.to_string());
-        let resume_directive = resume_checkpoint
-            .as_ref()
-            .map(build_resume_from_checkpoint_message);
+
+        let effective_max_iterations = (agent_config.max_iterations * iterations_multiplier).min(100);
 
         let mut history = Vec::new();
         if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
@@ -628,23 +637,44 @@ impl DelegateTool {
             }
         }
 
-        if let Some(message) = resume_directive.as_ref() {
-            history.push(message.clone());
+        // Rehydrate prior subagent history so the model resumes with its real prior turns
+        // instead of extra ZeroClaw-specific wrapper messages.
+        let mut restored_prior_history = false;
+        if let Some(checkpoint) = resume_checkpoint.as_ref() {
+            if let (Some(workspace_dir), Some(path)) = (
+                self.workspace_dir.as_deref(),
+                checkpoint.subagent_history_file.as_deref(),
+            ) {
+                match subagent_history_store::load_history(workspace_dir, path) {
+                    Ok(prior) => {
+                        if !prior.is_empty() {
+                            restored_prior_history = true;
+                        }
+                        for msg in prior.into_iter().filter(|m| m.role != "system") {
+                            history.push(msg);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to load subagent history from {path}: {e}");
+                    }
+                }
+            }
         }
+
+        let effective_prompt = match resume_checkpoint.as_ref() {
+            Some(_) if restored_prior_history => build_delegate_resume_followup_message(full_prompt),
+            Some(checkpoint) => build_delegate_resume_prompt(agent_name, full_prompt, checkpoint),
+            None => full_prompt.to_string(),
+        };
 
         history.push(ChatMessage::user(effective_prompt.clone()));
 
         let quote = if let Some(remote_budget) = remote_budget {
-            let budget_prompt = if let Some(message) = resume_directive.as_ref() {
-                format!("{}\n\n{}", message.content, effective_prompt)
-            } else {
-                effective_prompt.clone()
-            };
             let (estimated_input_tokens, estimated_output_tokens) = estimate_delegate_tokens(
                 agent_config.system_prompt.as_deref(),
-                &budget_prompt,
+                &effective_prompt,
                 true,
-                agent_config.max_iterations,
+                effective_max_iterations,
             );
             let check = remote_budget
                 .check_text_quote(
@@ -657,7 +687,7 @@ impl DelegateTool {
                     json!({
                         "delegateAgent": agent_name,
                         "agentic": true,
-                        "maxIterations": agent_config.max_iterations,
+                        "maxIterations": effective_max_iterations,
                     }),
                 )
                 .await?;
@@ -696,7 +726,7 @@ impl DelegateTool {
                 "delegate",
                 None,
                 &self.multimodal_config,
-                agent_config.max_iterations,
+                effective_max_iterations,
                 None,
                 None,
                 None,
@@ -1100,12 +1130,14 @@ mod tests {
                 kind: "service_job".to_string(),
                 id: "infobae-headlines-csv".to_string(),
             }),
+            subagent_history_file: None,
         };
 
         let prompt = build_delegate_resume_prompt("service_builder", "continue", &checkpoint);
 
-        assert!(prompt.starts_with("EXISTING_JOB: infobae-headlines-csv"));
+        assert!(prompt.starts_with("Use the existing service job 'infobae-headlines-csv'."));
         assert!(!prompt.contains("NEW_JOB: true"));
+        assert!(!prompt.contains("saved checkpoint"));
         assert!(prompt.contains("Implementar un proceso recurrente"));
     }
 
@@ -1122,6 +1154,7 @@ mod tests {
             max_iterations: 5,
             autonomous_approved: false,
             continuation_target: None,
+            subagent_history_file: None,
         };
 
         let prompt = build_delegate_resume_prompt(
@@ -1133,6 +1166,21 @@ mod tests {
         assert!(prompt.contains("Current instruction / user feedback"));
         assert!(prompt.contains("Please finish the publish step and fix the probe failure."));
         assert!(prompt.contains("Refactor the handler"));
+    }
+
+    #[test]
+    fn build_delegate_resume_followup_message_normalizes_internal_batch_resume_prompts() {
+        assert_eq!(build_delegate_resume_followup_message("10x"), "Continue.");
+        assert_eq!(
+            build_delegate_resume_followup_message(
+                "EXISTING_JOB: infobae-news-csv\n\nContinue the same service job from the saved checkpoint. Reuse completed work and focus only on the remaining steps.\n\nImplement it"
+            ),
+            "Continue."
+        );
+        assert_eq!(
+            build_delegate_resume_followup_message("Please finish the publish step."),
+            "Please finish the publish step."
+        );
     }
 
     #[test]
@@ -1484,7 +1532,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false, 1)
             .await
             .unwrap();
 
@@ -1506,7 +1554,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false, 1)
             .await
             .unwrap();
 
@@ -1526,7 +1574,7 @@ mod tests {
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false, 1)
             .await
             .unwrap();
 
@@ -1545,7 +1593,7 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false, 1)
             .await
             .unwrap();
 
@@ -1628,6 +1676,38 @@ mod tests {
         }
     }
 
+    struct CaptureMessagesThenDoneProvider {
+        seen: Arc<Mutex<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureMessagesThenDoneProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            *self.seen.lock().unwrap() = request.messages.to_vec();
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {
         // Build DelegateTool with NO parent tools initially
@@ -1641,7 +1721,7 @@ mod tests {
 
         let provider = McpToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2, None, None, false)
+            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2, None, None, false, 1)
             .await
             .unwrap();
 
@@ -1651,6 +1731,89 @@ mod tests {
             "Expected output containing 'mcp done', got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_resume_with_prior_history_omits_internal_resume_scaffolding() {
+        let workspace = tempfile::tempdir().expect("temp dir");
+        let root_scope = "session-1";
+        let delegate_scope = format!("{root_scope}::delegate::service_builder");
+        let relative_history_path = "subagent_history/legacy-service-builder.json";
+        let legacy_history = vec![
+            ChatMessage::user("NEW_JOB: true\nImplementar un proceso recurrente"),
+            ChatMessage::assistant("Scaffold listo."),
+            ChatMessage::user(
+                "EXISTING_JOB: infobae-news-csv\n\nContinue the same service job from the saved checkpoint. Reuse completed work and focus only on the remaining steps.\n\nImplementar un proceso recurrente",
+            ),
+            ChatMessage::user("[Tool results]\n<tool_result name=\"shell\">ok</tool_result>"),
+            ChatMessage::assistant(
+                "Ya avancé con la implementación. ¿Quieres que siga?",
+            ),
+        ];
+        std::fs::create_dir_all(workspace.path().join("subagent_history"))
+            .expect("history dir should exist");
+        std::fs::write(
+            workspace.path().join(relative_history_path),
+            serde_json::to_string(&legacy_history).expect("legacy history should serialize"),
+        )
+        .expect("legacy history should write");
+
+        let checkpoint = crate::agent::loop_::ContinuationCheckpoint {
+            reason: "max_tool_iterations".to_string(),
+            original_request: "NEW_JOB: true\nImplementar un proceso recurrente".to_string(),
+            completed_work: "Scaffold listo.".to_string(),
+            pending_work: "Falta implementar el resto.".to_string(),
+            resume_hint: "Continuar desde el job ya creado.".to_string(),
+            user_message: "Checkpoint".to_string(),
+            completed_iterations: 5,
+            max_iterations: 5,
+            autonomous_approved: false,
+            continuation_target: Some(crate::agent::loop_::ContinuationTarget {
+                kind: "service_job".to_string(),
+                id: "infobae-news-csv".to_string(),
+            }),
+            subagent_history_file: Some(relative_history_path.to_string()),
+        };
+        crate::agent::task_checkpoint_store::save_checkpoint(
+            workspace.path(),
+            &delegate_scope,
+            crate::agent::task_checkpoint_store::ROOT_TASK_CHECKPOINT_AGENT,
+            &checkpoint,
+        )
+        .expect("checkpoint should save");
+
+        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>])))
+            .with_workspace(workspace.path().to_path_buf(), false, None);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = CaptureMessagesThenDoneProvider { seen: seen.clone() };
+
+        let result = tool
+            .execute_agentic(
+                "service_builder",
+                &config,
+                &provider,
+                "10x",
+                0.2,
+                None,
+                Some(root_scope),
+                true,
+                10,
+            )
+            .await
+            .expect("resume should succeed");
+
+        assert!(result.success);
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|msg| msg.role == "assistant" && msg.content == "Scaffold listo."));
+        assert!(seen.iter().any(|msg| msg.role == "assistant" && msg.content.contains("¿Quieres que siga?")));
+        assert!(seen.iter().any(|msg| msg.role == "user" && msg.content == "Continue."));
+        assert!(!seen.iter().any(|msg| msg.content.contains("Prior subagent transcript")));
+        assert!(!seen.iter().any(|msg| msg.content.contains("CONTINUATION RESUME DIRECTIVE")));
+        assert!(!seen.iter().any(|msg| msg.content.contains("saved checkpoint")));
+        assert!(!seen.iter().any(|msg| msg.content.starts_with("[Tool results]")));
+        assert!(!seen.iter().any(|msg| msg.content.starts_with("EXISTING_JOB:")));
     }
 
     #[test]
