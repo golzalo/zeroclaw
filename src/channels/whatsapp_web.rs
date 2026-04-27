@@ -2448,6 +2448,7 @@ impl WhatsAppWebChannel {
     const MAX_RETRIES: u32 = 10;
     const BASE_DELAY_SECS: u64 = 3;
     const MAX_DELAY_SECS: u64 = 300;
+    const PAIRING_WATCHDOG_SECS: u64 = 90;
 
     /// Compute the exponential-backoff delay for a given 1-based attempt number.
     /// Doubles each attempt from `BASE_DELAY_SECS`, capped at `MAX_DELAY_SECS`.
@@ -2470,9 +2471,39 @@ impl WhatsAppWebChannel {
         (attempts, attempts > Self::MAX_RETRIES)
     }
 
+    /// Decide whether the reconnect loop should abort after exceeding the retry cap.
+    /// Before the first successful bind we keep retrying indefinitely so QR pairing
+    /// can continue cycling until the user actually links the device.
+    fn should_abort_reconnect(attempts: u32, ever_connected: bool) -> bool {
+        ever_connected && attempts > Self::MAX_RETRIES
+    }
+
     /// Reset the retry counter (called on `Event::Connected`).
     fn reset_retry(retry_count: &std::sync::atomic::AtomicU32) {
         retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn schedule_pairing_watchdog(
+        logout_tx: tokio::sync::broadcast::Sender<()>,
+        session_revoked: Arc<std::sync::atomic::AtomicBool>,
+        currently_connected: Arc<std::sync::atomic::AtomicBool>,
+        pairing_generation: Arc<std::sync::atomic::AtomicU64>,
+        generation: u64,
+    ) {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(Self::PAIRING_WATCHDOG_SECS)).await;
+            let still_waiting_for_same_pairing =
+                pairing_generation.load(std::sync::atomic::Ordering::SeqCst) == generation;
+            let is_connected = currently_connected.load(std::sync::atomic::Ordering::SeqCst);
+            if still_waiting_for_same_pairing && !is_connected {
+                session_revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::warn!(
+                    "WhatsApp Web pairing watchdog expired without a live connection; restarting for a fresh QR"
+                );
+                let _ = logout_tx.send(());
+            }
+        });
     }
 
     /// Return the session file paths to remove (primary + WAL + SHM sidecars).
@@ -4390,6 +4421,7 @@ impl Channel for WhatsAppWebChannel {
         use wa_rs_ureq_http::UreqHttpClient;
 
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ever_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         loop {
             let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
@@ -4432,13 +4464,18 @@ impl Channel for WhatsAppWebChannel {
 
             // Tracks whether Event::LoggedOut actually fired (vs task crash).
             let session_revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let currently_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let pairing_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
             // Build the bot
             let tx_clone = tx.clone();
             let allowed_numbers = self.allowed_numbers.clone();
             let logout_tx_clone = logout_tx.clone();
             let retry_count_clone = retry_count.clone();
+            let ever_connected_clone = ever_connected.clone();
             let session_revoked_clone = session_revoked.clone();
+            let currently_connected_clone = currently_connected.clone();
+            let pairing_generation_clone = pairing_generation.clone();
             let transcription_config = self.transcription.clone();
             let allow_self_chat = self.allow_self_chat;
             let allow_direct_messages = self.allow_direct_messages;
@@ -4474,7 +4511,10 @@ impl Channel for WhatsAppWebChannel {
                     let allowed_numbers = allowed_numbers.clone();
                     let logout_tx = logout_tx_clone.clone();
                     let retry_count = retry_count_clone.clone();
+                    let ever_connected = ever_connected_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
+                    let currently_connected = currently_connected_clone.clone();
+                    let pairing_generation = pairing_generation_clone.clone();
                     let transcription_config = transcription_config.clone();
                     let self_phone = self_phone.clone();
                     let bootstrap_group_done = bootstrap_group_done.clone();
@@ -4805,6 +4845,9 @@ impl Channel for WhatsAppWebChannel {
                             }
                             Event::Connected(_) => {
                                 tracing::info!("WhatsApp Web connected successfully");
+                                currently_connected
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                ever_connected.store(true, std::sync::atomic::Ordering::SeqCst);
                                 WhatsAppWebChannel::reset_retry(&retry_count);
                                 let restored = WhatsAppWebChannel::rehydrate_managed_groups(
                                     Some(&official_group_jid),
@@ -4908,6 +4951,8 @@ impl Channel for WhatsAppWebChannel {
                                 }
                             }
                             Event::LoggedOut(_) => {
+                                currently_connected
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
                                 bootstrap_group_done.store(
                                     false,
@@ -4931,6 +4976,12 @@ impl Channel for WhatsAppWebChannel {
                                 tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
                             }
                             Event::PairingCode { code, .. } => {
+                                currently_connected
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                let generation = pairing_generation.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                ) + 1;
                                 tracing::info!("WhatsApp Web pair code received");
                                 tracing::info!(
                                     "Link your phone by entering this code in WhatsApp > Linked Devices"
@@ -4938,8 +4989,21 @@ impl Channel for WhatsAppWebChannel {
                                 eprintln!();
                                 eprintln!("WhatsApp Web pair code: {code}");
                                 eprintln!();
+                                WhatsAppWebChannel::schedule_pairing_watchdog(
+                                    logout_tx.clone(),
+                                    session_revoked.clone(),
+                                    currently_connected.clone(),
+                                    pairing_generation.clone(),
+                                    generation,
+                                );
                             }
                             Event::PairingQrCode { code, .. } => {
+                                currently_connected
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                let generation = pairing_generation.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                ) + 1;
                                 tracing::info!(
                                     "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
                                 );
@@ -4962,6 +5026,13 @@ impl Channel for WhatsAppWebChannel {
                                         eprintln!();
                                     }
                                 }
+                                WhatsAppWebChannel::schedule_pairing_watchdog(
+                                    logout_tx.clone(),
+                                    session_revoked.clone(),
+                                    currently_connected.clone(),
+                                    pairing_generation.clone(),
+                                    generation,
+                                );
                             }
                             _ => {}
                         }
@@ -5028,10 +5099,19 @@ impl Channel for WhatsAppWebChannel {
 
             if should_reconnect {
                 let (attempts, exceeded) = Self::record_retry(&retry_count);
-                if exceeded {
+                let should_abort = Self::should_abort_reconnect(
+                    attempts,
+                    ever_connected.load(std::sync::atomic::Ordering::SeqCst),
+                );
+                if should_abort {
                     anyhow::bail!(
                         "WhatsApp Web: exceeded {} reconnect attempts, giving up",
                         Self::MAX_RETRIES
+                    );
+                }
+                if exceeded {
+                    tracing::warn!(
+                        "WhatsApp Web: exceeded reconnect retry cap before the first live bind; continuing to cycle pairing"
                     );
                 }
 
@@ -6384,6 +6464,23 @@ mod tests {
         let (attempt, exceeded) = WhatsAppWebChannel::record_retry(&counter);
         assert_eq!(attempt, 1);
         assert!(!exceeded);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn should_abort_reconnect_only_after_first_live_bind() {
+        assert!(!WhatsAppWebChannel::should_abort_reconnect(
+            WhatsAppWebChannel::MAX_RETRIES + 1,
+            false
+        ));
+        assert!(!WhatsAppWebChannel::should_abort_reconnect(
+            WhatsAppWebChannel::MAX_RETRIES,
+            true
+        ));
+        assert!(WhatsAppWebChannel::should_abort_reconnect(
+            WhatsAppWebChannel::MAX_RETRIES + 1,
+            true
+        ));
     }
 
     #[test]

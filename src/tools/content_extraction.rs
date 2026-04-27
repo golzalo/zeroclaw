@@ -4,6 +4,8 @@ use anyhow::Context;
 pub enum HtmlOutputFormat {
     Markdown,
     Text,
+    Html,
+    RawHtml,
 }
 
 impl HtmlOutputFormat {
@@ -16,8 +18,12 @@ impl HtmlOutputFormat {
         {
             "" | "markdown" | "md" => Ok(Self::Markdown),
             "text" | "plain" | "plain_text" => Ok(Self::Text),
+            "html" => Ok(Self::Html),
+            "raw_html" | "raw" => Ok(Self::RawHtml),
             other => {
-                anyhow::bail!("Unsupported HTML output format '{other}'. Use 'markdown' or 'text'.")
+                anyhow::bail!(
+                    "Unsupported HTML output format '{other}'. Use 'markdown', 'text', 'html', or 'raw_html'."
+                )
             }
         }
     }
@@ -28,19 +34,32 @@ pub fn extract_html_for_llm(
     source_url: &str,
     format: HtmlOutputFormat,
 ) -> anyhow::Result<String> {
-    let extracted = extract_main_content(html, source_url);
-
     match format {
-        HtmlOutputFormat::Markdown => markdown_from_extraction(html, extracted.as_ref()),
-        HtmlOutputFormat::Text => text_from_extraction(html, extracted.as_ref()),
+        HtmlOutputFormat::RawHtml => Ok(html.to_string()),
+        HtmlOutputFormat::Html => {
+            let extracted = extract_main_content(html, source_url, true);
+            html_from_extraction(html, extracted.as_ref())
+        }
+        HtmlOutputFormat::Markdown => {
+            let extracted = extract_main_content(html, source_url, false);
+            markdown_from_extraction(html, extracted.as_ref())
+        }
+        HtmlOutputFormat::Text => {
+            let extracted = extract_main_content(html, source_url, false);
+            text_from_extraction(html, extracted.as_ref())
+        }
     }
 }
 
-fn extract_main_content(html: &str, source_url: &str) -> Option<rs_trafilatura::ExtractResult> {
+fn extract_main_content(
+    html: &str,
+    source_url: &str,
+    include_images: bool,
+) -> Option<rs_trafilatura::ExtractResult> {
     let options = rs_trafilatura::Options {
         include_tables: true,
         include_links: true,
-        include_images: false,
+        include_images,
         include_comments: false,
         include_title_in_content: true,
         min_extracted_size: 1,
@@ -58,6 +77,17 @@ fn extract_main_content(html: &str, source_url: &str) -> Option<rs_trafilatura::
             None
         }
     }
+}
+
+fn html_from_extraction(
+    original_html: &str,
+    extracted: Option<&rs_trafilatura::ExtractResult>,
+) -> anyhow::Result<String> {
+    if let Some(extracted_html) = extracted.and_then(|result| non_empty(result.content_html.as_deref())) {
+        return Ok(extracted_html.to_string());
+    }
+
+    Ok(original_html.to_string())
 }
 
 fn markdown_from_extraction(
@@ -131,6 +161,14 @@ mod tests {
             HtmlOutputFormat::parse(Some("plain_text")).unwrap(),
             HtmlOutputFormat::Text
         );
+        assert_eq!(
+            HtmlOutputFormat::parse(Some("html")).unwrap(),
+            HtmlOutputFormat::Html
+        );
+        assert_eq!(
+            HtmlOutputFormat::parse(Some("raw")).unwrap(),
+            HtmlOutputFormat::RawHtml
+        );
         assert!(HtmlOutputFormat::parse(Some("xml")).is_err());
     }
 
@@ -159,6 +197,28 @@ mod tests {
         assert!(text.contains("Hello"));
         assert!(text.contains("world"));
         assert!(!text.contains("<article>"));
+    }
+
+    #[test]
+    fn html_format_preserves_image_tags() {
+        let html = "<html><body><article><h1>Title</h1><img src=\"https://example.com/hero.jpg\" alt=\"hero\" /><p>Hello world</p></article></body></html>";
+        let extracted =
+            extract_html_for_llm(html, "https://example.com/page", HtmlOutputFormat::Html)
+                .unwrap();
+
+        assert!(extracted.contains("<img"));
+        assert!(extracted.contains("hero.jpg"));
+        assert!(extracted.contains("Hello world"));
+    }
+
+    #[test]
+    fn raw_html_format_returns_original_document() {
+        let html = "<html><head><title>Title</title></head><body><article><img src=\"hero.jpg\" /></article></body></html>";
+        let extracted =
+            extract_html_for_llm(html, "https://example.com/page", HtmlOutputFormat::RawHtml)
+                .unwrap();
+
+        assert_eq!(extracted, html);
     }
 
     #[test]
