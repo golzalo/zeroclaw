@@ -13,7 +13,8 @@ use std::time::Duration;
 /// - Only supports GET
 /// - Follows redirects (up to 10)
 /// - Extracts main HTML content via `rs-trafilatura`
-/// - Converts HTML to Markdown via `html-to-markdown-rs`
+/// - Converts HTML to Markdown via `html-to-markdown-rs` by default
+/// - Can also return extracted HTML or raw HTML when callers need image tags
 /// - Passes through text/plain, text/markdown, and application/json as-is
 /// - Sets a descriptive User-Agent
 pub struct WebFetchTool {
@@ -91,6 +92,8 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         "Fetch a web page and return its content as readable Markdown or text. \
          HTML pages are automatically extracted and converted to readable Markdown by default. \
+         Use format='html' to keep extracted article HTML (including image tags when present), \
+         or format='raw_html' to return the original HTML without conversion. \
          JSON and plain text responses are returned as-is. \
          Only GET requests; follows redirects. \
          Security: allowlist-only domains, no local/private hosts."
@@ -106,9 +109,9 @@ impl Tool for WebFetchTool {
                 },
                 "format": {
                     "type": "string",
-                    "enum": ["markdown", "text"],
+                    "enum": ["markdown", "text", "html", "raw_html"],
                     "default": "markdown",
-                    "description": "Output format for HTML responses. Non-HTML responses are returned as-is."
+                    "description": "Output format for HTML responses. Use 'markdown' or 'text' for extracted readable content, 'html' for extracted article HTML with image tags preserved when available, or 'raw_html' for the original HTML. Non-HTML responses are returned as-is."
                 }
             },
             "required": ["url"]
@@ -576,6 +579,14 @@ mod tests {
         assert!(schema["properties"]["url"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("url")));
+        let formats = schema["properties"]["format"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(formats.contains(&"html"));
+        assert!(formats.contains(&"raw_html"));
     }
 
     // ── HTML conversion ──────────────────────────────────────────
@@ -591,6 +602,16 @@ mod tests {
         assert!(text.contains("world"));
         assert!(!text.contains("<h1>"));
         assert!(!text.contains("<p>"));
+    }
+
+    #[test]
+    fn html_format_keeps_image_markup() {
+        let html =
+            "<html><body><article><h1>Title</h1><img src=\"hero.jpg\" alt=\"hero\" /></article></body></html>";
+        let text = extract_html_for_llm(html, "https://example.com/page", HtmlOutputFormat::Html)
+            .unwrap();
+        assert!(text.contains("<img"));
+        assert!(text.contains("hero.jpg"));
     }
 
     // ── URL validation ───────────────────────────────────────────

@@ -61,6 +61,136 @@ fn delegate_task_scope(scope_key: &str, agent_name: &str) -> String {
     format!("{scope_key}::delegate::{agent_name}")
 }
 
+fn contains_any(normalized: &str, terms: &[&str]) -> bool {
+    terms.iter().any(|term| normalized.contains(term))
+}
+
+fn is_explicit_native_google_workspace_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "native google doc",
+            "native google docs",
+            "google docs body",
+            "google doc body",
+            "edit the google doc body",
+            "edit the google docs body",
+            "not docx",
+            "no docx",
+            "instead of docx",
+            "gdoc",
+        ],
+    )
+}
+
+fn looks_like_drive_image_artifact_request(prompt: &str) -> bool {
+    let normalized = prompt.to_ascii_lowercase();
+    let has_image_signal = contains_any(
+        &normalized,
+        &[
+            "[image:",
+            "image",
+            "imagen",
+            "photo",
+            "foto",
+            "screenshot",
+            "captura",
+            "logo",
+        ],
+    );
+    let has_document_signal = contains_any(
+        &normalized,
+        &[
+            "docx",
+            "pptx",
+            "xlsx",
+            "document",
+            "documento",
+            "doc ",
+            " doc",
+            "word",
+            "slide",
+            "slides",
+            "presentation",
+            "presentacion",
+            "powerpoint",
+            "deck",
+            "spreadsheet",
+            "sheet",
+            "excel",
+            "workbook",
+            "planilla",
+        ],
+    );
+
+    has_image_signal
+        && has_document_signal
+        && !is_explicit_native_google_workspace_request(&normalized)
+}
+
+fn infer_drive_office_kind(prompt: &str) -> &'static str {
+    let normalized = prompt.to_ascii_lowercase();
+    if contains_any(
+        &normalized,
+        &[
+            "pptx",
+            "powerpoint",
+            "slide",
+            "slides",
+            "presentation",
+            "presentacion",
+            "deck",
+        ],
+    ) {
+        return "pptx";
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "xlsx",
+            "spreadsheet",
+            "excel",
+            "sheet",
+            "workbook",
+            "planilla",
+        ],
+    ) {
+        return "xlsx";
+    }
+    "docx"
+}
+
+fn maybe_rewrite_drive_delegate_prompt(prompt: &str) -> Option<String> {
+    if !looks_like_drive_image_artifact_request(prompt) {
+        return None;
+    }
+
+    let office_kind = infer_drive_office_kind(prompt);
+    Some(format!(
+        "[Structured Drive Office Upload]\n\
+mode: office_artifact_upload\n\
+office_kind: {office_kind}\n\
+contains_embedded_image: true\n\
+\n\
+Execute this as a Google Drive Office upload task, not as native Google Docs/Sheets/Slides body editing.\n\
+Unless the user explicitly requested a native Google workspace body, create a local {office_kind} artifact with the image embedded and upload it with `contentBase64`.\n\
+Prefer the deterministic helper command `python3 tools/drive_artifact_upload.py create-and-upload --kind {office_kind} --name <file>.{office_kind} --input <payload.json>` after writing any structured payload you need.\n\
+If the prompt references an image the user just uploaded and no explicit image path is present, inspect `attachments/whatsapp/` for the most recent image file before failing.\n\
+If the user asked generically for a doc/document with an image, default to `docx`.\n\
+\n\
+Original request:\n\
+{prompt}"
+    ))
+}
+
+fn normalize_delegate_prompt(agent_name: &str, prompt: &str) -> String {
+    if agent_name.eq_ignore_ascii_case("drive") {
+        return maybe_rewrite_drive_delegate_prompt(prompt)
+            .unwrap_or_else(|| prompt.to_string());
+    }
+    prompt.to_string()
+}
+
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
@@ -372,6 +502,7 @@ impl Tool for DelegateTool {
         } else {
             format!("[Context]\n{context}\n\n[Task]\n{prompt}")
         };
+        let routed_prompt = normalize_delegate_prompt(agent_name, &full_prompt);
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
         let remote_budget = RemoteBudgetClient::from_env();
@@ -383,7 +514,7 @@ impl Tool for DelegateTool {
                     agent_name,
                     agent_config,
                     &*provider,
-                    &full_prompt,
+                    &routed_prompt,
                     temperature,
                     remote_budget.as_ref(),
                     continuation_scope,
@@ -393,11 +524,11 @@ impl Tool for DelegateTool {
                 .await;
         }
 
-        let messages = build_delegate_messages(agent_config.system_prompt.as_deref(), &full_prompt);
+        let messages = build_delegate_messages(agent_config.system_prompt.as_deref(), &routed_prompt);
         let quote = if let Some(remote_budget) = remote_budget.as_ref() {
             let (estimated_input_tokens, estimated_output_tokens) = estimate_delegate_tokens(
                 agent_config.system_prompt.as_deref(),
-                &full_prompt,
+                &routed_prompt,
                 false,
                 1,
             );
@@ -913,6 +1044,7 @@ mod tests {
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
+    use std::sync::Mutex;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -1181,6 +1313,46 @@ mod tests {
             build_delegate_resume_followup_message("Please finish the publish step."),
             "Please finish the publish step."
         );
+    }
+
+    #[test]
+    fn normalize_delegate_prompt_routes_drive_doc_with_image_to_docx_upload() {
+        let prompt = "Create a doc in Drive with this image [IMAGE:data:image/png;base64,abc]";
+
+        let normalized = normalize_delegate_prompt("drive", prompt);
+
+        assert!(normalized.contains("[Structured Drive Office Upload]"));
+        assert!(normalized.contains("office_kind: docx"));
+        assert!(normalized.contains("drive_artifact_upload.py create-and-upload"));
+        assert!(normalized.contains("attachments/whatsapp/"));
+        assert!(normalized.contains("Original request:\nCreate a doc in Drive"));
+    }
+
+    #[test]
+    fn normalize_delegate_prompt_routes_drive_slides_with_image_to_pptx_upload() {
+        let prompt = "Create a PowerPoint in Drive with this screenshot embedded.";
+
+        let normalized = normalize_delegate_prompt("drive", prompt);
+
+        assert!(normalized.contains("office_kind: pptx"));
+    }
+
+    #[test]
+    fn normalize_delegate_prompt_routes_drive_spreadsheet_with_image_to_xlsx_upload() {
+        let prompt = "Subi a Drive una planilla Excel con esta imagen.";
+
+        let normalized = normalize_delegate_prompt("drive", prompt);
+
+        assert!(normalized.contains("office_kind: xlsx"));
+    }
+
+    #[test]
+    fn normalize_delegate_prompt_preserves_explicit_native_google_docs_requests() {
+        let prompt = "Create a native Google Docs body and not docx for this image.";
+
+        let normalized = normalize_delegate_prompt("drive", prompt);
+
+        assert_eq!(normalized, prompt);
     }
 
     #[test]
