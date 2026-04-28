@@ -83,11 +83,15 @@ pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
+pub mod whatsapp_configure_conversation_policy;
 pub mod whatsapp_create_topic_group;
 pub mod whatsapp_enable_community;
+pub mod whatsapp_list_direct_chats;
 pub mod whatsapp_list_groups;
 pub mod whatsapp_list_observed_groups;
 pub mod whatsapp_observe_group;
+pub mod whatsapp_objective_dm;
+pub mod whatsapp_start_direct_conversation;
 pub mod whatsapp_unobserve_group;
 pub mod workspace_tool;
 
@@ -158,11 +162,15 @@ pub use traits::Tool;
 pub use traits::{ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
+pub use whatsapp_configure_conversation_policy::WhatsAppConfigureConversationPolicyTool;
 pub use whatsapp_create_topic_group::WhatsAppCreateTopicGroupTool;
 pub use whatsapp_enable_community::WhatsAppEnableCommunityTool;
+pub use whatsapp_list_direct_chats::WhatsAppListDirectChatsTool;
 pub use whatsapp_list_groups::WhatsAppListGroupsTool;
 pub use whatsapp_list_observed_groups::WhatsAppListObservedGroupsTool;
 pub use whatsapp_observe_group::WhatsAppObserveGroupTool;
+pub use whatsapp_objective_dm::WhatsAppObjectiveDmTool;
+pub use whatsapp_start_direct_conversation::WhatsAppStartDirectConversationTool;
 pub use whatsapp_unobserve_group::WhatsAppUnobserveGroupTool;
 pub use workspace_tool::WorkspaceTool;
 
@@ -426,13 +434,26 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
         Arc::new(CalculatorTool::new()),
+        Arc::new(WhatsAppConfigureConversationPolicyTool::new(
+            workspace_dir.to_path_buf(),
+            security.clone(),
+        )),
         Arc::new(WhatsAppCreateTopicGroupTool::new(security.clone())),
         Arc::new(WhatsAppEnableCommunityTool::new(security.clone())),
+        Arc::new(WhatsAppListDirectChatsTool::new(workspace_dir.to_path_buf())),
         Arc::new(WhatsAppListGroupsTool::new(workspace_dir.to_path_buf())),
         Arc::new(WhatsAppListObservedGroupsTool::new(
             workspace_dir.to_path_buf(),
         )),
         Arc::new(WhatsAppObserveGroupTool::new(
+            workspace_dir.to_path_buf(),
+            security.clone(),
+        )),
+        Arc::new(WhatsAppObjectiveDmTool::new(
+            workspace_dir.to_path_buf(),
+            security.clone(),
+        )),
+        Arc::new(WhatsAppStartDirectConversationTool::new(
             workspace_dir.to_path_buf(),
             security.clone(),
         )),

@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::channels::whatsapp_observation::WhatsAppObservationService;
+use crate::channels::whatsapp_observation::{ConversationMode, WhatsAppObservationService};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -28,7 +28,7 @@ impl Tool for WhatsAppObserveGroupTool {
     }
 
     fn description(&self) -> &str {
-        "Register a WhatsApp group for passive observation only. This captures future messages into the observation log and does not make the agent reply in that observed-only group."
+        "Register or update a WhatsApp group conversation policy. Use mode='observe_only' for passive summaries, mode='mention_reply' to let the agent answer when explicitly mentioned, or mode='managed_group' for active participation. Policies can also pin a workspace skill so future replies follow that playbook."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -46,6 +46,15 @@ impl Tool for WhatsAppObserveGroupTool {
                 "delivery_chat_jid": {
                     "type": "string",
                     "description": "Chat JID that controls this observation. When observing from the current conversation, pass the current reply_target."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["observe_only", "mention_reply", "managed_group"],
+                    "description": "Conversation mode. Defaults to observe_only for new groups; omitted mode keeps the existing mode when updating an already observed group."
+                },
+                "skill_name": {
+                    "type": "string",
+                    "description": "Optional workspace skill name from workspace/skills. If omitted, the existing policy skill is preserved when present."
                 }
             },
             "required": ["delivery_chat_jid"]
@@ -70,6 +79,33 @@ impl Tool for WhatsAppObserveGroupTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing 'delivery_chat_jid' parameter"))?;
+        let mode = match args
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::parse::<ConversationMode>)
+            .transpose()
+        {
+            Ok(mode) => mode,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
+        };
+        if mode == Some(ConversationMode::ObjectiveDm) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "mode `objective_dm` only applies to WhatsApp direct chats. Use `whatsapp_objective_dm` for 1:1 objective-driven conversations."
+                        .to_string(),
+                ),
+            });
+        }
         let service = WhatsAppObservationService::new(self.workspace_dir.clone());
         let group = match service.resolve_visible_group(
             args.get("group_jid").and_then(|value| value.as_str()),
@@ -84,11 +120,27 @@ impl Tool for WhatsAppObserveGroupTool {
                 });
             }
         };
+        let existing = service.observed_group_config(&group.group_jid);
+        let skill_name = match service.resolve_workspace_skill_name(
+            args.get("skill_name").and_then(|value| value.as_str()),
+            existing.as_ref().and_then(|policy| policy.skill_name.as_deref()),
+        ) {
+            Ok(skill_name) => skill_name,
+            Err(err) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(err.to_string()),
+                });
+            }
+        };
 
-        let observed = match service.register_observed_group(
+        let observed = match service.register_observed_group_with_mode_and_skill(
             &group.group_jid,
             &group.group_name,
             delivery_chat_jid,
+            mode,
+            skill_name.as_deref(),
         ) {
             Ok(observed) => observed,
             Err(err) => {
@@ -100,14 +152,35 @@ impl Tool for WhatsAppObserveGroupTool {
             }
         };
 
+        let mode_note = match observed.mode {
+            ConversationMode::ObserveOnly => {
+                "Passive capture only; the agent will not reply inside that group."
+            }
+            ConversationMode::MentionReply => {
+                "The agent will only answer when explicitly mentioned or when someone replies to one of its messages."
+            }
+            ConversationMode::ObjectiveDm => {
+                "Reserved for direct-message objective workflows; group replies stay disabled."
+            }
+            ConversationMode::ManagedGroup => {
+                "The agent may actively participate in that group."
+            }
+        };
+
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Now observing WhatsApp group '{}' (jid={}). Control chat: {}. Log path: {}. Capture mode: passive only; no replies are sent to this observed-only group.",
+                "WhatsApp group '{}' (jid={}) is now configured in mode `{}`. Skill: {}. Control chat: {}. Log path: {}. {}",
                 observed.group_name,
                 observed.group_jid,
+                observed.mode.as_str(),
+                observed
+                    .skill_name
+                    .as_deref()
+                    .unwrap_or("none"),
                 observed.delivery_chat_jid,
-                service.observed_group_log_path(&observed.group_jid).display()
+                service.observed_group_log_path(&observed.group_jid).display(),
+                mode_note,
             ),
             error: None,
         })
@@ -122,6 +195,13 @@ mod tests {
     #[tokio::test]
     async fn observe_group_registers_cached_group() {
         let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("skills").join("whatsapp_mention_reply");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: whatsapp_mention_reply\ndescription: Mention reply\n---\n# Mention Reply\n",
+        )
+        .unwrap();
         let service = WhatsAppObservationService::new(temp.path().to_path_buf());
         service
             .save_visible_groups(&[VisibleGroupRecord {
@@ -141,15 +221,22 @@ mod tests {
         let result = tool
             .execute(json!({
                 "group_name": "Los Pibes",
-                "delivery_chat_jid": "120363408016257691@g.us"
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "mode": "mention_reply",
+                "skill_name": "whatsapp_mention_reply"
             }))
             .await
             .unwrap();
 
         assert!(result.success);
-        assert!(result.output.contains("Now observing WhatsApp group 'Los Pibes'"));
-        assert!(service
+        assert!(result.output.contains("mode `mention_reply`"));
+        let observed = service
             .observed_group_config("120363025123456789@g.us")
-            .is_some());
+            .unwrap();
+        assert_eq!(observed.mode, ConversationMode::MentionReply);
+        assert_eq!(
+            observed.skill_name.as_deref(),
+            Some("whatsapp_mention_reply")
+        );
     }
 }

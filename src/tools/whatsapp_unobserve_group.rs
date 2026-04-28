@@ -28,7 +28,7 @@ impl Tool for WhatsAppUnobserveGroupTool {
     }
 
     fn description(&self) -> &str {
-        "Stop observing a WhatsApp group. This removes the group from the observation index but keeps any existing JSONL log on disk."
+        "Remove a WhatsApp conversation policy. This stops future capture/replies for that target but keeps any existing JSONL log on disk."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -37,11 +37,11 @@ impl Tool for WhatsAppUnobserveGroupTool {
             "properties": {
                 "group_jid": {
                     "type": "string",
-                    "description": "Exact WhatsApp group JID to stop observing."
+                    "description": "Exact WhatsApp target JID to remove from conversation policies."
                 },
                 "group_name": {
                     "type": "string",
-                    "description": "Observed group name to stop observing."
+                    "description": "Configured group or direct-conversation label to remove."
                 }
             }
         })
@@ -78,7 +78,7 @@ impl Tool for WhatsAppUnobserveGroupTool {
             Ok(Some(_)) => Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "Stopped observing WhatsApp group '{}' (jid={}). Existing log was kept at {}.",
+                    "Removed the WhatsApp conversation policy for '{}' (jid={}). Existing log was kept at {}.",
                     observed.group_name,
                     observed.group_jid,
                     service.observed_group_log_path(&observed.group_jid).display()
@@ -89,7 +89,7 @@ impl Tool for WhatsAppUnobserveGroupTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "WhatsApp group '{}' was not observed anymore.",
+                    "WhatsApp conversation '{}' no longer had an active policy.",
                     observed.group_name
                 )),
             }),

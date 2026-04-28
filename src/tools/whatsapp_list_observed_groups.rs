@@ -21,7 +21,7 @@ impl Tool for WhatsAppListObservedGroupsTool {
     }
 
     fn description(&self) -> &str {
-        "List WhatsApp groups currently registered for passive observation."
+        "List WhatsApp conversation policies currently registered for groups or direct chats, including their active mode and control chat."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

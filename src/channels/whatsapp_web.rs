@@ -30,7 +30,10 @@
 //! The Cloud API channel is used when `phone_number_id` is set.
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use super::whatsapp_observation::{VisibleGroupRecord, WhatsAppObservationService};
+use super::whatsapp_observation::{
+    ConversationChatKind, ConversationMode, ConversationPolicyStatus, ObservedGroupConfig,
+    ObservedGroupMessageMetadata, VisibleGroupRecord, WhatsAppObservationService,
+};
 use super::whatsapp_storage::RusqliteStore;
 use crate::remote_budget::RemoteBudgetClient;
 use anyhow::{anyhow, Result};
@@ -658,6 +661,137 @@ impl WhatsAppWebChannel {
         }
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn identity_match_tokens(value: &str) -> Vec<String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        let mut tokens = Vec::new();
+        let mut push_token = |token: String| {
+            let normalized = token.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return;
+            }
+            if !tokens.iter().any(|existing| existing == &normalized) {
+                tokens.push(normalized);
+            }
+        };
+
+        push_token(trimmed.to_string());
+
+        let user_part = trimmed
+            .split_once('@')
+            .map(|(user, _)| user)
+            .unwrap_or(trimmed)
+            .split_once(':')
+            .map(|(user, _)| user)
+            .unwrap_or_else(|| trimmed.split_once('@').map(|(user, _)| user).unwrap_or(trimmed))
+            .trim();
+        push_token(user_part.to_string());
+
+        if let Some(phone) = Self::normalize_phone_token(trimmed) {
+            push_token(phone.clone());
+            push_token(phone.trim_start_matches('+').to_string());
+        }
+
+        tokens
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn build_agent_identity_tokens(
+        self_phone: Option<&str>,
+        self_identity_aliases: &[String],
+    ) -> std::collections::HashSet<String> {
+        let mut tokens = std::collections::HashSet::new();
+
+        for value in self_phone.into_iter().chain(self_identity_aliases.iter().map(String::as_str)) {
+            for token in Self::identity_match_tokens(value) {
+                tokens.insert(token);
+            }
+        }
+
+        tokens
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn value_matches_agent_identity(
+        value: &str,
+        agent_identity_tokens: &std::collections::HashSet<String>,
+    ) -> bool {
+        Self::identity_match_tokens(value)
+            .into_iter()
+            .any(|candidate| agent_identity_tokens.contains(&candidate))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_textual_mentions(text: &str) -> Vec<String> {
+        let mut mentions = Vec::new();
+        let chars: Vec<char> = text.chars().collect();
+        let mut index = 0usize;
+
+        while index < chars.len() {
+            if chars[index] != '@' {
+                index += 1;
+                continue;
+            }
+
+            let start = index + 1;
+            let mut end = start;
+            while end < chars.len() {
+                let ch = chars[end];
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if end > start {
+                let mention = chars[start..end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_ascii_lowercase();
+                if !mention.is_empty() {
+                    mentions.push(mention);
+                }
+            }
+
+            index = end.max(start);
+        }
+
+        mentions
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn collect_self_identity_aliases(
+        sender: &wa_rs_binary::jid::Jid,
+        sender_alt: Option<&wa_rs_binary::jid::Jid>,
+        mapped_sender_phone: Option<&str>,
+        self_phone: Option<&str>,
+        sender_candidates: &[String],
+    ) -> Vec<String> {
+        let Some(self_number) = self_phone else {
+            return Vec::new();
+        };
+        if !sender_candidates.iter().any(|candidate| candidate == self_number) {
+            return Vec::new();
+        }
+
+        let mut aliases = vec![sender.to_string(), self_number.to_string()];
+        if let Some(alt) = sender_alt {
+            aliases.push(alt.to_string());
+        }
+        if let Some(mapped_sender_phone) = mapped_sender_phone {
+            aliases.push(mapped_sender_phone.to_string());
+        }
+        aliases.sort();
+        aliases.dedup();
+        aliases
+    }
+
     /// Build normalized sender candidates from sender JID, optional alt JID, and optional LID->PN mapping.
     #[cfg(feature = "whatsapp-web")]
     fn sender_phone_candidates(
@@ -802,20 +936,32 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
-    fn allows_group_policy_override(
+    fn allows_conversation_policy_override(
         decision: &WhatsAppChatPolicyDecision,
         rejection_reason: &str,
         group_is_managed: bool,
-        group_is_observed: bool,
+        conversation_policy: Option<&ObservedGroupConfig>,
     ) -> bool {
-        if decision.chat_kind != WhatsAppChatKind::Group {
-            return false;
-        }
-
-        match rejection_reason {
-            "group_disabled" => group_is_managed || group_is_observed,
-            "sender_not_in_allowlist" => group_is_observed,
-            _ => false,
+        match decision.chat_kind {
+            WhatsAppChatKind::Group => {
+                let group_is_observed = conversation_policy
+                    .is_some_and(|policy| policy.chat_kind == ConversationChatKind::Group);
+                match rejection_reason {
+                    "group_disabled" => group_is_managed || group_is_observed,
+                    "sender_not_in_allowlist" => group_is_observed,
+                    _ => false,
+                }
+            }
+            WhatsAppChatKind::Direct => conversation_policy.is_some_and(|policy| {
+                policy.chat_kind == ConversationChatKind::Direct
+                    && matches!(
+                        policy.mode,
+                        ConversationMode::ObserveOnly | ConversationMode::ObjectiveDm
+                    )
+                    && policy.status == ConversationPolicyStatus::Active
+                    && matches!(rejection_reason, "direct_disabled" | "sender_not_in_allowlist")
+            }),
+            WhatsAppChatKind::SelfChat => false,
         }
     }
 
@@ -2742,6 +2888,156 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn extract_context_info<'a>(
+        msg: &'a wa_rs_proto::whatsapp::Message,
+    ) -> Option<&'a wa_rs_proto::whatsapp::ContextInfo> {
+        msg.extended_text_message
+            .as_deref()
+            .and_then(|item| item.context_info.as_deref())
+            .or_else(|| {
+                msg.image_message
+                    .as_deref()
+                    .and_then(|item| item.context_info.as_deref())
+            })
+            .or_else(|| {
+                msg.document_message
+                    .as_deref()
+                    .and_then(|item| item.context_info.as_deref())
+            })
+            .or_else(|| {
+                msg.video_message
+                    .as_deref()
+                    .and_then(|item| item.context_info.as_deref())
+            })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn context_mentions_agent(
+        context_info: &wa_rs_proto::whatsapp::ContextInfo,
+        message_text: Option<&str>,
+        self_phone: Option<&str>,
+        self_identity_aliases: &[String],
+    ) -> bool {
+        let agent_identity_tokens =
+            Self::build_agent_identity_tokens(self_phone, self_identity_aliases);
+        if agent_identity_tokens.is_empty() {
+            return false;
+        }
+
+        if context_info
+            .mentioned_jid
+            .iter()
+            .any(|jid| Self::value_matches_agent_identity(jid, &agent_identity_tokens))
+        {
+            return true;
+        }
+
+        message_text.is_some_and(|text| {
+            Self::extract_textual_mentions(text).into_iter().any(|mention| {
+                agent_identity_tokens.contains(&mention)
+                    || Self::normalize_phone_token(&mention)
+                        .is_some_and(|candidate| agent_identity_tokens.contains(&candidate))
+            })
+        })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn context_replies_to_agent(
+        context_info: &wa_rs_proto::whatsapp::ContextInfo,
+        self_phone: Option<&str>,
+        self_identity_aliases: &[String],
+    ) -> bool {
+        let agent_identity_tokens =
+            Self::build_agent_identity_tokens(self_phone, self_identity_aliases);
+        if agent_identity_tokens.is_empty() {
+            return false;
+        }
+
+        context_info
+            .participant
+            .as_deref()
+            .is_some_and(|participant| {
+                Self::value_matches_agent_identity(participant, &agent_identity_tokens)
+            })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_observed_group_trigger(
+        msg: &wa_rs_proto::whatsapp::Message,
+        message_text: Option<&str>,
+        self_phone: Option<&str>,
+        self_identity_aliases: &[String],
+    ) -> ObservedGroupTrigger {
+        let Some(context_info) = Self::extract_context_info(msg) else {
+            return ObservedGroupTrigger {
+                mentions_agent: message_text.is_some_and(|text| {
+                    let agent_identity_tokens =
+                        Self::build_agent_identity_tokens(self_phone, self_identity_aliases);
+                    !agent_identity_tokens.is_empty()
+                        && Self::extract_textual_mentions(text).into_iter().any(|mention| {
+                            agent_identity_tokens.contains(&mention)
+                                || Self::normalize_phone_token(&mention).is_some_and(|candidate| {
+                                    agent_identity_tokens.contains(&candidate)
+                                })
+                        })
+                }),
+                ..Default::default()
+            };
+        };
+
+        ObservedGroupTrigger {
+            mentions_agent: Self::context_mentions_agent(
+                context_info,
+                message_text,
+                self_phone,
+                self_identity_aliases,
+            ),
+            replied_to_agent: Self::context_replies_to_agent(
+                context_info,
+                self_phone,
+                self_identity_aliases,
+            ),
+            quoted_message_id: context_info.stanza_id.clone(),
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn should_invoke_observed_group_agent(
+        observed_group: &ObservedGroupConfig,
+        trigger: &ObservedGroupTrigger,
+    ) -> bool {
+        if observed_group.status != ConversationPolicyStatus::Active {
+            return false;
+        }
+
+        if !observed_group.mode.allows_agent_reply() {
+            return false;
+        }
+
+        match observed_group.mode {
+            ConversationMode::MentionReply => trigger.should_invoke(),
+            ConversationMode::ManagedGroup => true,
+            ConversationMode::ObjectiveDm => false,
+            ConversationMode::ObserveOnly => false,
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn should_invoke_group_agent(
+        group_is_managed: bool,
+        conversation_policy: Option<&ObservedGroupConfig>,
+        trigger: &ObservedGroupTrigger,
+    ) -> bool {
+        if let Some(policy) = conversation_policy
+            .filter(|policy| policy.chat_kind == ConversationChatKind::Group)
+        {
+            return Self::should_invoke_observed_group_agent(policy, trigger);
+        }
+
+        group_is_managed
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     async fn collect_image_markers(
         client: &wa_rs::Client,
         msg: &wa_rs_proto::whatsapp::Message,
@@ -3984,9 +4280,15 @@ impl WhatsAppWebChannel {
             return WHATSAPP_OFFICIAL_GROUP_DELIVERY_TARGET.to_string();
         }
 
-        if matches!(chat_kind, WhatsAppChatKind::SelfChat) && chat_is_lid {
+        if chat_is_lid && matches!(chat_kind, WhatsAppChatKind::SelfChat | WhatsAppChatKind::Direct)
+        {
+            let fallback_phone = if matches!(chat_kind, WhatsAppChatKind::SelfChat) {
+                self_phone
+            } else {
+                None
+            };
             mapped_chat_phone
-                .or(self_phone)
+                .or(fallback_phone)
                 .and_then(Self::normalize_phone_token)
                 .map(|phone| format!("{}@s.whatsapp.net", phone.trim_start_matches('+')))
                 .unwrap_or_else(|| chat.to_string())
@@ -4139,6 +4441,21 @@ struct WhatsAppChatPolicyDecision {
 }
 
 #[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ObservedGroupTrigger {
+    mentions_agent: bool,
+    replied_to_agent: bool,
+    quoted_message_id: Option<String>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl ObservedGroupTrigger {
+    fn should_invoke(&self) -> bool {
+        self.mentions_agent || self.replied_to_agent
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
@@ -4286,15 +4603,18 @@ impl Channel for WhatsAppWebChannel {
                         return Err(err.into());
                     }
                 }
-                if observation_service
-                    .observed_group_config(&message.recipient)
-                    .is_some()
+                if let Some(conversation_policy) = observation_service
+                    .conversation_policy_for_target(&message.recipient)
                 {
-                    let _ = observation_service.append_observed_group_message(
-                        &message.recipient,
+                    let _ = observation_service.append_observed_group_message_with_metadata(
+                        &conversation_policy.group_jid,
                         "assistant",
                         "agent",
                         &clean_content,
+                        ObservedGroupMessageMetadata {
+                            event: Some("message".to_string()),
+                            ..Default::default()
+                        },
                     );
                 }
             }
@@ -4312,17 +4632,21 @@ impl Channel for WhatsAppWebChannel {
                 }
             }
 
-            if clean_content.is_empty()
-                && observation_service
-                    .observed_group_config(&message.recipient)
-                    .is_some()
-            {
-                let _ = observation_service.append_observed_group_message(
-                    &message.recipient,
-                    "assistant",
-                    "agent",
-                    "[Adjunto enviado por el agente]",
-                );
+            if clean_content.is_empty() {
+                if let Some(conversation_policy) = observation_service
+                    .conversation_policy_for_target(&message.recipient)
+                {
+                    let _ = observation_service.append_observed_group_message_with_metadata(
+                        &conversation_policy.group_jid,
+                        "assistant",
+                        "agent",
+                        "[Adjunto enviado por el agente]",
+                        ObservedGroupMessageMetadata {
+                            event: Some("attachment".to_string()),
+                            ..Default::default()
+                        },
+                    );
+                }
             }
 
             self.maybe_start_support_provisioning_after_general_reply(
@@ -4343,15 +4667,18 @@ impl Channel for WhatsAppWebChannel {
                     return Err(err);
                 }
             }
-            if observation_service
-                .observed_group_config(&message.recipient)
-                .is_some()
+            if let Some(conversation_policy) = observation_service
+                .conversation_policy_for_target(&message.recipient)
             {
-                let _ = observation_service.append_observed_group_message(
-                    &message.recipient,
+                let _ = observation_service.append_observed_group_message_with_metadata(
+                    &conversation_policy.group_jid,
                     "assistant",
                     "agent",
                     "[Adjunto enviado por el agente]",
+                    ObservedGroupMessageMetadata {
+                        event: Some("attachment".to_string()),
+                        ..Default::default()
+                    },
                 );
             }
             self.maybe_start_support_provisioning_after_general_reply(
@@ -4384,15 +4711,20 @@ impl Channel for WhatsAppWebChannel {
                 }
             }
         };
-        if observation_service
-            .observed_group_config(&message.recipient)
-            .is_some()
+        if let Some(conversation_policy) = observation_service
+            .conversation_policy_for_target(&message.recipient)
         {
-            let _ = observation_service.append_observed_group_message(
-                &message.recipient,
+            let message_id_string = message_id.to_string();
+            let _ = observation_service.append_observed_group_message_with_metadata(
+                &conversation_policy.group_jid,
                 "assistant",
                 "agent",
                 &clean_content,
+                ObservedGroupMessageMetadata {
+                    message_id: Some(message_id_string),
+                    event: Some("message".to_string()),
+                    ..Default::default()
+                },
             );
         }
         tracing::debug!(
@@ -4564,6 +4896,18 @@ impl Channel for WhatsAppWebChannel {
                                     decision.rejection_reason.unwrap_or("accepted");
                                 let configured_group = official_group_jid.lock().clone();
                                 let observation_service = Self::observation_service();
+                                let conversation_policy = match decision.chat_kind {
+                                    WhatsAppChatKind::Group => {
+                                        observation_service.conversation_policy_config(&chat)
+                                    }
+                                    WhatsAppChatKind::Direct => {
+                                        observation_service.direct_chat_policy_for_candidates(
+                                            Some(&chat),
+                                            &chat_candidates,
+                                        )
+                                    }
+                                    WhatsAppChatKind::SelfChat => None,
+                                };
                                 let managed_group_name = if decision.chat_kind
                                     == WhatsAppChatKind::Group
                                 {
@@ -4589,14 +4933,31 @@ impl Channel for WhatsAppWebChannel {
                                     .as_deref()
                                     .map(Self::is_support_group_name)
                                     .unwrap_or(false);
-                                let group_is_observed = decision.chat_kind == WhatsAppChatKind::Group
-                                    && observation_service.observed_group_config(&chat).is_some();
+                                let group_is_observed = conversation_policy
+                                    .as_ref()
+                                    .is_some_and(|policy| {
+                                        policy.chat_kind == ConversationChatKind::Group
+                                    });
+                                let direct_observe_only_policy_active = conversation_policy
+                                    .as_ref()
+                                    .is_some_and(|policy| {
+                                        policy.chat_kind == ConversationChatKind::Direct
+                                            && policy.mode == ConversationMode::ObserveOnly
+                                            && policy.status == ConversationPolicyStatus::Active
+                                    });
+                                let direct_objective_policy_active = conversation_policy
+                                    .as_ref()
+                                    .is_some_and(|policy| {
+                                        policy.chat_kind == ConversationChatKind::Direct
+                                            && policy.mode == ConversationMode::ObjectiveDm
+                                            && policy.status == ConversationPolicyStatus::Active
+                                    });
                                 let accepted = decision.accepted
-                                    || Self::allows_group_policy_override(
+                                    || Self::allows_conversation_policy_override(
                                         &decision,
                                         rejection_reason,
                                         group_is_managed,
-                                        group_is_observed,
+                                        conversation_policy.as_ref(),
                                     );
 
                                 tracing::trace!(
@@ -4622,6 +4983,29 @@ impl Channel for WhatsAppWebChannel {
                                     rejection_reason,
                                     "WhatsApp Web inbound chat policy evaluation"
                                 );
+
+                                if decision.chat_kind == WhatsAppChatKind::Direct {
+                                    let direct_phone = chat_candidates
+                                        .first()
+                                        .cloned()
+                                        .or_else(|| sender_candidates.first().cloned());
+                                    let direct_display_name = conversation_policy
+                                        .as_ref()
+                                        .map(|policy| policy.group_name.clone())
+                                        .unwrap_or_else(|| {
+                                            direct_phone.clone().unwrap_or_else(|| chat.clone())
+                                        });
+                                    if let Err(err) = observation_service.record_visible_direct_chat(
+                                        &chat,
+                                        &direct_display_name,
+                                        direct_phone.as_deref(),
+                                    ) {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            "WhatsApp Web failed to cache visible direct chat: {err}"
+                                        );
+                                    }
+                                }
 
                                 if !accepted {
                                     tracing::warn!(
@@ -4710,6 +5094,20 @@ impl Channel for WhatsAppWebChannel {
                                 sections.extend(document_markers);
 
                                 let content = sections.join("\n\n");
+                                let self_identity_aliases =
+                                    observation_service.load_self_identity_aliases();
+                                let observed_group_trigger = if decision.chat_kind
+                                    == WhatsAppChatKind::Group
+                                {
+                                    Self::extract_observed_group_trigger(
+                                        content_msg,
+                                        content_msg.text_content(),
+                                        self_phone.as_deref(),
+                                        &self_identity_aliases,
+                                    )
+                                } else {
+                                    ObservedGroupTrigger::default()
+                                };
 
                                 tracing::info!(
                                     "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={}, attachments={})",
@@ -4723,17 +5121,45 @@ impl Channel for WhatsAppWebChannel {
                                     content
                                 );
 
-                                if decision.chat_kind == WhatsAppChatKind::Group
+                                let self_identity_aliases_to_record =
+                                    Self::collect_self_identity_aliases(
+                                        &sender_jid,
+                                        sender_alt.as_ref(),
+                                        mapped_sender_phone.as_deref(),
+                                        self_phone.as_deref(),
+                                        &sender_candidates,
+                                    );
+                                if !self_identity_aliases_to_record.is_empty() {
+                                    if let Err(err) = observation_service
+                                        .record_self_identity_aliases(self_identity_aliases_to_record)
+                                    {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            "WhatsApp Web failed to persist self identity aliases: {err}"
+                                        );
+                                    }
+                                }
+
+                                if matches!(
+                                    decision.chat_kind,
+                                    WhatsAppChatKind::Group | WhatsAppChatKind::Direct
+                                )
                                     && !Self::is_agent_echo_content(&content)
                                 {
-                                    if let Some(observed_group) =
-                                        observation_service.observed_group_config(&chat)
-                                    {
-                                        if let Err(err) = observation_service.append_observed_group_message(
-                                            &observed_group.group_jid,
+                                    if let Some(conversation_policy) = conversation_policy.as_ref() {
+                                        if let Err(err) = observation_service.append_observed_group_message_with_metadata(
+                                            &conversation_policy.group_jid,
                                             "user",
                                             &normalized,
                                             &content,
+                                            ObservedGroupMessageMetadata {
+                                                event: Some("message".to_string()),
+                                                mentions_agent: observed_group_trigger.mentions_agent,
+                                                quoted_message_id: observed_group_trigger
+                                                    .quoted_message_id
+                                                    .clone(),
+                                                ..Default::default()
+                                            },
                                         ) {
                                             tracing::warn!(
                                                 chat = %chat,
@@ -4745,13 +5171,56 @@ impl Channel for WhatsAppWebChannel {
 
                                 if decision.chat_kind == WhatsAppChatKind::Group
                                     && group_is_observed
-                                    && !group_is_managed
                                 {
+                                    let should_invoke = Self::should_invoke_group_agent(
+                                        group_is_managed,
+                                        conversation_policy.as_ref(),
+                                        &observed_group_trigger,
+                                    );
+                                    if !should_invoke {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            mode = conversation_policy
+                                                .as_ref()
+                                                .map(|group| group.mode.as_str())
+                                                .unwrap_or("observe_only"),
+                                            mentions_agent = observed_group_trigger.mentions_agent,
+                                            replied_to_agent = observed_group_trigger.replied_to_agent,
+                                            "WhatsApp Web observed group message captured without invoking the agent"
+                                        );
+                                        return;
+                                    }
                                     tracing::debug!(
                                         chat = %chat,
-                                        "WhatsApp Web observed-only group message captured without invoking the agent"
+                                        mode = conversation_policy
+                                            .as_ref()
+                                            .map(|group| group.mode.as_str())
+                                            .unwrap_or("mention_reply"),
+                                        mentions_agent = observed_group_trigger.mentions_agent,
+                                        replied_to_agent = observed_group_trigger.replied_to_agent,
+                                        "WhatsApp Web observed group message allowed to invoke the agent"
                                     );
-                                    return;
+                                }
+
+                                if decision.chat_kind == WhatsAppChatKind::Direct
+                                {
+                                    if direct_observe_only_policy_active {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            "WhatsApp Web direct observe-only policy captured the message without invoking the agent"
+                                        );
+                                        return;
+                                    }
+                                    if direct_objective_policy_active {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            objective = conversation_policy
+                                                .as_ref()
+                                                .and_then(|policy| policy.objective.as_deref())
+                                                .unwrap_or(""),
+                                            "WhatsApp Web direct conversation policy allowed agent invocation"
+                                        );
+                                    }
                                 }
 
                                 if decision.chat_kind == WhatsAppChatKind::Group && group_is_support {
@@ -5557,11 +6026,30 @@ mod tests {
         assert!(!decision.accepted);
         assert_eq!(decision.chat_kind, WhatsAppChatKind::Group);
         assert_eq!(decision.rejection_reason, Some("sender_not_in_allowlist"));
-        assert!(WhatsAppWebChannel::allows_group_policy_override(
+        let observed_group = ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Los Pibes".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::ObserveOnly,
+            status: ConversationPolicyStatus::Active,
+            objective: None,
+            skill_name: None,
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+        assert!(WhatsAppWebChannel::allows_conversation_policy_override(
             &decision,
             decision.rejection_reason.unwrap(),
             false,
-            true,
+            Some(&observed_group),
         ));
     }
 
@@ -5581,11 +6069,303 @@ mod tests {
 
         assert!(!decision.accepted);
         assert_eq!(decision.rejection_reason, Some("sender_not_in_allowlist"));
-        assert!(!WhatsAppWebChannel::allows_group_policy_override(
+        assert!(!WhatsAppWebChannel::allows_conversation_policy_override(
             &decision,
             decision.rejection_reason.unwrap(),
             false,
+            None,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_direct_policy_override_allows_objective_dm_outside_allowlist() {
+        let decision = WhatsAppWebChannel::evaluate_chat_policy(
+            &["+15551234567".to_string()],
+            &["+5491159297734".to_string()],
+            &["+5491159297734".to_string()],
             false,
+            Some("+15551234567"),
+            true,
+            false,
+            true,
+        );
+
+        assert!(!decision.accepted);
+        assert_eq!(decision.chat_kind, WhatsAppChatKind::Direct);
+        assert_eq!(decision.rejection_reason, Some("sender_not_in_allowlist"));
+        let direct_policy = ObservedGroupConfig {
+            group_jid: "5491159297734@s.whatsapp.net".to_string(),
+            group_name: "Cliente Demo".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Direct,
+            mode: ConversationMode::ObjectiveDm,
+            status: ConversationPolicyStatus::Active,
+            objective: Some("Cerrar acuerdo comercial".to_string()),
+            skill_name: Some("whatsapp_objective_dm".to_string()),
+            canonical_phone: Some("+5491159297734".to_string()),
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+        assert!(WhatsAppWebChannel::allows_conversation_policy_override(
+            &decision,
+            decision.rejection_reason.unwrap(),
+            false,
+            Some(&direct_policy),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_detects_direct_mention() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("@agent hacelo".to_string()),
+                    context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                        mentioned_jid: vec!["15551234567@s.whatsapp.net".to_string()],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            Some("@agent hacelo"),
+            Some("+15551234567"),
+            &[],
+        );
+        assert!(trigger.mentions_agent);
+        assert!(!trigger.replied_to_agent);
+        assert!(trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_detects_reply_to_agent() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("dale".to_string()),
+                    context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                        participant: Some("15551234567@s.whatsapp.net".to_string()),
+                        stanza_id: Some("wamid-agent-1".to_string()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            Some("dale"),
+            Some("+15551234567"),
+            &[],
+        );
+        assert!(!trigger.mentions_agent);
+        assert!(trigger.replied_to_agent);
+        assert_eq!(trigger.quoted_message_id.as_deref(), Some("wamid-agent-1"));
+        assert!(trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_detects_textual_lid_mention_from_alias() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("@128789057143037 hacelo".to_string()),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            Some("@128789057143037 hacelo"),
+            Some("+15551234567"),
+            &["128789057143037@lid".to_string()],
+        );
+        assert!(trigger.mentions_agent);
+        assert!(!trigger.replied_to_agent);
+        assert!(trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_detects_reply_to_agent_lid_alias() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("dale".to_string()),
+                    context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                        participant: Some("128789057143037@lid".to_string()),
+                        stanza_id: Some("wamid-agent-2".to_string()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            Some("dale"),
+            Some("+15551234567"),
+            &["128789057143037@lid".to_string()],
+        );
+        assert!(!trigger.mentions_agent);
+        assert!(trigger.replied_to_agent);
+        assert_eq!(trigger.quoted_message_id.as_deref(), Some("wamid-agent-2"));
+        assert!(trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_agent_invocation_respects_mode() {
+        let observed_group = ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Los Pibes".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::MentionReply,
+            status: ConversationPolicyStatus::Active,
+            objective: None,
+            skill_name: Some("whatsapp_mention_reply".to_string()),
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+        let empty_trigger = ObservedGroupTrigger::default();
+        assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &observed_group,
+            &empty_trigger,
+        ));
+
+        let mention_trigger = ObservedGroupTrigger {
+            mentions_agent: true,
+            replied_to_agent: false,
+            quoted_message_id: None,
+        };
+        assert!(WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &observed_group,
+            &mention_trigger,
+        ));
+
+        let passive_group = ObservedGroupConfig {
+            mode: ConversationMode::ObserveOnly,
+            ..observed_group.clone()
+        };
+        assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &passive_group,
+            &mention_trigger,
+        ));
+
+        let paused_group = ObservedGroupConfig {
+            status: ConversationPolicyStatus::Paused,
+            ..observed_group
+        };
+        assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &paused_group,
+            &mention_trigger,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_collect_self_identity_aliases_includes_lid_and_phone_aliases() {
+        let sender = Jid::lid("128789057143037");
+        let sender_alt = Jid::pn("5491140853388");
+        let aliases = WhatsAppWebChannel::collect_self_identity_aliases(
+            &sender,
+            Some(&sender_alt),
+            Some("5491140853388"),
+            Some("+5491140853388"),
+            &["+128789057143037".to_string(), "+5491140853388".to_string()],
+        );
+
+        assert_eq!(
+            aliases,
+            vec![
+                "+5491140853388".to_string(),
+                "128789057143037@lid".to_string(),
+                "5491140853388@s.whatsapp.net".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_group_policy_takes_precedence_over_managed_group_flag() {
+        let observed_group = ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Los Pibes".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::MentionReply,
+            status: ConversationPolicyStatus::Active,
+            objective: None,
+            skill_name: Some("whatsapp_mention_reply".to_string()),
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+        let empty_trigger = ObservedGroupTrigger::default();
+        assert!(!WhatsAppWebChannel::should_invoke_group_agent(
+            true,
+            Some(&observed_group),
+            &empty_trigger,
+        ));
+
+        let managed_group_policy = ObservedGroupConfig {
+            mode: ConversationMode::ManagedGroup,
+            ..observed_group.clone()
+        };
+        assert!(WhatsAppWebChannel::should_invoke_group_agent(
+            true,
+            Some(&managed_group_policy),
+            &empty_trigger,
+        ));
+
+        let observe_only_policy = ObservedGroupConfig {
+            mode: ConversationMode::ObserveOnly,
+            ..observed_group
+        };
+        assert!(!WhatsAppWebChannel::should_invoke_group_agent(
+            true,
+            Some(&observe_only_policy),
+            &empty_trigger,
+        ));
+
+        assert!(WhatsAppWebChannel::should_invoke_group_agent(
+            true,
+            None,
+            &empty_trigger,
         ));
     }
 
@@ -5605,11 +6385,11 @@ mod tests {
 
         assert!(!decision.accepted);
         assert_eq!(decision.rejection_reason, Some("group_disabled"));
-        assert!(WhatsAppWebChannel::allows_group_policy_override(
+        assert!(WhatsAppWebChannel::allows_conversation_policy_override(
             &decision,
             decision.rejection_reason.unwrap(),
             true,
-            false,
+            None,
         ));
     }
 
@@ -6125,6 +6905,21 @@ mod tests {
             &official_group_jid,
         );
         assert_eq!(reply_target, "15551234567@s.whatsapp.net");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_resolve_reply_target_normalizes_direct_chat_lid() {
+        let official_group_jid = Arc::new(Mutex::new(None));
+        let reply_target = WhatsAppWebChannel::resolve_reply_target(
+            "76188559093817@lid",
+            WhatsAppChatKind::Direct,
+            true,
+            Some("5491159297734"),
+            Some("+15551234567"),
+            &official_group_jid,
+        );
+        assert_eq!(reply_target, "5491159297734@s.whatsapp.net");
     }
 
     #[test]
