@@ -48,6 +48,42 @@ impl WhatsAppObjectiveDmTool {
         }
     }
 
+    fn normalized_direct_chat_phone(chat_jid: &str) -> Option<String> {
+        if chat_jid.contains("@lid") {
+            None
+        } else {
+            Self::normalize_phone_token(chat_jid)
+        }
+    }
+
+    fn delivery_chat_conflicts_with_direct_target(
+        delivery_chat_jid: &str,
+        target_chat_jid: &str,
+        canonical_phone: Option<&str>,
+    ) -> bool {
+        let delivery_chat_jid = delivery_chat_jid.trim();
+        if delivery_chat_jid.is_empty()
+            || delivery_chat_jid == "__whatsapp_official_group__"
+            || delivery_chat_jid.ends_with("@g.us")
+        {
+            return false;
+        }
+
+        if delivery_chat_jid == target_chat_jid {
+            return true;
+        }
+
+        let target_phone = canonical_phone
+            .and_then(Self::normalize_phone_token)
+            .or_else(|| Self::normalized_direct_chat_phone(target_chat_jid));
+        let delivery_phone = Self::normalize_phone_token(delivery_chat_jid);
+
+        matches!(
+            (target_phone.as_deref(), delivery_phone.as_deref()),
+            (Some(target_phone), Some(delivery_phone)) if target_phone == delivery_phone
+        )
+    }
+
     fn resolve_target(
         service: &WhatsAppObservationService,
         chat_jid: Option<&str>,
@@ -61,7 +97,7 @@ impl WhatsAppObjectiveDmTool {
             if chat_jid.contains('@') {
                 return Ok((
                     chat_jid.to_string(),
-                    Self::normalize_phone_token(chat_jid),
+                    Self::normalized_direct_chat_phone(chat_jid),
                     contact_name
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
@@ -191,6 +227,20 @@ impl Tool for WhatsAppObjectiveDmTool {
             args.get("contact_phone").and_then(|value| value.as_str()),
             args.get("contact_name").and_then(|value| value.as_str()),
         )?;
+        if Self::delivery_chat_conflicts_with_direct_target(
+            delivery_chat_jid,
+            &chat_jid,
+            canonical_phone.as_deref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "The control chat cannot be the same WhatsApp 1:1 that the agent is supposed to manage. Configure this from a different control conversation."
+                        .to_string(),
+                ),
+            });
+        }
         let contact_name = args
             .get("contact_name")
             .and_then(|value| value.as_str())
@@ -342,6 +392,37 @@ mod tests {
             observed.objective.as_deref(),
             Some("Confirmar horario de encuentro despues de las 9:30.")
         );
+    }
+
+    #[tokio::test]
+    async fn objective_dm_rejects_same_direct_chat_as_control_chat() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("skills").join("whatsapp_objective_dm");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: whatsapp_objective_dm\ndescription: Objective DM\n---\n# Objective DM\n",
+        )
+        .unwrap();
+
+        let tool = WhatsAppObjectiveDmTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "contact_phone": "+54 9 11 3411 5686",
+                "delivery_chat_jid": "5491134115686@s.whatsapp.net",
+                "objective": "Ayudar con estrategias de temporada baja."
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("control chat cannot be the same WhatsApp 1:1")));
     }
 
 }

@@ -844,6 +844,20 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn preferred_direct_chat_phone(
+        chat_candidates: &[String],
+        sender_candidates: &[String],
+        mapped_chat_phone: Option<&str>,
+        mapped_sender_phone: Option<&str>,
+    ) -> Option<String> {
+        mapped_chat_phone
+            .and_then(Self::normalize_phone_token)
+            .or_else(|| mapped_sender_phone.and_then(Self::normalize_phone_token))
+            .or_else(|| chat_candidates.first().cloned())
+            .or_else(|| sender_candidates.first().cloned())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     fn is_group_chat(chat: &wa_rs_binary::jid::Jid) -> bool {
         chat.to_string().contains("@g.us")
     }
@@ -3038,6 +3052,46 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn should_suppress_self_authored_direct_invocation(
+        conversation_policy: Option<&ObservedGroupConfig>,
+        sender_candidates: &[String],
+        self_phone: Option<&str>,
+    ) -> bool {
+        let Some(self_phone) = self_phone else {
+            return false;
+        };
+        let Some(policy) = conversation_policy.filter(|policy| {
+            policy.chat_kind == ConversationChatKind::Direct
+                && matches!(
+                    policy.mode,
+                    ConversationMode::ObserveOnly | ConversationMode::ObjectiveDm
+                )
+                && policy.status == ConversationPolicyStatus::Active
+        }) else {
+            return false;
+        };
+
+        let sender_matches_self = sender_candidates
+            .iter()
+            .any(|candidate| candidate == self_phone);
+        if !sender_matches_self {
+            return false;
+        }
+
+        let sender_matches_policy_contact = policy
+            .canonical_phone
+            .as_deref()
+            .and_then(Self::normalize_phone_token)
+            .is_some_and(|policy_phone| {
+                sender_candidates
+                    .iter()
+                    .any(|candidate| candidate == &policy_phone)
+            });
+
+        !sender_matches_policy_contact
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     async fn collect_image_markers(
         client: &wa_rs::Client,
         msg: &wa_rs_proto::whatsapp::Message,
@@ -4985,10 +5039,12 @@ impl Channel for WhatsAppWebChannel {
                                 );
 
                                 if decision.chat_kind == WhatsAppChatKind::Direct {
-                                    let direct_phone = chat_candidates
-                                        .first()
-                                        .cloned()
-                                        .or_else(|| sender_candidates.first().cloned());
+                                    let direct_phone = Self::preferred_direct_chat_phone(
+                                        &chat_candidates,
+                                        &sender_candidates,
+                                        mapped_chat_phone.as_deref(),
+                                        mapped_sender_phone.as_deref(),
+                                    );
                                     let direct_display_name = conversation_policy
                                         .as_ref()
                                         .map(|policy| policy.group_name.clone())
@@ -5208,6 +5264,23 @@ impl Channel for WhatsAppWebChannel {
                                         tracing::debug!(
                                             chat = %chat,
                                             "WhatsApp Web direct observe-only policy captured the message without invoking the agent"
+                                        );
+                                        return;
+                                    }
+                                    if Self::should_suppress_self_authored_direct_invocation(
+                                        conversation_policy.as_ref(),
+                                        &sender_candidates,
+                                        self_phone.as_deref(),
+                                    ) {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            sender = %normalized,
+                                            self_phone = ?self_phone,
+                                            policy_phone = conversation_policy
+                                                .as_ref()
+                                                .and_then(|policy| policy.canonical_phone.as_deref()),
+                                            sender_candidates = ?sender_candidates,
+                                            "WhatsApp Web direct conversation policy captured a self-authored message without invoking the agent"
                                         );
                                         return;
                                     }
@@ -5895,6 +5968,18 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_prefers_mapped_phone_for_direct_chat_cache() {
+        let preferred = WhatsAppWebChannel::preferred_direct_chat_phone(
+            &["+109169529094354".to_string(), "+5491134115686".to_string()],
+            &["+5491134115686".to_string()],
+            Some("5491134115686"),
+            None,
+        );
+        assert_eq!(preferred.as_deref(), Some("+5491134115686"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_group_detection_matches_group_jid() {
         let group: Jid = "120363025246293599@g.us".parse().unwrap();
         assert!(WhatsAppWebChannel::is_group_chat(&group));
@@ -6118,6 +6203,66 @@ mod tests {
             decision.rejection_reason.unwrap(),
             false,
             Some(&direct_policy),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_suppresses_self_authored_direct_invocation() {
+        let direct_policy = ObservedGroupConfig {
+            group_jid: "5491170742021@s.whatsapp.net".to_string(),
+            group_name: "Gonza".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "__whatsapp_official_group__".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Direct,
+            mode: ConversationMode::ObjectiveDm,
+            status: ConversationPolicyStatus::Active,
+            objective: Some("Coordinar idioma".to_string()),
+            skill_name: None,
+            canonical_phone: Some("+5491170742021".to_string()),
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+
+        assert!(WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
+            Some(&direct_policy),
+            &["+128789057143037".to_string(), "+5491140853388".to_string()],
+            Some("+5491140853388"),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_keeps_real_contact_messages_in_direct_objective_dm() {
+        let direct_policy = ObservedGroupConfig {
+            group_jid: "5491170742021@s.whatsapp.net".to_string(),
+            group_name: "Gonza".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "__whatsapp_official_group__".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Direct,
+            mode: ConversationMode::ObjectiveDm,
+            status: ConversationPolicyStatus::Active,
+            objective: Some("Coordinar idioma".to_string()),
+            skill_name: None,
+            canonical_phone: Some("+5491170742021".to_string()),
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+
+        assert!(!WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
+            Some(&direct_policy),
+            &["+5491170742021".to_string()],
+            Some("+5491140853388"),
         ));
     }
 

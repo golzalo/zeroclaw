@@ -500,17 +500,34 @@ impl WhatsAppObservationService {
             chat_name.trim()
         };
 
-        let canonical_phone = canonical_phone
-            .and_then(Self::normalize_phone_token)
-            .or_else(|| Self::normalize_phone_token(chat_jid));
+        let canonical_phone =
+            Self::canonical_direct_chat_phone(chat_jid, canonical_phone);
+        let policy_jid = Self::canonical_direct_policy_jid(chat_jid, canonical_phone.as_deref());
         self.record_visible_direct_chat(chat_jid, chat_name, canonical_phone.as_deref())?;
 
         let mut groups = self.load_observed_groups();
+        if chat_jid != policy_jid {
+            groups.remove(chat_jid);
+        }
+        if let Some(canonical_phone) = canonical_phone.as_deref() {
+            let duplicate_keys: Vec<String> = groups
+                .iter()
+                .filter(|(group_jid, policy)| {
+                    *group_jid != &policy_jid
+                        && policy.chat_kind == ConversationChatKind::Direct
+                        && policy.canonical_phone.as_deref() == Some(canonical_phone)
+                })
+                .map(|(group_jid, _)| group_jid.clone())
+                .collect();
+            for group_jid in duplicate_keys {
+                groups.remove(&group_jid);
+            }
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let entry = groups
-            .entry(chat_jid.to_string())
+            .entry(policy_jid.clone())
             .or_insert_with(|| ObservedGroupConfig {
-                group_jid: chat_jid.to_string(),
+                group_jid: policy_jid.clone(),
                 group_name: chat_name.to_string(),
                 enabled_at: now.clone(),
                 delivery_chat_jid: delivery_chat_jid.to_string(),
@@ -528,6 +545,7 @@ impl WhatsAppObservationService {
                 initial_outreach_sent_at: None,
                 initial_outreach_preview: None,
             });
+        entry.group_jid = policy_jid;
         entry.group_name = chat_name.to_string();
         entry.delivery_chat_jid = delivery_chat_jid.to_string();
         entry.channel = default_channel();
@@ -588,6 +606,21 @@ impl WhatsAppObservationService {
         let mut groups = self.load_observed_groups();
         if let Some(policy) = groups.remove(target) {
             return Some(policy);
+        }
+
+        if let Some(cached_phone) = self
+            .load_visible_direct_chats()
+            .into_iter()
+            .find(|chat| chat.chat_jid == target)
+            .and_then(|chat| chat.canonical_phone)
+            .and_then(|phone| Self::normalize_phone_token(&phone))
+        {
+            if let Some(policy) = groups.values().find(|policy| {
+                policy.chat_kind == ConversationChatKind::Direct
+                    && policy.canonical_phone.as_deref() == Some(cached_phone.as_str())
+            }) {
+                return Some(policy.clone());
+            }
         }
 
         let normalized_phone = Self::normalize_phone_token(target)?;
@@ -743,6 +776,20 @@ impl WhatsAppObservationService {
                 "Ambiguous configured WhatsApp conversation name `{requested_name}`. Matches: {}",
                 names.join(", ")
             );
+        }
+
+        if let Some(policy) = self
+            .resolve_visible_direct_chat(None, Some(requested_name), None)
+            .ok()
+            .and_then(|chat| {
+                self.conversation_policy_for_target(&chat.chat_jid).or_else(|| {
+                    chat.canonical_phone
+                        .as_deref()
+                        .and_then(|phone| self.conversation_policy_for_target(phone))
+                })
+            })
+        {
+            return Ok(policy);
         }
 
         anyhow::bail!("Unknown configured WhatsApp conversation name `{requested_name}`")
@@ -991,9 +1038,8 @@ impl WhatsAppObservationService {
         } else {
             display_name.trim()
         };
-        let canonical_phone = canonical_phone
-            .and_then(Self::normalize_phone_token)
-            .or_else(|| Self::normalize_phone_token(chat_jid));
+        let canonical_phone =
+            Self::canonical_direct_chat_phone(chat_jid, canonical_phone);
         let now = chrono::Utc::now().to_rfc3339();
 
         let mut chats = self.load_visible_direct_chats();
@@ -1362,6 +1408,24 @@ impl WhatsAppObservationService {
         }
 
         incoming_display_name.contains('@') && !existing_display_name.contains('@')
+    }
+
+    fn canonical_direct_chat_phone(chat_jid: &str, canonical_phone: Option<&str>) -> Option<String> {
+        canonical_phone
+            .and_then(Self::normalize_phone_token)
+            .or_else(|| {
+                if chat_jid.contains("@lid") {
+                    None
+                } else {
+                    Self::normalize_phone_token(chat_jid)
+                }
+            })
+    }
+
+    fn canonical_direct_policy_jid(chat_jid: &str, canonical_phone: Option<&str>) -> String {
+        Self::canonical_direct_chat_phone(chat_jid, canonical_phone)
+            .map(|phone| format!("{}@s.whatsapp.net", phone.trim_start_matches('+')))
+            .unwrap_or_else(|| chat_jid.to_string())
     }
 
     fn sanitize_group_jid(group_jid: &str) -> String {
@@ -1977,6 +2041,34 @@ mod tests {
     }
 
     #[test]
+    fn register_direct_chat_policy_canonicalizes_lid_target_to_phone_jid() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+
+        let observed = service
+            .register_direct_chat_policy_with_skill(
+                "109169529094354@lid",
+                "Naty",
+                "__whatsapp_official_group__",
+                ConversationMode::ObjectiveDm,
+                "Ayudar con estrategias de temporada baja.",
+                Some("+54 9 11 3411 5686"),
+                Some("whatsapp_objective_dm"),
+            )
+            .unwrap();
+
+        assert_eq!(observed.group_jid, "5491134115686@s.whatsapp.net");
+        assert_eq!(observed.canonical_phone.as_deref(), Some("+5491134115686"));
+        assert!(service
+            .observed_group_config("109169529094354@lid")
+            .is_none());
+        let via_lid = service
+            .conversation_policy_for_target("109169529094354@lid")
+            .unwrap();
+        assert_eq!(via_lid.group_jid, "5491134115686@s.whatsapp.net");
+    }
+
+    #[test]
     fn register_direct_observe_only_policy_without_objective() {
         let temp = tempfile::tempdir().unwrap();
         let service = WhatsAppObservationService::new(temp.path().to_path_buf());
@@ -2178,6 +2270,48 @@ mod tests {
             .resolve_visible_direct_chat(Some("5491170742021@s.whatsapp.net"), None, None)
             .unwrap();
         assert_eq!(cached.display_name, "Gonzalo TIENDAMIA");
+    }
+
+    #[test]
+    fn record_visible_direct_chat_does_not_promote_lid_to_fake_phone() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+
+        let cached = service
+            .record_visible_direct_chat("109169529094354@lid", "Naty (Hermana)", None)
+            .unwrap();
+
+        assert_eq!(cached.canonical_phone, None);
+    }
+
+    #[test]
+    fn resolve_observed_group_can_fallback_to_visible_direct_chat_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_direct_chats(&[VisibleDirectChatRecord {
+                chat_jid: "109169529094354@lid".into(),
+                display_name: "Naty (Hermana)".into(),
+                canonical_phone: Some("+5491134115686".into()),
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+        service
+            .register_direct_chat_policy_with_skill(
+                "109169529094354@lid",
+                "109169529094354@lid",
+                "5491134115686@s.whatsapp.net",
+                ConversationMode::ObjectiveDm,
+                "Ayudar con estrategias de temporada baja.",
+                Some("+5491134115686"),
+                Some("whatsapp_objective_dm"),
+            )
+            .unwrap();
+
+        let observed = service
+            .resolve_observed_group(None, Some("Naty"))
+            .unwrap();
+        assert_eq!(observed.canonical_phone.as_deref(), Some("+5491134115686"));
     }
 
 }
