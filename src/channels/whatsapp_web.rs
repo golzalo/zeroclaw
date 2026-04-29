@@ -4982,7 +4982,18 @@ impl Channel for WhatsAppWebChannel {
                                 } else {
                                     None
                                 };
-                                let group_is_managed = managed_group_name.is_some();
+                                let group_is_suppressed = if decision.chat_kind
+                                    == WhatsAppChatKind::Group
+                                {
+                                    observation_service.is_group_fallback_suppressed(
+                                        &chat,
+                                        managed_group_name.as_deref(),
+                                    )
+                                } else {
+                                    false
+                                };
+                                let group_is_managed =
+                                    managed_group_name.is_some() && !group_is_suppressed;
                                 let group_is_support = managed_group_name
                                     .as_deref()
                                     .map(Self::is_support_group_name)
@@ -5032,6 +5043,7 @@ impl Channel for WhatsAppWebChannel {
                                     allow_direct_messages,
                                     allow_group_messages,
                                     group_is_managed,
+                                    group_is_suppressed,
                                     group_is_support,
                                     accepted,
                                     rejection_reason,

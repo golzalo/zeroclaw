@@ -42,6 +42,10 @@ impl Tool for WhatsAppUnobserveGroupTool {
                 "group_name": {
                     "type": "string",
                     "description": "Configured group or direct-conversation label to remove."
+                },
+                "contact_phone": {
+                    "type": "string",
+                    "description": "Optional direct-chat phone number to remove when the policy is easier to identify by phone."
                 }
             }
         })
@@ -62,7 +66,9 @@ impl Tool for WhatsAppUnobserveGroupTool {
         let service = WhatsAppObservationService::new(self.workspace_dir.clone());
         let observed = match service.resolve_observed_group(
             args.get("group_jid").and_then(|value| value.as_str()),
-            args.get("group_name").and_then(|value| value.as_str()),
+            args.get("group_name")
+                .and_then(|value| value.as_str())
+                .or_else(|| args.get("contact_phone").and_then(|value| value.as_str())),
         ) {
             Ok(group) => group,
             Err(err) => {
@@ -74,18 +80,34 @@ impl Tool for WhatsAppUnobserveGroupTool {
             }
         };
 
-        match service.unregister_observed_group(&observed.group_jid) {
-            Ok(Some(_)) => Ok(ToolResult {
+        match service.unregister_conversation_policy(&observed) {
+            Ok(removed) if !removed.is_empty() => {
+                if observed.chat_kind == crate::channels::whatsapp_observation::ConversationChatKind::Group {
+                    let _ = service.suppress_group_fallback(&observed.group_jid, &observed.group_name);
+                }
+
+                let alias_note = if observed.chat_kind
+                    == crate::channels::whatsapp_observation::ConversationChatKind::Direct
+                    && removed.len() > 1
+                {
+                    format!(" Removed {} alias policies for the same direct chat.", removed.len() - 1)
+                } else {
+                    String::new()
+                };
+
+                Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "Removed the WhatsApp conversation policy for '{}' (jid={}). Existing log was kept at {}.",
+                    "Removed the WhatsApp conversation policy for '{}' (jid={}). Existing log was kept at {}.{}",
                     observed.group_name,
                     observed.group_jid,
-                    service.observed_group_log_path(&observed.group_jid).display()
+                    service.observed_group_log_path(&observed.group_jid).display(),
+                    alias_note
                 ),
                 error: None,
-            }),
-            Ok(None) => Ok(ToolResult {
+            })
+            }
+            Ok(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
@@ -131,5 +153,64 @@ mod tests {
         assert!(service
             .observed_group_config("120363025123456789@g.us")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn unobserve_group_supports_contact_phone_for_direct_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .register_direct_chat_policy_with_skill(
+                "5491170742021@s.whatsapp.net",
+                "Gonza",
+                "__whatsapp_official_group__",
+                crate::channels::whatsapp_observation::ConversationMode::ObjectiveDm,
+                "Coordinar horario.",
+                Some("+54 9 11 7074-2021"),
+                Some("whatsapp_objective_dm"),
+            )
+            .unwrap();
+
+        let tool = WhatsAppUnobserveGroupTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({ "contact_phone": "+54 9 11 7074-2021" }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(service
+            .conversation_policy_for_target("+5491170742021")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn unobserve_group_suppresses_legacy_group_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .register_observed_group(
+                "120363025123456789@g.us",
+                "Los Pibes",
+                "__whatsapp_official_group__",
+            )
+            .unwrap();
+
+        let tool = WhatsAppUnobserveGroupTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({ "group_name": "Los Pibes" }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(service.is_group_fallback_suppressed(
+            "120363025123456789@g.us",
+            Some("Los Pibes")
+        ));
     }
 }

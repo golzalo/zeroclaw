@@ -128,6 +128,20 @@ const WHATSAPP_GROUP_POLICY_SUCCESS_HINTS: &[&str] = &[
     "ya lo tenes configurado asi",
 ];
 
+const WHATSAPP_POLICY_REMOVAL_HINTS: &[&str] = &[
+    "dejé de observar",
+    "deje de observar",
+    "dejé de contestar",
+    "deje de contestar",
+    "dejé de observar y contestar",
+    "deje de observar y contestar",
+    "ya no va a contestar",
+    "ya no responde",
+    "ya no le voy a responder",
+    "ya no le voy a contestar",
+    "removed the whatsapp conversation policy",
+];
+
 static WHATSAPP_GROUP_NAME_IN_RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)grupo\s+(?:\*\*([^*]+)\*\*|`([^`]+)`|"([^"]+)"|([^\n.!?]+))"#)
         .expect("valid whatsapp group response regex")
@@ -731,6 +745,13 @@ fn response_claims_whatsapp_group_policy_success(display_text: &str) -> bool {
         .any(|hint| lowered.contains(hint))
         || (lowered.contains("solo voy a responder cuando me arroben")
             && lowered.contains("grupo"))
+}
+
+fn response_claims_whatsapp_policy_removal(display_text: &str) -> bool {
+    let lowered = display_text.to_ascii_lowercase();
+    WHATSAPP_POLICY_REMOVAL_HINTS
+        .iter()
+        .any(|hint| lowered.contains(hint))
 }
 
 fn extract_claimed_whatsapp_group_name(display_text: &str) -> Option<String> {
@@ -5400,6 +5421,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut scheduled_delivery_verified = false;
     let mut whatsapp_group_policy_written = false;
     let mut whatsapp_group_policy_verifications: Vec<String> = Vec::new();
+    let mut whatsapp_policy_removed = false;
     let mut requests = Vec::new();
 
     for iteration in 0..max_iterations {
@@ -5830,6 +5852,29 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            if response_claims_whatsapp_policy_removal(&display_text) && !whatsapp_policy_removed {
+                runtime_trace::record_event(
+                    "final_response_unverified_whatsapp_policy_removal",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("assistant claimed a WhatsApp policy removal without executing whatsapp_unobserve_group"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "policy_removed": whatsapp_policy_removed,
+                        "text": scrub_credentials(&display_text),
+                    }),
+                );
+
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(internal_repair_message(
+                    "You just told the user that a WhatsApp conversation stopped being observed or answered, but this turn did not execute whatsapp_unobserve_group successfully. If the user asked to stop a WhatsApp direct chat or group, call whatsapp_unobserve_group now and only then confirm the deactivation.",
+                ));
+                continue;
+            }
+
             if should_enforce_artifact_existence(history, &display_text) {
                 let missing_artifacts = missing_artifact_references(&display_text);
                 if !missing_artifacts.is_empty() {
@@ -6242,6 +6287,9 @@ pub(crate) async fn run_tool_call_loop(
                 }
                 if call.name == "whatsapp_list_observed_groups" {
                     whatsapp_group_policy_verifications.push(outcome.output.clone());
+                }
+                if call.name == "whatsapp_unobserve_group" {
+                    whatsapp_policy_removed = true;
                 }
                 if call.name == "read_skill" {
                     if let (Some(skill_name), Some(skill_activations)) =
@@ -10700,6 +10748,13 @@ Tail"#;
         let response = "No tengo acceso directo a tu agenda real, pero puedo consultar los eventos de hoy en una agenda de demostracion conectada a Google Calendar.";
 
         assert!(!response_claims_schedule_success(response));
+    }
+
+    #[test]
+    fn response_claims_whatsapp_policy_removal_detects_deactivation_claims() {
+        let response = "Listo, ya dejé de observar y contestar a Ale.";
+
+        assert!(response_claims_whatsapp_policy_removal(response));
     }
 
     #[test]

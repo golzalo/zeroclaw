@@ -103,6 +103,13 @@ pub struct ObservedGroupMessageMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SuppressedGroupFallbackRecord {
+    group_jid: String,
+    group_name: String,
+    suppressed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservedGroupConfig {
     pub group_jid: String,
     pub group_name: String,
@@ -423,6 +430,7 @@ impl WhatsAppObservationService {
         }
         let observed = entry.clone();
         self.save_observed_groups(&groups)?;
+        self.clear_group_fallback_suppression(group_jid, group_name)?;
         Ok(observed)
     }
 
@@ -590,6 +598,43 @@ impl WhatsAppObservationService {
     pub fn unregister_observed_group(&self, group_jid: &str) -> Result<Option<ObservedGroupConfig>> {
         let mut groups = self.load_observed_groups();
         let removed = groups.remove(group_jid);
+        self.save_observed_groups(&groups)?;
+        Ok(removed)
+    }
+
+    pub fn unregister_conversation_policy(
+        &self,
+        policy: &ObservedGroupConfig,
+    ) -> Result<Vec<ObservedGroupConfig>> {
+        let mut groups = self.load_observed_groups();
+        let removed_keys: Vec<String> = match policy.chat_kind {
+            ConversationChatKind::Group => vec![policy.group_jid.clone()],
+            ConversationChatKind::Direct => {
+                if let Some(canonical_phone) = policy.canonical_phone.as_deref() {
+                    let mut keys: Vec<String> = groups
+                        .iter()
+                        .filter(|(_, existing)| {
+                            existing.chat_kind == ConversationChatKind::Direct
+                                && existing.canonical_phone.as_deref() == Some(canonical_phone)
+                        })
+                        .map(|(group_jid, _)| group_jid.clone())
+                        .collect();
+                    if !keys.iter().any(|group_jid| group_jid == &policy.group_jid) {
+                        keys.push(policy.group_jid.clone());
+                    }
+                    keys
+                } else {
+                    vec![policy.group_jid.clone()]
+                }
+            }
+        };
+
+        let mut removed = Vec::new();
+        for group_jid in removed_keys {
+            if let Some(existing) = groups.remove(&group_jid) {
+                removed.push(existing);
+            }
+        }
         self.save_observed_groups(&groups)?;
         Ok(removed)
     }
@@ -778,8 +823,12 @@ impl WhatsAppObservationService {
             );
         }
 
+        if let Some(policy) = self.conversation_policy_for_target(requested_name) {
+            return Ok(policy);
+        }
+
         if let Some(policy) = self
-            .resolve_visible_direct_chat(None, Some(requested_name), None)
+            .resolve_visible_direct_chat(None, Some(requested_name), Some(requested_name))
             .ok()
             .and_then(|chat| {
                 self.conversation_policy_for_target(&chat.chat_jid).or_else(|| {
@@ -793,6 +842,49 @@ impl WhatsAppObservationService {
         }
 
         anyhow::bail!("Unknown configured WhatsApp conversation name `{requested_name}`")
+    }
+
+    pub fn suppress_group_fallback(&self, group_jid: &str, group_name: &str) -> Result<()> {
+        let mut groups = self.load_suppressed_group_fallbacks();
+        groups.retain(|record| {
+            record.group_jid != group_jid && !record.group_name.eq_ignore_ascii_case(group_name)
+        });
+        groups.push(SuppressedGroupFallbackRecord {
+            group_jid: group_jid.trim().to_string(),
+            group_name: group_name.trim().to_string(),
+            suppressed_at: chrono::Utc::now().to_rfc3339(),
+        });
+        self.save_suppressed_group_fallbacks(&groups)
+    }
+
+    pub fn clear_group_fallback_suppression(&self, group_jid: &str, group_name: &str) -> Result<()> {
+        let mut groups = self.load_suppressed_group_fallbacks();
+        let original_len = groups.len();
+        groups.retain(|record| {
+            record.group_jid != group_jid && !record.group_name.eq_ignore_ascii_case(group_name)
+        });
+        if groups.len() != original_len {
+            self.save_suppressed_group_fallbacks(&groups)?;
+        }
+        Ok(())
+    }
+
+    pub fn is_group_fallback_suppressed(
+        &self,
+        group_jid: &str,
+        group_name: Option<&str>,
+    ) -> bool {
+        let group_jid = group_jid.trim();
+        let group_name = group_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        self.load_suppressed_group_fallbacks().into_iter().any(|record| {
+            record.group_jid == group_jid
+                || group_name.as_ref().is_some_and(|candidate| {
+                    record.group_name.to_ascii_lowercase() == *candidate
+                })
+        })
     }
 
     pub fn append_observed_group_message(
@@ -1426,6 +1518,37 @@ impl WhatsAppObservationService {
         Self::canonical_direct_chat_phone(chat_jid, canonical_phone)
             .map(|phone| format!("{}@s.whatsapp.net", phone.trim_start_matches('+')))
             .unwrap_or_else(|| chat_jid.to_string())
+    }
+
+    fn suppressed_group_fallbacks_path(&self) -> PathBuf {
+        self.workspace_dir
+            .join("state")
+            .join("whatsapp")
+            .join("suppressed_group_fallbacks.json")
+    }
+
+    fn load_suppressed_group_fallbacks(&self) -> Vec<SuppressedGroupFallbackRecord> {
+        let path = self.suppressed_group_fallbacks_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    fn save_suppressed_group_fallbacks(
+        &self,
+        records: &[SuppressedGroupFallbackRecord],
+    ) -> Result<()> {
+        let path = self.suppressed_group_fallbacks_path();
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("Invalid suppressed fallback path {}", path.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|err| anyhow!("Failed to create {}: {err}", parent.display()))?;
+        let serialized = serde_json::to_string_pretty(records)
+            .map_err(|err| anyhow!("Failed to serialize suppressed group fallbacks: {err}"))?;
+        std::fs::write(&path, serialized)
+            .map_err(|err| anyhow!("Failed to write {}: {err}", path.display()))
     }
 
     fn sanitize_group_jid(group_jid: &str) -> String {
@@ -2069,6 +2192,78 @@ mod tests {
     }
 
     #[test]
+    fn unregister_conversation_policy_removes_direct_aliases_for_same_phone() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        let now = chrono::Utc::now().to_rfc3339();
+
+        service
+            .save_observed_groups(&std::collections::HashMap::from([
+                (
+                    "109169529094354@lid".to_string(),
+                    ObservedGroupConfig {
+                        group_jid: "109169529094354@lid".to_string(),
+                        group_name: "Naty".to_string(),
+                        enabled_at: now.clone(),
+                        delivery_chat_jid: "__whatsapp_official_group__".to_string(),
+                        channel: "whatsapp".to_string(),
+                        chat_kind: ConversationChatKind::Direct,
+                        mode: ConversationMode::ObjectiveDm,
+                        status: ConversationPolicyStatus::Active,
+                        objective: Some("Ayudar con temporada baja".to_string()),
+                        skill_name: Some("whatsapp_objective_dm".to_string()),
+                        canonical_phone: Some("+5491134115686".to_string()),
+                        rotate_after_bytes: 1024,
+                        keep_log_segments: 2,
+                        last_message_at: None,
+                        last_rotated_at: None,
+                        initial_outreach_sent_at: None,
+                        initial_outreach_preview: None,
+                    },
+                ),
+                (
+                    "5491134115686@s.whatsapp.net".to_string(),
+                    ObservedGroupConfig {
+                        group_jid: "5491134115686@s.whatsapp.net".to_string(),
+                        group_name: "Naty".to_string(),
+                        enabled_at: now,
+                        delivery_chat_jid: "__whatsapp_official_group__".to_string(),
+                        channel: "whatsapp".to_string(),
+                        chat_kind: ConversationChatKind::Direct,
+                        mode: ConversationMode::ObjectiveDm,
+                        status: ConversationPolicyStatus::Active,
+                        objective: Some("Ayudar con temporada baja".to_string()),
+                        skill_name: Some("whatsapp_objective_dm".to_string()),
+                        canonical_phone: Some("+5491134115686".to_string()),
+                        rotate_after_bytes: 1024,
+                        keep_log_segments: 2,
+                        last_message_at: None,
+                        last_rotated_at: None,
+                        initial_outreach_sent_at: None,
+                        initial_outreach_preview: None,
+                    },
+                ),
+            ]))
+            .unwrap();
+
+        let policy = service
+            .conversation_policy_for_target("+5491134115686")
+            .unwrap();
+        let removed = service.unregister_conversation_policy(&policy).unwrap();
+
+        assert_eq!(removed.len(), 2);
+        assert!(service
+            .conversation_policy_for_target("+5491134115686")
+            .is_none());
+        assert!(service
+            .observed_group_config("109169529094354@lid")
+            .is_none());
+        assert!(service
+            .observed_group_config("5491134115686@s.whatsapp.net")
+            .is_none());
+    }
+
+    #[test]
     fn register_direct_observe_only_policy_without_objective() {
         let temp = tempfile::tempdir().unwrap();
         let service = WhatsAppObservationService::new(temp.path().to_path_buf());
@@ -2312,6 +2507,61 @@ mod tests {
             .resolve_observed_group(None, Some("Naty"))
             .unwrap();
         assert_eq!(observed.canonical_phone.as_deref(), Some("+5491134115686"));
+    }
+
+    #[test]
+    fn resolve_observed_group_supports_direct_phone_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .register_direct_chat_policy_with_skill(
+                "5491170742021@s.whatsapp.net",
+                "Gonza",
+                "__whatsapp_official_group__",
+                ConversationMode::ObjectiveDm,
+                "Coordinar una fecha de encuentro.",
+                Some("+54 9 11 7074-2021"),
+                Some("whatsapp_objective_dm"),
+            )
+            .unwrap();
+
+        let observed = service
+            .resolve_observed_group(None, Some("+54 9 11 7074-2021"))
+            .unwrap();
+        assert_eq!(observed.group_jid, "5491170742021@s.whatsapp.net");
+    }
+
+    #[test]
+    fn group_fallback_suppression_round_trips_and_clears_on_register() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+
+        service
+            .suppress_group_fallback("120363025123456789@g.us", "Los Pibes")
+            .unwrap();
+        assert!(service.is_group_fallback_suppressed(
+            "120363025123456789@g.us",
+            Some("Los Pibes")
+        ));
+        assert!(service.is_group_fallback_suppressed(
+            "120363099999999999@g.us",
+            Some("Los Pibes")
+        ));
+
+        service
+            .register_observed_group_with_mode_and_skill(
+                "120363025123456789@g.us",
+                "Los Pibes",
+                "__whatsapp_official_group__",
+                Some(ConversationMode::MentionReply),
+                Some("whatsapp_mention_reply"),
+            )
+            .unwrap();
+
+        assert!(!service.is_group_fallback_suppressed(
+            "120363025123456789@g.us",
+            Some("Los Pibes")
+        ));
     }
 
 }
