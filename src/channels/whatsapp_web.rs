@@ -85,7 +85,8 @@ const WHATSAPP_BOOTSTRAP_COMMUNITY_SUBJECT: &str = "S86";
 const WHATSAPP_BOOTSTRAP_GROUP_SUBJECT: &str = "S86 - Agente Principal";
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_OFFICIAL_GROUP_DELIVERY_TARGET: &str = "__whatsapp_official_group__";
-const WHATSAPP_DEFAULT_MENTION_ALIASES: &[&str] = &["agent", "agente", "zeroclaw"];
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_WAKE_TOKEN: &str = "s86";
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_BOOTSTRAP_GROUP_GREETING: &str = "Hola";
 #[cfg(feature = "whatsapp-web")]
@@ -701,35 +702,6 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
-    fn build_agent_identity_tokens(
-        self_phone: Option<&str>,
-        self_identity_aliases: &[String],
-    ) -> std::collections::HashSet<String> {
-        let mut tokens = std::collections::HashSet::new();
-
-        for value in self_phone.into_iter().chain(self_identity_aliases.iter().map(String::as_str)) {
-            for token in Self::identity_match_tokens(value) {
-                tokens.insert(token);
-            }
-        }
-        for alias in WHATSAPP_DEFAULT_MENTION_ALIASES {
-            tokens.insert((*alias).to_string());
-        }
-
-        tokens
-    }
-
-    #[cfg(feature = "whatsapp-web")]
-    fn value_matches_agent_identity(
-        value: &str,
-        agent_identity_tokens: &std::collections::HashSet<String>,
-    ) -> bool {
-        Self::identity_match_tokens(value)
-            .into_iter()
-            .any(|candidate| agent_identity_tokens.contains(&candidate))
-    }
-
-    #[cfg(feature = "whatsapp-web")]
     fn extract_textual_mentions(text: &str) -> Vec<String> {
         let mut mentions = Vec::new();
         let chars: Vec<char> = text.chars().collect();
@@ -757,6 +729,7 @@ impl WhatsAppWebChannel {
                     .iter()
                     .collect::<String>()
                     .trim()
+                    .trim_end_matches('.')
                     .to_ascii_lowercase();
                 if !mention.is_empty() {
                     mentions.push(mention);
@@ -767,6 +740,15 @@ impl WhatsAppWebChannel {
         }
 
         mentions
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_wake_token(message_text: Option<&str>) -> bool {
+        message_text.is_some_and(|text| {
+            Self::extract_textual_mentions(text)
+                .into_iter()
+                .any(|mention| mention == WHATSAPP_WAKE_TOKEN)
+        })
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2931,52 +2913,21 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     fn context_mentions_agent(
-        context_info: &wa_rs_proto::whatsapp::ContextInfo,
+        _context_info: &wa_rs_proto::whatsapp::ContextInfo,
         message_text: Option<&str>,
-        self_phone: Option<&str>,
-        self_identity_aliases: &[String],
+        _self_phone: Option<&str>,
+        _self_identity_aliases: &[String],
     ) -> bool {
-        let agent_identity_tokens =
-            Self::build_agent_identity_tokens(self_phone, self_identity_aliases);
-        if agent_identity_tokens.is_empty() {
-            return false;
-        }
-
-        if context_info
-            .mentioned_jid
-            .iter()
-            .any(|jid| Self::value_matches_agent_identity(jid, &agent_identity_tokens))
-        {
-            return true;
-        }
-
-        message_text.is_some_and(|text| {
-            Self::extract_textual_mentions(text).into_iter().any(|mention| {
-                agent_identity_tokens.contains(&mention)
-                    || Self::normalize_phone_token(&mention)
-                        .is_some_and(|candidate| agent_identity_tokens.contains(&candidate))
-            })
-        })
+        Self::contains_wake_token(message_text)
     }
 
     #[cfg(feature = "whatsapp-web")]
     fn context_replies_to_agent(
-        context_info: &wa_rs_proto::whatsapp::ContextInfo,
-        self_phone: Option<&str>,
-        self_identity_aliases: &[String],
+        _context_info: &wa_rs_proto::whatsapp::ContextInfo,
+        _self_phone: Option<&str>,
+        _self_identity_aliases: &[String],
     ) -> bool {
-        let agent_identity_tokens =
-            Self::build_agent_identity_tokens(self_phone, self_identity_aliases);
-        if agent_identity_tokens.is_empty() {
-            return false;
-        }
-
-        context_info
-            .participant
-            .as_deref()
-            .is_some_and(|participant| {
-                Self::value_matches_agent_identity(participant, &agent_identity_tokens)
-            })
+        false
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2988,17 +2939,7 @@ impl WhatsAppWebChannel {
     ) -> ObservedGroupTrigger {
         let Some(context_info) = Self::extract_context_info(msg) else {
             return ObservedGroupTrigger {
-                mentions_agent: message_text.is_some_and(|text| {
-                    let agent_identity_tokens =
-                        Self::build_agent_identity_tokens(self_phone, self_identity_aliases);
-                    !agent_identity_tokens.is_empty()
-                        && Self::extract_textual_mentions(text).into_iter().any(|mention| {
-                            agent_identity_tokens.contains(&mention)
-                                || Self::normalize_phone_token(&mention).is_some_and(|candidate| {
-                                    agent_identity_tokens.contains(&candidate)
-                                })
-                        })
-                }),
+                mentions_agent: Self::contains_wake_token(message_text),
                 ..Default::default()
             };
         };
@@ -3031,7 +2972,7 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     fn should_invoke_observed_group_agent(
         observed_group: &ObservedGroupConfig,
-        is_main_channel: bool,
+        _is_main_channel: bool,
         trigger: &ObservedGroupTrigger,
     ) -> bool {
         if observed_group.status != ConversationPolicyStatus::Active {
@@ -3043,8 +2984,8 @@ impl WhatsAppWebChannel {
         }
 
         match observed_group.mode {
-            ConversationMode::MentionReply => is_main_channel || trigger.should_invoke(),
-            ConversationMode::ManagedGroup => true,
+            ConversationMode::MentionReply => trigger.should_invoke(),
+            ConversationMode::ManagedGroup => trigger.should_invoke(),
             ConversationMode::ObjectiveDm => false,
             ConversationMode::ObserveOnly => false,
         }
@@ -3063,7 +3004,7 @@ impl WhatsAppWebChannel {
             return Self::should_invoke_observed_group_agent(policy, is_main_channel, trigger);
         }
 
-        group_is_managed || is_main_channel
+        (group_is_managed || is_main_channel) && trigger.should_invoke()
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3083,7 +3024,7 @@ impl WhatsAppWebChannel {
             ConversationMode::MentionReply | ConversationMode::ObjectiveDm => {
                 trigger.should_invoke()
             }
-            ConversationMode::ManagedGroup => true,
+            ConversationMode::ManagedGroup => trigger.should_invoke(),
             ConversationMode::ObserveOnly => false,
         }
     }
@@ -3093,7 +3034,12 @@ impl WhatsAppWebChannel {
         conversation_policy: Option<&ObservedGroupConfig>,
         sender_candidates: &[String],
         self_phone: Option<&str>,
+        trigger: &ObservedGroupTrigger,
     ) -> bool {
+        if trigger.mentions_agent {
+            return false;
+        }
+
         let Some(self_phone) = self_phone else {
             return false;
         };
@@ -4542,7 +4488,7 @@ struct ObservedGroupTrigger {
 #[cfg(feature = "whatsapp-web")]
 impl ObservedGroupTrigger {
     fn should_invoke(&self) -> bool {
-        self.mentions_agent || self.replied_to_agent
+        self.mentions_agent
     }
 }
 
@@ -5346,6 +5292,7 @@ impl Channel for WhatsAppWebChannel {
                                         conversation_policy.as_ref(),
                                         &sender_candidates,
                                         self_phone.as_deref(),
+                                        &observed_group_trigger,
                                     ) {
                                         tracing::debug!(
                                             chat = %chat,
@@ -6347,6 +6294,7 @@ mod tests {
             Some(&direct_policy),
             &["+128789057143037".to_string(), "+5491140853388".to_string()],
             Some("+5491140853388"),
+            &ObservedGroupTrigger::default(),
         ));
     }
 
@@ -6377,6 +6325,44 @@ mod tests {
             Some(&direct_policy),
             &["+5491170742021".to_string()],
             Some("+5491140853388"),
+            &ObservedGroupTrigger::default(),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_keeps_self_authored_direct_wake_token_messages() {
+        let direct_policy = ObservedGroupConfig {
+            group_jid: "5491170742021@s.whatsapp.net".to_string(),
+            group_name: "Gonza".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "__whatsapp_official_group__".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Direct,
+            mode: ConversationMode::ObjectiveDm,
+            status: ConversationPolicyStatus::Active,
+            objective: Some("Coordinar idioma".to_string()),
+            skill_name: None,
+            canonical_phone: Some("+5491170742021".to_string()),
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+
+        let wake_trigger = ObservedGroupTrigger {
+            mentions_agent: true,
+            replied_to_agent: false,
+            quoted_message_id: None,
+        };
+
+        assert!(!WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
+            Some(&direct_policy),
+            &["+128789057143037".to_string(), "+5491140853388".to_string()],
+            Some("+5491140853388"),
+            &wake_trigger,
         ));
     }
 
@@ -6386,7 +6372,7 @@ mod tests {
         let msg = wa_rs_proto::whatsapp::Message {
             extended_text_message: Some(Box::new(
                 wa_rs_proto::whatsapp::message::ExtendedTextMessage {
-                    text: Some("@agent hacelo".to_string()),
+                    text: Some("@s86 hacelo".to_string()),
                     context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
                         mentioned_jid: vec!["15551234567@s.whatsapp.net".to_string()],
                         ..Default::default()
@@ -6399,7 +6385,7 @@ mod tests {
 
         let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
             &msg,
-            Some("@agent hacelo"),
+            Some("@s86 hacelo"),
             Some("+15551234567"),
             &[],
         );
@@ -6412,13 +6398,13 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_observed_group_trigger_detects_plain_agent_wake_token() {
         let msg = wa_rs_proto::whatsapp::Message {
-            conversation: Some("@agent hacelo".to_string()),
+            conversation: Some("@s86 hacelo".to_string()),
             ..Default::default()
         };
 
         let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
             &msg,
-            Some("@agent hacelo"),
+            Some("@s86 hacelo"),
             Some("+15551234567"),
             &[],
         );
@@ -6429,7 +6415,64 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_observed_group_trigger_detects_reply_to_agent() {
+    fn whatsapp_web_observed_group_trigger_detects_inline_agent_wake_token() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            conversation: Some("primero pensemos y despues @s86 decime".to_string()),
+            ..Default::default()
+        };
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            Some("primero pensemos y despues @s86 decime"),
+            Some("+15551234567"),
+            &[],
+        );
+        assert!(trigger.mentions_agent);
+        assert!(!trigger.replied_to_agent);
+        assert!(trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_detects_wake_token_with_trailing_period() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            conversation: Some("dale, @s86. que opciones tenemos".to_string()),
+            ..Default::default()
+        };
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            Some("dale, @s86. que opciones tenemos"),
+            Some("+15551234567"),
+            &[],
+        );
+        assert!(trigger.mentions_agent);
+        assert!(!trigger.replied_to_agent);
+        assert!(trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_ignores_domain_like_text() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            conversation: Some("miren https://foo.com/@s86.com".to_string()),
+            ..Default::default()
+        };
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            Some("miren https://foo.com/@s86.com"),
+            Some("+15551234567"),
+            &[],
+        );
+        assert!(!trigger.mentions_agent);
+        assert!(!trigger.replied_to_agent);
+        assert!(!trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_ignores_reply_to_agent_without_wake_token() {
         let msg = wa_rs_proto::whatsapp::Message {
             extended_text_message: Some(Box::new(
                 wa_rs_proto::whatsapp::message::ExtendedTextMessage {
@@ -6452,14 +6495,14 @@ mod tests {
             &[],
         );
         assert!(!trigger.mentions_agent);
-        assert!(trigger.replied_to_agent);
+        assert!(!trigger.replied_to_agent);
         assert_eq!(trigger.quoted_message_id.as_deref(), Some("wamid-agent-1"));
-        assert!(trigger.should_invoke());
+        assert!(!trigger.should_invoke());
     }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_observed_group_trigger_detects_textual_lid_mention_from_alias() {
+    fn whatsapp_web_observed_group_trigger_ignores_textual_lid_mention_alias() {
         let msg = wa_rs_proto::whatsapp::Message {
             extended_text_message: Some(Box::new(
                 wa_rs_proto::whatsapp::message::ExtendedTextMessage {
@@ -6476,14 +6519,14 @@ mod tests {
             Some("+15551234567"),
             &["128789057143037@lid".to_string()],
         );
-        assert!(trigger.mentions_agent);
+        assert!(!trigger.mentions_agent);
         assert!(!trigger.replied_to_agent);
-        assert!(trigger.should_invoke());
+        assert!(!trigger.should_invoke());
     }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_observed_group_trigger_detects_reply_to_agent_lid_alias() {
+    fn whatsapp_web_observed_group_trigger_ignores_reply_to_agent_lid_alias() {
         let msg = wa_rs_proto::whatsapp::Message {
             extended_text_message: Some(Box::new(
                 wa_rs_proto::whatsapp::message::ExtendedTextMessage {
@@ -6506,9 +6549,9 @@ mod tests {
             &["128789057143037@lid".to_string()],
         );
         assert!(!trigger.mentions_agent);
-        assert!(trigger.replied_to_agent);
+        assert!(!trigger.replied_to_agent);
         assert_eq!(trigger.quoted_message_id.as_deref(), Some("wamid-agent-2"));
-        assert!(trigger.should_invoke());
+        assert!(!trigger.should_invoke());
     }
 
     #[test]
@@ -6574,7 +6617,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_main_channel_bypasses_mention_gate_for_owner_messages() {
+    fn whatsapp_web_main_channel_requires_wake_token_for_owner_messages() {
         let observed_group = ObservedGroupConfig {
             group_jid: "120363025123456789@g.us".to_string(),
             group_name: "Main".to_string(),
@@ -6595,7 +6638,7 @@ mod tests {
             initial_outreach_preview: None,
         };
 
-        assert!(WhatsAppWebChannel::should_invoke_observed_group_agent(
+        assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
             &observed_group,
             true,
             &ObservedGroupTrigger::default(),
@@ -6698,11 +6741,23 @@ mod tests {
             mode: ConversationMode::ManagedGroup,
             ..observed_group.clone()
         };
-        assert!(WhatsAppWebChannel::should_invoke_group_agent(
+        assert!(!WhatsAppWebChannel::should_invoke_group_agent(
             true,
             false,
             Some(&managed_group_policy),
             &empty_trigger,
+        ));
+
+        let mention_trigger = ObservedGroupTrigger {
+            mentions_agent: true,
+            replied_to_agent: false,
+            quoted_message_id: None,
+        };
+        assert!(WhatsAppWebChannel::should_invoke_group_agent(
+            true,
+            false,
+            Some(&managed_group_policy),
+            &mention_trigger,
         ));
 
         let observe_only_policy = ObservedGroupConfig {
@@ -6716,11 +6771,18 @@ mod tests {
             &empty_trigger,
         ));
 
-        assert!(WhatsAppWebChannel::should_invoke_group_agent(
+        assert!(!WhatsAppWebChannel::should_invoke_group_agent(
             true,
             false,
             None,
             &empty_trigger,
+        ));
+
+        assert!(WhatsAppWebChannel::should_invoke_group_agent(
+            true,
+            false,
+            None,
+            &mention_trigger,
         ));
     }
 

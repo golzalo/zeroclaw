@@ -3139,6 +3139,68 @@ fn tool_registry_contains(tools_registry: &[Box<dyn Tool>], tool_name: &str) -> 
     tools_registry.iter().any(|tool| tool.name() == tool_name)
 }
 
+fn build_strict_agent_system_prompt(
+    workspace_dir: &std::path::Path,
+    tools: &[crate::tools::ToolSpec],
+    skills: &[crate::skills::Skill],
+    agent_system_prompt: Option<&str>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    extra_context_files: &[String],
+) -> String {
+    let mut prompt = String::new();
+
+    if let Some(system_prompt) = agent_system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str(system_prompt);
+    }
+
+    if !skills.is_empty() {
+        let skills_prompt = crate::skills::skills_to_prompt_with_mode(
+            skills,
+            workspace_dir,
+            skills_prompt_mode,
+        );
+        if !skills_prompt.trim().is_empty() {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(&skills_prompt);
+        }
+    }
+
+    if !extra_context_files.is_empty() {
+        if !prompt.is_empty() {
+            prompt.push_str("\n\n");
+        }
+        append_extra_context_files(
+            &mut prompt,
+            workspace_dir,
+            extra_context_files,
+            BOOTSTRAP_MAX_CHARS,
+        );
+    }
+
+    if !native_tools && !tools.is_empty() {
+        let tool_instructions = build_tool_instructions(tools);
+        if !tool_instructions.trim().is_empty() {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(&tool_instructions);
+        }
+    }
+
+    if prompt.trim().is_empty() {
+        "You are a restricted messaging worker. Reply briefly, honestly, and only with the capabilities explicitly configured for this runtime."
+            .to_string()
+    } else {
+        prompt
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn build_whatsapp_third_party_runtime_context(
     root_config: &Config,
@@ -3186,7 +3248,7 @@ async fn build_whatsapp_third_party_runtime_context(
     worker_config.model_routes.clear();
     worker_config.query_classification = crate::config::QueryClassificationConfig::default();
 
-    let provider_name = resolved_default_provider(&worker_config);
+    let provider_name = agent_config.provider.clone();
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: worker_config.api_url.clone(),
@@ -3340,39 +3402,22 @@ async fn build_whatsapp_third_party_runtime_context(
         Some(&i18n_descs),
     );
 
-    let bootstrap_max_chars = if worker_config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
     let native_tools = provider.supports_native_tools();
-    let model = resolved_default_model(&worker_config);
-    let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
+    let model = agent_config.model.clone();
+    let system_prompt = build_strict_agent_system_prompt(
         &workspace,
-        &model,
         &active_tool_specs,
         &skills,
-        Some(&worker_config.identity),
-        bootstrap_max_chars,
-        Some(&worker_config.autonomy),
+        agent_config.system_prompt.as_deref(),
         native_tools,
         worker_config.skills.prompt_injection_mode,
         &worker_config.agent.context_files,
     );
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
-    }
     if !deferred_section.is_empty() {
-        system_prompt.push('\n');
-        system_prompt.push_str(&deferred_section);
-    }
-    if let Some(agent_system_prompt) = agent_config
-        .system_prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        system_prompt = format!("{agent_system_prompt}\n\n{system_prompt}");
+        tracing::info!(
+            agent = THIRD_PARTY_WHATSAPP_AGENT_NAME,
+            "Deferred MCP prompt section suppressed for strict WhatsApp third-party runtime"
+        );
     }
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
@@ -3400,6 +3445,10 @@ async fn build_whatsapp_third_party_runtime_context(
         .mattermost
         .as_ref()
         .is_some_and(|mm| mm.interrupt_on_new_message);
+    let runtime_ctx_provider_runtime_options = providers::ProviderRuntimeOptions {
+        zeroclaw_dir: None,
+        ..provider_runtime_options.clone()
+    };
 
     Ok(Some(Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -3422,7 +3471,7 @@ async fn build_whatsapp_third_party_runtime_context(
         api_key: worker_config.api_key.clone(),
         api_url: worker_config.api_url.clone(),
         reliability: Arc::new(worker_config.reliability.clone()),
-        provider_runtime_options,
+        provider_runtime_options: runtime_ctx_provider_runtime_options,
         workspace_dir: Arc::new(worker_config.workspace_dir.clone()),
         message_timeout_secs,
         interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -9731,6 +9780,43 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             prompt.contains("instead of simulating an approval flow"),
             "read-only prompt should explain restrictions instead of faking approval"
+        );
+    }
+
+    #[test]
+    fn strict_agent_prompt_injects_only_explicit_context_files() {
+        let ws = make_workspace();
+        std::fs::write(
+            ws.path().join("SMALL_AGENT.md"),
+            "Reply with the strict worker policy only.",
+        )
+        .unwrap();
+
+        let prompt = build_strict_agent_system_prompt(
+            ws.path(),
+            &[],
+            &[],
+            Some("You are the strict worker."),
+            true,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &["SMALL_AGENT.md".to_string()],
+        );
+
+        assert!(
+            prompt.contains("You are the strict worker."),
+            "missing configured system prompt"
+        );
+        assert!(
+            prompt.contains("Reply with the strict worker policy only."),
+            "missing explicit context file"
+        );
+        assert!(
+            !prompt.contains("Follow instructions."),
+            "strict prompt should not inject AGENTS.md"
+        );
+        assert!(
+            !prompt.contains("Use shell carefully."),
+            "strict prompt should not inject TOOLS.md"
         );
     }
 

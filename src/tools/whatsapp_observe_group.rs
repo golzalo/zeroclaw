@@ -28,7 +28,7 @@ impl Tool for WhatsAppObserveGroupTool {
     }
 
     fn description(&self) -> &str {
-        "Register or update a WhatsApp group conversation policy. Use mode='observe_only' for passive summaries, mode='mention_reply' to let the agent answer when explicitly mentioned, or mode='managed_group' for active participation. Policies can also pin a workspace skill so future replies follow that playbook."
+        "Register or update a WhatsApp group conversation policy. Use mode='observe_only' for passive summaries, mode='mention_reply' to let the agent answer only when summoned with `@s86`, or mode='managed_group' for agent-managed groups that still require `@s86` to reply. Policies can also pin a workspace skill so future replies follow that playbook."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -157,13 +157,13 @@ impl Tool for WhatsAppObserveGroupTool {
                 "Passive capture only; the agent will not reply inside that group."
             }
             ConversationMode::MentionReply => {
-                "The agent will only answer when explicitly mentioned or when someone replies to one of its messages."
+                "The agent will only answer when a message explicitly includes `@s86`."
             }
             ConversationMode::ObjectiveDm => {
                 "Reserved for direct-message objective workflows; group replies stay disabled."
             }
             ConversationMode::ManagedGroup => {
-                "The agent may actively participate in that group."
+                "The group is managed by the agent, but replies still require an explicit `@s86` summon."
             }
         };
 
