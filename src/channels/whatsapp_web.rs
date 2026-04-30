@@ -85,6 +85,7 @@ const WHATSAPP_BOOTSTRAP_COMMUNITY_SUBJECT: &str = "S86";
 const WHATSAPP_BOOTSTRAP_GROUP_SUBJECT: &str = "S86 - Agente Principal";
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_OFFICIAL_GROUP_DELIVERY_TARGET: &str = "__whatsapp_official_group__";
+const WHATSAPP_DEFAULT_MENTION_ALIASES: &[&str] = &["agent", "agente", "zeroclaw"];
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_BOOTSTRAP_GROUP_GREETING: &str = "Hola";
 #[cfg(feature = "whatsapp-web")]
@@ -710,6 +711,9 @@ impl WhatsAppWebChannel {
             for token in Self::identity_match_tokens(value) {
                 tokens.insert(token);
             }
+        }
+        for alias in WHATSAPP_DEFAULT_MENTION_ALIASES {
+            tokens.insert((*alias).to_string());
         }
 
         tokens
@@ -3016,8 +3020,18 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn sender_is_owner(sender_candidates: &[String], self_phone: Option<&str>) -> bool {
+        self_phone.is_some_and(|self_phone| {
+            sender_candidates
+                .iter()
+                .any(|candidate| candidate == self_phone)
+        })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     fn should_invoke_observed_group_agent(
         observed_group: &ObservedGroupConfig,
+        is_main_channel: bool,
         trigger: &ObservedGroupTrigger,
     ) -> bool {
         if observed_group.status != ConversationPolicyStatus::Active {
@@ -3029,7 +3043,7 @@ impl WhatsAppWebChannel {
         }
 
         match observed_group.mode {
-            ConversationMode::MentionReply => trigger.should_invoke(),
+            ConversationMode::MentionReply => is_main_channel || trigger.should_invoke(),
             ConversationMode::ManagedGroup => true,
             ConversationMode::ObjectiveDm => false,
             ConversationMode::ObserveOnly => false,
@@ -3039,16 +3053,39 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     fn should_invoke_group_agent(
         group_is_managed: bool,
+        is_main_channel: bool,
         conversation_policy: Option<&ObservedGroupConfig>,
         trigger: &ObservedGroupTrigger,
     ) -> bool {
         if let Some(policy) = conversation_policy
             .filter(|policy| policy.chat_kind == ConversationChatKind::Group)
         {
-            return Self::should_invoke_observed_group_agent(policy, trigger);
+            return Self::should_invoke_observed_group_agent(policy, is_main_channel, trigger);
         }
 
-        group_is_managed
+        group_is_managed || is_main_channel
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn should_invoke_observed_direct_agent(
+        observed_direct: &ObservedGroupConfig,
+        trigger: &ObservedGroupTrigger,
+    ) -> bool {
+        if observed_direct.status != ConversationPolicyStatus::Active {
+            return false;
+        }
+
+        if !observed_direct.mode.allows_agent_reply() {
+            return false;
+        }
+
+        match observed_direct.mode {
+            ConversationMode::MentionReply | ConversationMode::ObjectiveDm => {
+                trigger.should_invoke()
+            }
+            ConversationMode::ManagedGroup => true,
+            ConversationMode::ObserveOnly => false,
+        }
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -4934,6 +4971,8 @@ impl Channel for WhatsAppWebChannel {
                                     sender_alt.as_ref(),
                                     mapped_sender_phone.as_deref(),
                                 );
+                                let sender_is_owner =
+                                    Self::sender_is_owner(&sender_candidates, self_phone.as_deref());
                                 let chat_candidates =
                                     Self::chat_phone_candidates(&chat_jid, mapped_chat_phone.as_deref());
                                 let decision = Self::evaluate_chat_policy(
@@ -4998,6 +5037,9 @@ impl Channel for WhatsAppWebChannel {
                                     .as_deref()
                                     .map(Self::is_support_group_name)
                                     .unwrap_or(false);
+                                let group_is_main_channel = decision.chat_kind
+                                    == WhatsAppChatKind::Group
+                                    && Self::is_official_general_chat(&official_group_jid, &chat);
                                 let group_is_observed = conversation_policy
                                     .as_ref()
                                     .is_some_and(|policy| {
@@ -5042,6 +5084,8 @@ impl Channel for WhatsAppWebChannel {
                                     allow_self_chat,
                                     allow_direct_messages,
                                     allow_group_messages,
+                                    sender_is_owner,
+                                    group_is_main_channel,
                                     group_is_managed,
                                     group_is_suppressed,
                                     group_is_support,
@@ -5106,6 +5150,17 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                         }
                                     }
+                                    if !group_is_observed
+                                        && !group_is_managed
+                                        && !group_is_main_channel
+                                    {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            sender_is_owner,
+                                            "WhatsApp Web group is not observed or managed; message captured without invoking the agent"
+                                        );
+                                        return;
+                                    }
                                 }
                                 let normalized = decision
                                     .sender_allowed_candidate
@@ -5164,17 +5219,16 @@ impl Channel for WhatsAppWebChannel {
                                 let content = sections.join("\n\n");
                                 let self_identity_aliases =
                                     observation_service.load_self_identity_aliases();
-                                let observed_group_trigger = if decision.chat_kind
-                                    == WhatsAppChatKind::Group
-                                {
-                                    Self::extract_observed_group_trigger(
-                                        content_msg,
-                                        content_msg.text_content(),
-                                        self_phone.as_deref(),
-                                        &self_identity_aliases,
-                                    )
-                                } else {
-                                    ObservedGroupTrigger::default()
+                                let observed_group_trigger = match decision.chat_kind {
+                                    WhatsAppChatKind::Group | WhatsAppChatKind::Direct => {
+                                        Self::extract_observed_group_trigger(
+                                            content_msg,
+                                            content_msg.text_content(),
+                                            self_phone.as_deref(),
+                                            &self_identity_aliases,
+                                        )
+                                    }
+                                    WhatsAppChatKind::SelfChat => ObservedGroupTrigger::default(),
                                 };
 
                                 tracing::info!(
@@ -5242,6 +5296,7 @@ impl Channel for WhatsAppWebChannel {
                                 {
                                     let should_invoke = Self::should_invoke_group_agent(
                                         group_is_managed,
+                                        group_is_main_channel,
                                         conversation_policy.as_ref(),
                                         &observed_group_trigger,
                                     );
@@ -5272,6 +5327,14 @@ impl Channel for WhatsAppWebChannel {
 
                                 if decision.chat_kind == WhatsAppChatKind::Direct
                                 {
+                                    if conversation_policy.is_none() {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            sender_is_owner,
+                                            "WhatsApp Web direct chat is not observed; message captured without invoking the agent"
+                                        );
+                                        return;
+                                    }
                                     if direct_observe_only_policy_active {
                                         tracing::debug!(
                                             chat = %chat,
@@ -5296,6 +5359,27 @@ impl Channel for WhatsAppWebChannel {
                                         );
                                         return;
                                     }
+                                    let should_invoke = conversation_policy
+                                        .as_ref()
+                                        .is_some_and(|policy| {
+                                            Self::should_invoke_observed_direct_agent(
+                                                policy,
+                                                &observed_group_trigger,
+                                            )
+                                        });
+                                    if !should_invoke {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            mode = conversation_policy
+                                                .as_ref()
+                                                .map(|policy| policy.mode.as_str())
+                                                .unwrap_or("observe_only"),
+                                            mentions_agent = observed_group_trigger.mentions_agent,
+                                            replied_to_agent = observed_group_trigger.replied_to_agent,
+                                            "WhatsApp Web direct conversation policy captured the message without invoking the agent"
+                                        );
+                                        return;
+                                    }
                                     if direct_objective_policy_active {
                                         tracing::debug!(
                                             chat = %chat,
@@ -5303,6 +5387,19 @@ impl Channel for WhatsAppWebChannel {
                                                 .as_ref()
                                                 .and_then(|policy| policy.objective.as_deref())
                                                 .unwrap_or(""),
+                                            mentions_agent = observed_group_trigger.mentions_agent,
+                                            replied_to_agent = observed_group_trigger.replied_to_agent,
+                                            "WhatsApp Web direct conversation policy allowed agent invocation"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            mode = conversation_policy
+                                                .as_ref()
+                                                .map(|policy| policy.mode.as_str())
+                                                .unwrap_or("mention_reply"),
+                                            mentions_agent = observed_group_trigger.mentions_agent,
+                                            replied_to_agent = observed_group_trigger.replied_to_agent,
                                             "WhatsApp Web direct conversation policy allowed agent invocation"
                                         );
                                     }
@@ -5373,11 +5470,16 @@ impl Channel for WhatsAppWebChannel {
                                     self_phone.as_deref(),
                                     &official_group_jid,
                                 );
+                                let runtime_channel = if sender_is_owner {
+                                    super::WHATSAPP_MAIN_RUNTIME_CHANNEL
+                                } else {
+                                    super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
+                                };
 
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
-                                        channel: "whatsapp".to_string(),
+                                        channel: runtime_channel.to_string(),
                                         sender: normalized.clone(),
                                         // Reply to the originating chat JID (DM or group).
                                         reply_target,
@@ -6308,6 +6410,25 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_detects_plain_agent_wake_token() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            conversation: Some("@agent hacelo".to_string()),
+            ..Default::default()
+        };
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            Some("@agent hacelo"),
+            Some("+15551234567"),
+            &[],
+        );
+        assert!(trigger.mentions_agent);
+        assert!(!trigger.replied_to_agent);
+        assert!(trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_observed_group_trigger_detects_reply_to_agent() {
         let msg = wa_rs_proto::whatsapp::Message {
             extended_text_message: Some(Box::new(
@@ -6415,6 +6536,7 @@ mod tests {
         let empty_trigger = ObservedGroupTrigger::default();
         assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
             &observed_group,
+            false,
             &empty_trigger,
         ));
 
@@ -6425,6 +6547,7 @@ mod tests {
         };
         assert!(WhatsAppWebChannel::should_invoke_observed_group_agent(
             &observed_group,
+            false,
             &mention_trigger,
         ));
 
@@ -6434,6 +6557,7 @@ mod tests {
         };
         assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
             &passive_group,
+            false,
             &mention_trigger,
         ));
 
@@ -6443,6 +6567,76 @@ mod tests {
         };
         assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
             &paused_group,
+            false,
+            &mention_trigger,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_main_channel_bypasses_mention_gate_for_owner_messages() {
+        let observed_group = ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Main".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::MentionReply,
+            status: ConversationPolicyStatus::Active,
+            objective: None,
+            skill_name: Some("whatsapp_mention_reply".to_string()),
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+
+        assert!(WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &observed_group,
+            true,
+            &ObservedGroupTrigger::default(),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_direct_objective_dm_requires_mention_trigger() {
+        let direct_policy = ObservedGroupConfig {
+            group_jid: "5491170742021@s.whatsapp.net".to_string(),
+            group_name: "Cliente Demo".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Direct,
+            mode: ConversationMode::ObjectiveDm,
+            status: ConversationPolicyStatus::Active,
+            objective: Some("Cerrar el acuerdo".to_string()),
+            skill_name: Some("whatsapp_objective_dm".to_string()),
+            canonical_phone: Some("+5491170742021".to_string()),
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+        };
+        let empty_trigger = ObservedGroupTrigger::default();
+        let mention_trigger = ObservedGroupTrigger {
+            mentions_agent: true,
+            replied_to_agent: false,
+            quoted_message_id: None,
+        };
+
+        assert!(!WhatsAppWebChannel::should_invoke_observed_direct_agent(
+            &direct_policy,
+            &empty_trigger,
+        ));
+        assert!(WhatsAppWebChannel::should_invoke_observed_direct_agent(
+            &direct_policy,
             &mention_trigger,
         ));
     }
@@ -6495,6 +6689,7 @@ mod tests {
         let empty_trigger = ObservedGroupTrigger::default();
         assert!(!WhatsAppWebChannel::should_invoke_group_agent(
             true,
+            false,
             Some(&observed_group),
             &empty_trigger,
         ));
@@ -6505,6 +6700,7 @@ mod tests {
         };
         assert!(WhatsAppWebChannel::should_invoke_group_agent(
             true,
+            false,
             Some(&managed_group_policy),
             &empty_trigger,
         ));
@@ -6515,12 +6711,14 @@ mod tests {
         };
         assert!(!WhatsAppWebChannel::should_invoke_group_agent(
             true,
+            false,
             Some(&observe_only_policy),
             &empty_trigger,
         ));
 
         assert!(WhatsAppWebChannel::should_invoke_group_agent(
             true,
+            false,
             None,
             &empty_trigger,
         ));

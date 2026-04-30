@@ -512,6 +512,55 @@ struct ChannelRemoteBudgetContext {
     scope_id: String,
 }
 
+const WHATSAPP_MAIN_RUNTIME_CHANNEL: &str = "whatsapp:main";
+const WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL: &str = "whatsapp:third_party";
+const THIRD_PARTY_WHATSAPP_AGENT_NAME: &str = "whatsapp_third_party";
+const THIRD_PARTY_EMPTY_TOOL_ALLOWLIST_SENTINEL: &str =
+    "__whatsapp_third_party_no_tools__";
+const THIRD_PARTY_EMPTY_SKILL_ALLOWLIST_SENTINEL: &str =
+    "__whatsapp_third_party_no_skills__";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelExecutionLane {
+    Main,
+    ThirdParty,
+}
+
+fn base_channel_name(channel_name: &str) -> &str {
+    channel_name
+        .split_once(':')
+        .map(|(base, _)| base)
+        .unwrap_or(channel_name)
+}
+
+fn resolve_channel_execution_lane(channel_name: &str) -> ChannelExecutionLane {
+    match channel_name.split_once(':') {
+        Some(("whatsapp", "third_party")) => ChannelExecutionLane::ThirdParty,
+        _ => ChannelExecutionLane::Main,
+    }
+}
+
+fn strict_allowlist_for_third_party_worker(configured: &[String], sentinel: &str) -> Vec<String> {
+    if configured.is_empty() {
+        return vec![sentinel.to_string()];
+    }
+
+    configured.to_vec()
+}
+
+fn is_allowed_skill_name(skill_name: &str, allowed_skills: Option<&[String]>) -> bool {
+    let Some(allowed_skills) = allowed_skills else {
+        return true;
+    };
+    if allowed_skills.is_empty() {
+        return true;
+    }
+
+    allowed_skills
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(skill_name))
+}
+
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     // Include thread_ts for per-topic memory isolation in forum groups
     match &msg.thread_ts {
@@ -536,11 +585,7 @@ fn resolve_active_whatsapp_conversation_policy(
     workspace_dir: &Path,
     msg: &traits::ChannelMessage,
 ) -> Option<ObservedGroupConfig> {
-    let base_channel = msg
-        .channel
-        .split_once(':')
-        .map(|(base, _)| base)
-        .unwrap_or(msg.channel.as_str());
+    let base_channel = base_channel_name(msg.channel.as_str());
     if base_channel != "whatsapp" {
         return None;
     }
@@ -973,8 +1018,10 @@ fn build_channel_system_prompt(
     channel_name: &str,
     reply_target: &str,
     workspace_dir: Option<&Path>,
+    allowed_skills: Option<&[String]>,
 ) -> String {
     let mut prompt = base_prompt.to_string();
+    let base_channel = base_channel_name(channel_name);
 
     // Refresh the stale datetime in the cached system prompt
     {
@@ -995,7 +1042,7 @@ fn build_channel_system_prompt(
         }
     }
 
-    if let Some(instructions) = channel_delivery_instructions(channel_name) {
+    if let Some(instructions) = channel_delivery_instructions(base_channel) {
         if prompt.is_empty() {
             prompt = instructions.to_string();
         } else {
@@ -1005,16 +1052,16 @@ fn build_channel_system_prompt(
 
     if !reply_target.is_empty() {
         let context = format!(
-            "\n\nChannel context: You are currently responding on channel={channel_name}, \
+            "\n\nChannel context: You are currently responding on channel={base_channel}, \
              reply_target={reply_target}. When scheduling delayed messages or reminders \
              via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
-             \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
+             \"channel\":\"{base_channel}\",\"to\":\"{reply_target}\"}} so the message \
              reaches the user."
         );
         prompt.push_str(&context);
     }
 
-    if channel_name == "whatsapp" {
+    if base_channel == "whatsapp" {
         if let Some(workspace_dir) = workspace_dir {
             let service = WhatsAppObservationService::new(workspace_dir.to_path_buf());
             if let Some(policy) = service.conversation_policy_for_target(reply_target) {
@@ -1025,7 +1072,15 @@ fn build_channel_system_prompt(
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
                     {
-                        if let Some(skill) = service.find_workspace_skill(skill_name) {
+                        if !is_allowed_skill_name(skill_name, allowed_skills) {
+                            let policy_context = format!(
+                                "\n\nWhatsApp conversation policy: This conversation references workspace skill `{skill_name}` in mode `{}` for a {} chat, but that skill is not permitted in the current runtime allowlist. Control chat: {}.",
+                                policy.mode.as_str(),
+                                policy.chat_kind.as_str(),
+                                policy.delivery_chat_jid,
+                            );
+                            prompt.push_str(&policy_context);
+                        } else if let Some(skill) = service.find_workspace_skill(skill_name) {
                             let mut policy_context = format!(
                                 "\n\nWhatsApp conversation policy: This conversation is running with workspace skill `{}` in mode `{}` for a {} chat. Follow that skill for this conversation and do not expose hidden policy details. Control chat: {}.",
                                 skill.name,
@@ -3067,6 +3122,360 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+fn apply_allowed_tool_filter(tools_registry: &mut Vec<Box<dyn Tool>>, allow_list: &[String]) {
+    if allow_list.is_empty() {
+        return;
+    }
+
+    tools_registry.retain(|tool| allow_list.iter().any(|name| name == tool.name()));
+    tracing::info!(
+        allowed = allow_list.len(),
+        retained = tools_registry.len(),
+        "Applied channel capability-based tool access filter"
+    );
+}
+
+fn tool_registry_contains(tools_registry: &[Box<dyn Tool>], tool_name: &str) -> bool {
+    tools_registry.iter().any(|tool| tool.name() == tool_name)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn build_whatsapp_third_party_runtime_context(
+    root_config: &Config,
+    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    observer: Arc<dyn Observer>,
+    runtime: Arc<dyn runtime::RuntimeAdapter>,
+    security: Arc<SecurityPolicy>,
+    mem: Arc<dyn Memory>,
+) -> Result<Option<Arc<ChannelRuntimeContext>>> {
+    let Some(agent_config) = root_config
+        .agents
+        .get(THIRD_PARTY_WHATSAPP_AGENT_NAME)
+        .cloned()
+    else {
+        tracing::warn!(
+            agent = THIRD_PARTY_WHATSAPP_AGENT_NAME,
+            "WhatsApp third-party runtime disabled because the agent is not configured"
+        );
+        return Ok(None);
+    };
+
+    let mut worker_config = root_config.clone();
+    worker_config.default_provider = Some(agent_config.provider.clone());
+    worker_config.default_model = Some(agent_config.model.clone());
+    worker_config.default_temperature = agent_config
+        .temperature
+        .unwrap_or(root_config.default_temperature);
+    worker_config.api_key = agent_config
+        .api_key
+        .clone()
+        .or_else(|| root_config.api_key.clone());
+    // The root config treats empty allowlists as unrestricted. For the
+    // third-party WhatsApp worker we want the opposite: `[]` must mean the
+    // worker gets no tools / skills beyond its injected context files.
+    worker_config.agent.allowed_tools = strict_allowlist_for_third_party_worker(
+        &agent_config.allowed_tools,
+        THIRD_PARTY_EMPTY_TOOL_ALLOWLIST_SENTINEL,
+    );
+    worker_config.agent.allowed_skills = strict_allowlist_for_third_party_worker(
+        &agent_config.skills,
+        THIRD_PARTY_EMPTY_SKILL_ALLOWLIST_SENTINEL,
+    );
+    worker_config.agent.context_files = agent_config.context_files.clone();
+    worker_config.agent.max_tool_iterations = agent_config.max_iterations;
+    worker_config.model_routes.clear();
+    worker_config.query_classification = crate::config::QueryClassificationConfig::default();
+
+    let provider_name = resolved_default_provider(&worker_config);
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: worker_config.api_url.clone(),
+        zeroclaw_dir: worker_config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from),
+        secrets_encrypt: worker_config.secrets.encrypt,
+        reasoning_enabled: worker_config.runtime.reasoning_enabled,
+        reasoning_effort: worker_config.runtime.reasoning_effort.clone(),
+        provider_timeout_secs: Some(worker_config.provider_timeout_secs),
+        extra_headers: worker_config.extra_headers.clone(),
+        api_path: worker_config.api_path.clone(),
+    };
+    let provider: Arc<dyn Provider> = match create_resilient_provider_nonblocking(
+        &provider_name,
+        worker_config.api_key.clone(),
+        worker_config.api_url.clone(),
+        worker_config.reliability.clone(),
+        provider_runtime_options.clone(),
+    )
+    .await
+    {
+        Ok(provider) => Arc::from(provider),
+        Err(error) => {
+            tracing::warn!(
+                agent = THIRD_PARTY_WHATSAPP_AGENT_NAME,
+                provider = %provider_name,
+                "WhatsApp third-party runtime disabled because the provider failed to initialize: {error}"
+            );
+            return Ok(None);
+        }
+    };
+
+    let (composio_key, composio_entity_id) = if worker_config.composio.enabled {
+        (
+            worker_config.composio.api_key.as_deref(),
+            Some(worker_config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let workspace = worker_config.workspace_dir.clone();
+    let (mut built_tools, delegate_handle_ch): (Vec<Box<dyn Tool>>, _) =
+        tools::all_tools_with_runtime(
+            Arc::new(worker_config.clone()),
+            &security,
+            runtime,
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &worker_config.browser,
+            &worker_config.http_request,
+            &worker_config.web_fetch,
+            &workspace,
+            &worker_config.agents,
+            worker_config.api_key.as_deref(),
+            &worker_config,
+        );
+
+    let mut deferred_section = String::new();
+    let mut activated_handle: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
+    if worker_config.mcp.enabled && !worker_config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client for WhatsApp third-party runtime — {} server(s) configured",
+            worker_config.mcp.servers.len()
+        );
+        match crate::tools::McpRegistry::connect_all(&worker_config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                if worker_config.mcp.deferred_loading {
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    tracing::info!(
+                        "WhatsApp third-party MCP deferred: {} tool stub(s) from {} server(s)",
+                        deferred_set.len(),
+                        registry.server_count()
+                    );
+                    deferred_section =
+                        crate::tools::mcp_deferred::build_deferred_tools_section(&deferred_set);
+                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::ActivatedToolSet::new(),
+                    ));
+                    activated_handle = Some(std::sync::Arc::clone(&activated));
+                    built_tools.push(Box::new(crate::tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated,
+                    )));
+                } else {
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle_ch {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            built_tools.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                            registered += 1;
+                        }
+                    }
+                    tracing::info!(
+                        "WhatsApp third-party MCP: {} tool(s) registered from {} server(s)",
+                        registered,
+                        registry.server_count()
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!("WhatsApp third-party MCP registry failed to initialize: {error:#}");
+            }
+        }
+    }
+
+    apply_allowed_tool_filter(&mut built_tools, &worker_config.agent.allowed_tools);
+    if !tool_registry_contains(&built_tools, "tool_search") {
+        deferred_section.clear();
+        activated_handle = None;
+    }
+    let tools_registry = Arc::new(built_tools);
+
+    let skills = load_runtime_skills(&workspace, &worker_config);
+    let i18n_locale = worker_config
+        .locale
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&workspace);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    let excluded = if worker_config.autonomy.level == AutonomyLevel::Full {
+        Vec::new()
+    } else {
+        worker_config.autonomy.non_cli_excluded_tools.clone()
+    };
+    let activation_sets = activated_handle.iter().collect::<Vec<_>>();
+    let active_tool_specs = crate::tools::active_tool_specs(
+        tools_registry.as_ref(),
+        &activation_sets,
+        &excluded,
+        worker_config.skills.prompt_injection_mode,
+        Some(&i18n_descs),
+    );
+
+    let bootstrap_max_chars = if worker_config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let native_tools = provider.supports_native_tools();
+    let model = resolved_default_model(&worker_config);
+    let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
+        &workspace,
+        &model,
+        &active_tool_specs,
+        &skills,
+        Some(&worker_config.identity),
+        bootstrap_max_chars,
+        Some(&worker_config.autonomy),
+        native_tools,
+        worker_config.skills.prompt_injection_mode,
+        &worker_config.agent.context_files,
+    );
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
+    }
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
+    }
+    if let Some(agent_system_prompt) = agent_config
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        system_prompt = format!("{agent_system_prompt}\n\n{system_prompt}");
+    }
+
+    let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+    provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
+    let message_timeout_secs = effective_channel_message_timeout_secs(
+        worker_config.channels_config.message_timeout_secs,
+    );
+    let interrupt_on_new_message = worker_config
+        .channels_config
+        .telegram
+        .as_ref()
+        .is_some_and(|tg| tg.interrupt_on_new_message);
+    let interrupt_on_new_message_slack = worker_config
+        .channels_config
+        .slack
+        .as_ref()
+        .is_some_and(|sl| sl.interrupt_on_new_message);
+    let interrupt_on_new_message_discord = worker_config
+        .channels_config
+        .discord
+        .as_ref()
+        .is_some_and(|dc| dc.interrupt_on_new_message);
+    let interrupt_on_new_message_mattermost = worker_config
+        .channels_config
+        .mattermost
+        .as_ref()
+        .is_some_and(|mm| mm.interrupt_on_new_message);
+
+    Ok(Some(Arc::new(ChannelRuntimeContext {
+        channels_by_name,
+        provider,
+        default_provider: Arc::new(provider_name),
+        prompt_config: Arc::new(worker_config.clone()),
+        memory: mem,
+        tools_registry,
+        observer: Arc::clone(&observer),
+        system_prompt: Arc::new(system_prompt),
+        model: Arc::new(model),
+        temperature: worker_config.default_temperature,
+        auto_save_memory: worker_config.memory.auto_save,
+        max_tool_iterations: worker_config.agent.max_tool_iterations,
+        min_relevance_score: worker_config.memory.min_relevance_score,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: worker_config.api_key.clone(),
+        api_url: worker_config.api_url.clone(),
+        reliability: Arc::new(worker_config.reliability.clone()),
+        provider_runtime_options,
+        workspace_dir: Arc::new(worker_config.workspace_dir.clone()),
+        message_timeout_secs,
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: interrupt_on_new_message,
+            slack: interrupt_on_new_message_slack,
+            discord: interrupt_on_new_message_discord,
+            mattermost: interrupt_on_new_message_mattermost,
+        },
+        multimodal: worker_config.multimodal.clone(),
+        hooks: if worker_config.hooks.enabled {
+            let mut runner = crate::hooks::HookRunner::new();
+            if worker_config.hooks.builtin.command_logger {
+                runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+            }
+            if worker_config.hooks.builtin.webhook_audit.enabled {
+                runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                    worker_config.hooks.builtin.webhook_audit.clone(),
+                )));
+            }
+            Some(Arc::new(runner))
+        } else {
+            None
+        },
+        non_cli_excluded_tools: Arc::new(worker_config.autonomy.non_cli_excluded_tools.clone()),
+        autonomy_level: worker_config.autonomy.level,
+        tool_call_dedup_exempt: Arc::new(worker_config.agent.tool_call_dedup_exempt.clone()),
+        model_routes: Arc::new(worker_config.model_routes.clone()),
+        query_classification: worker_config.query_classification.clone(),
+        ack_reactions: worker_config.channels_config.ack_reactions,
+        show_tool_calls: worker_config.channels_config.show_tool_calls,
+        session_store: if worker_config.channels_config.session_persistence {
+            match session_store::SessionStore::new(&worker_config.workspace_dir) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(error) => {
+                    tracing::warn!(
+                        "WhatsApp third-party session persistence disabled: {error}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        },
+        approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+            &worker_config.autonomy,
+        )),
+        activated_tools: activated_handle,
+        chat_purge_idle_time_secs: worker_config.agent.chat_purge_idle_time_secs,
+        last_activity: Arc::new(Mutex::new(HashMap::new())),
+        consolidation_prompt_file: worker_config.memory.consolidation.prompt_file.clone(),
+    })))
+}
+
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
@@ -3155,7 +3564,9 @@ async fn process_channel_message(
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
-    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+    if resolve_channel_execution_lane(msg.channel.as_str()) == ChannelExecutionLane::Main
+        && handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await
+    {
         return;
     }
 
@@ -3459,6 +3870,7 @@ async fn process_channel_message(
         &msg.channel,
         &msg.reply_target,
         Some(ctx.workspace_dir.as_ref()),
+        Some(ctx.prompt_config.agent.allowed_skills.as_slice()),
     );
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
@@ -4141,6 +4553,7 @@ async fn process_channel_message(
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
+    third_party_ctx: Option<Arc<ChannelRuntimeContext>>,
     max_in_flight_messages: usize,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
@@ -4200,7 +4613,19 @@ async fn run_message_dispatch_loop(
             Err(_) => break,
         };
 
-        let worker_ctx = Arc::clone(&ctx);
+        let worker_ctx = match resolve_channel_execution_lane(msg.channel.as_str()) {
+            ChannelExecutionLane::Main => Arc::clone(&ctx),
+            ChannelExecutionLane::ThirdParty => {
+                let Some(third_party_ctx) = third_party_ctx.as_ref() else {
+                    tracing::warn!(
+                        channel = %msg.channel,
+                        "Dropping WhatsApp third-party message because no restricted runtime is configured"
+                    );
+                    continue;
+                };
+                Arc::clone(third_party_ctx)
+            }
+        };
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
@@ -5518,7 +5943,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
-            runtime,
+            Arc::clone(&runtime),
             Arc::clone(&mem),
             composio_key,
             composio_entity_id,
@@ -5598,6 +6023,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
+    apply_allowed_tool_filter(&mut built_tools, &config.agent.allowed_tools);
+    if !tool_registry_contains(&built_tools, "tool_search") {
+        deferred_section.clear();
+        ch_activated_handle = None;
+    }
     let tools_registry = Arc::new(built_tools);
 
     let skills = load_runtime_skills(&workspace, &config);
@@ -5776,7 +6206,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         prompt_config: Arc::new(config.clone()),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
-        observer,
+        observer: Arc::clone(&observer),
         system_prompt: Arc::new(system_prompt),
         model: Arc::new(model.clone()),
         temperature,
@@ -5841,6 +6271,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         last_activity: Arc::new(Mutex::new(HashMap::new())),
         consolidation_prompt_file: config.memory.consolidation.prompt_file.clone(),
     });
+
+    let third_party_runtime_ctx = build_whatsapp_third_party_runtime_context(
+        &config,
+        Arc::clone(&runtime_ctx.channels_by_name),
+        Arc::clone(&observer),
+        Arc::clone(&runtime),
+        Arc::clone(&security),
+        Arc::clone(&mem),
+    )
+    .await?;
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
     if let Some(ref store) = runtime_ctx.session_store {
@@ -5921,7 +6361,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         });
     }
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    run_message_dispatch_loop(
+        rx,
+        runtime_ctx,
+        third_party_runtime_ctx,
+        max_in_flight_messages,
+    )
+    .await;
 
     // Wait for all channel tasks
     for h in handles {
@@ -8262,7 +8708,7 @@ BTC is currently around $65,000 based on latest tool output."#
         drop(tx);
 
         let started = Instant::now();
-        run_message_dispatch_loop(rx, runtime_ctx, 2).await;
+        run_message_dispatch_loop(rx, runtime_ctx, None, 2).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -8366,7 +8812,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, None, 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -8484,7 +8930,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, None, 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -8599,7 +9045,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, None, 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -8990,6 +9436,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "whatsapp",
             "15551234567@s.whatsapp.net",
             Some(ws.path()),
+            None,
         );
 
         assert!(prompt.contains("objective-driven direct conversation"));
@@ -8997,6 +9444,41 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("120363408016257691@g.us"));
         assert!(prompt.contains("workspace skill `whatsapp_objective_dm`"));
         assert!(prompt.contains("Always move the conversation toward a concrete next step."));
+    }
+
+    #[test]
+    fn channel_prompt_blocks_whatsapp_policy_skills_outside_allowlist() {
+        let ws = make_workspace();
+        let skill_dir = ws.path().join("skills").join("whatsapp_objective_dm");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: whatsapp_objective_dm\ndescription: Objective-driven WhatsApp DM\n---\n# WhatsApp Objective DM\nAlways move the conversation toward a concrete next step.\n",
+        )
+        .unwrap();
+        let service = WhatsAppObservationService::new(ws.path().to_path_buf());
+        service
+            .register_direct_chat_policy_with_skill(
+                "15551234567@s.whatsapp.net",
+                "Cliente Demo",
+                "120363408016257691@g.us",
+                crate::channels::whatsapp_observation::ConversationMode::ObjectiveDm,
+                "Cerrar el acuerdo y validar el trabajo realizado.",
+                Some("+15551234567"),
+                Some("whatsapp_objective_dm"),
+            )
+            .unwrap();
+
+        let prompt = build_channel_system_prompt(
+            "Base prompt",
+            "whatsapp:third_party",
+            "15551234567@s.whatsapp.net",
+            Some(ws.path()),
+            Some(&["whatsapp_mention_reply".to_string()]),
+        );
+
+        assert!(prompt.contains("not permitted in the current runtime allowlist"));
+        assert!(!prompt.contains("Always move the conversation toward a concrete next step."));
     }
 
     #[test]
@@ -11578,7 +12060,7 @@ This is an example JSON object for profile settings."#;
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, None, 4).await;
         send_task.await.unwrap();
 
         // Both tasks should have completed — different threads, no cancellation.
