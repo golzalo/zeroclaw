@@ -128,6 +128,16 @@ pub struct ObservedGroupConfig {
     #[serde(default)]
     pub skill_name: Option<String>,
     #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub procedure_job_slug: Option<String>,
+    #[serde(default)]
+    pub procedure_summary: Option<String>,
+    #[serde(default)]
+    pub procedure_input_schema: Option<String>,
+    #[serde(default)]
+    pub procedure_sop: Option<String>,
+    #[serde(default)]
     pub canonical_phone: Option<String>,
     #[serde(default = "default_rotate_after_bytes")]
     pub rotate_after_bytes: u64,
@@ -141,6 +151,16 @@ pub struct ObservedGroupConfig {
     pub initial_outreach_sent_at: Option<String>,
     #[serde(default)]
     pub initial_outreach_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationProcedureMetadata {
+    pub goal: Option<String>,
+    pub procedure_job_slug: Option<String>,
+    pub procedure_summary: Option<String>,
+    pub procedure_input_schema: Option<String>,
+    pub procedure_sop: Option<String>,
+    pub clear_procedure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -386,6 +406,25 @@ impl WhatsAppObservationService {
         mode: Option<ConversationMode>,
         skill_name: Option<&str>,
     ) -> Result<ObservedGroupConfig> {
+        self.register_observed_group_with_metadata(
+            group_jid,
+            group_name,
+            delivery_chat_jid,
+            mode,
+            skill_name,
+            None,
+        )
+    }
+
+    pub fn register_observed_group_with_metadata(
+        &self,
+        group_jid: &str,
+        group_name: &str,
+        delivery_chat_jid: &str,
+        mode: Option<ConversationMode>,
+        skill_name: Option<&str>,
+        procedure: Option<&ConversationProcedureMetadata>,
+    ) -> Result<ObservedGroupConfig> {
         let mut groups = self.load_observed_groups();
         let now = chrono::Utc::now().to_rfc3339();
         let entry = groups
@@ -401,6 +440,11 @@ impl WhatsAppObservationService {
                 status: ConversationPolicyStatus::Active,
                 objective: None,
                 skill_name: skill_name.and_then(Self::normalize_skill_name),
+                goal: None,
+                procedure_job_slug: None,
+                procedure_summary: None,
+                procedure_input_schema: None,
+                procedure_sop: None,
                 canonical_phone: None,
                 rotate_after_bytes: default_rotate_after_bytes(),
                 keep_log_segments: default_keep_log_segments(),
@@ -417,10 +461,17 @@ impl WhatsAppObservationService {
         if let Some(skill_name) = skill_name.and_then(Self::normalize_skill_name) {
             entry.skill_name = Some(skill_name);
         }
-        entry.canonical_phone = None;
         if let Some(mode) = mode {
             entry.mode = mode;
         }
+        if Self::procedure_metadata_has_job(procedure) && !entry.mode.allows_agent_reply() {
+            anyhow::bail!(
+                "Procedure jobs are only supported for observed-with-reply policies, not mode `{}`.",
+                entry.mode.as_str()
+            );
+        }
+        Self::apply_procedure_metadata(entry, procedure)?;
+        entry.canonical_phone = None;
         entry.status = ConversationPolicyStatus::Active;
         if entry.rotate_after_bytes == 0 {
             entry.rotate_after_bytes = default_rotate_after_bytes();
@@ -471,6 +522,7 @@ impl WhatsAppObservationService {
             objective,
             canonical_phone,
             skill_name,
+            None,
         )
     }
 
@@ -483,6 +535,7 @@ impl WhatsAppObservationService {
         objective: &str,
         canonical_phone: Option<&str>,
         skill_name: Option<&str>,
+        procedure: Option<&ConversationProcedureMetadata>,
     ) -> Result<ObservedGroupConfig> {
         let chat_jid = chat_jid.trim();
         if chat_jid.is_empty() {
@@ -545,6 +598,11 @@ impl WhatsAppObservationService {
                 status: ConversationPolicyStatus::Active,
                 objective: Self::normalize_optional_text(objective),
                 skill_name: skill_name.and_then(Self::normalize_skill_name),
+                goal: None,
+                procedure_job_slug: None,
+                procedure_summary: None,
+                procedure_input_schema: None,
+                procedure_sop: None,
                 canonical_phone: canonical_phone.clone(),
                 rotate_after_bytes: default_rotate_after_bytes(),
                 keep_log_segments: default_keep_log_segments(),
@@ -564,6 +622,13 @@ impl WhatsAppObservationService {
         if let Some(skill_name) = skill_name.and_then(Self::normalize_skill_name) {
             entry.skill_name = Some(skill_name);
         }
+        if Self::procedure_metadata_has_job(procedure) && !entry.mode.allows_agent_reply() {
+            anyhow::bail!(
+                "Procedure jobs are only supported for observed-with-reply policies, not mode `{}`.",
+                entry.mode.as_str()
+            );
+        }
+        Self::apply_procedure_metadata(entry, procedure)?;
         entry.canonical_phone = canonical_phone;
         if entry.rotate_after_bytes == 0 {
             entry.rotate_after_bytes = default_rotate_after_bytes();
@@ -1380,13 +1445,27 @@ pub fn render_observed_groups(groups: &[ObservedGroupConfig], workspace_dir: &Pa
             .filter(|value| !value.is_empty())
             .map(|skill| format!(" | skill={skill}"))
             .unwrap_or_default();
+        let goal_flag = group
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|_| " | goal=set".to_string())
+            .unwrap_or_default();
+        let procedure_flag = group
+            .procedure_job_slug
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|slug| format!(" | procedure_job={slug}"))
+            .unwrap_or_default();
         let outreach_flag = group
             .initial_outreach_sent_at
             .as_deref()
             .map(|sent_at| format!(" | initial_outreach_sent_at={sent_at}"))
             .unwrap_or_default();
         output.push_str(&format!(
-            "- {} | kind={} | jid={} | mode={} | control_chat={} | log={}{}{}{}\n",
+            "- {} | kind={} | jid={} | mode={} | control_chat={} | log={}{}{}{}{}{}\n",
             group.group_name,
             group.chat_kind.as_str(),
             group.group_jid,
@@ -1395,6 +1474,8 @@ pub fn render_observed_groups(groups: &[ObservedGroupConfig], workspace_dir: &Pa
             service.observed_group_log_path(&group.group_jid).display(),
             skill_flag,
             objective_flag,
+            goal_flag,
+            procedure_flag,
             outreach_flag,
         ));
     }
@@ -1402,6 +1483,79 @@ pub fn render_observed_groups(groups: &[ObservedGroupConfig], workspace_dir: &Pa
 }
 
 impl WhatsAppObservationService {
+    fn procedure_metadata_has_job(procedure: Option<&ConversationProcedureMetadata>) -> bool {
+        procedure
+            .and_then(|procedure| procedure.procedure_job_slug.as_deref())
+            .and_then(Self::normalize_optional_text)
+            .is_some()
+    }
+
+    fn apply_procedure_metadata(
+        entry: &mut ObservedGroupConfig,
+        procedure: Option<&ConversationProcedureMetadata>,
+    ) -> Result<()> {
+        let Some(procedure) = procedure else {
+            return Ok(());
+        };
+
+        if procedure.clear_procedure {
+            entry.procedure_job_slug = None;
+            entry.procedure_summary = None;
+            entry.procedure_input_schema = None;
+            entry.procedure_sop = None;
+        }
+
+        if let Some(goal) = procedure
+            .goal
+            .as_deref()
+            .and_then(Self::normalize_optional_text)
+        {
+            entry.goal = Some(goal);
+        }
+
+        if let Some(job_slug) = procedure
+            .procedure_job_slug
+            .as_deref()
+            .and_then(Self::normalize_optional_text)
+        {
+            let normalized_slug = Self::normalize_procedure_job_slug(&job_slug)?;
+            entry.procedure_job_slug = Some(normalized_slug);
+            entry.procedure_summary = procedure
+                .procedure_summary
+                .as_deref()
+                .and_then(Self::normalize_optional_text);
+            entry.procedure_input_schema = procedure
+                .procedure_input_schema
+                .as_deref()
+                .and_then(Self::normalize_optional_text);
+            entry.procedure_sop = procedure
+                .procedure_sop
+                .as_deref()
+                .and_then(Self::normalize_optional_text);
+        }
+
+        Ok(())
+    }
+
+    pub fn normalize_procedure_job_slug(value: &str) -> Result<String> {
+        let slug = value.trim();
+        if slug.is_empty() {
+            anyhow::bail!("Procedure job slug cannot be empty");
+        }
+        if slug.len() > 120 {
+            anyhow::bail!("Procedure job slug is too long");
+        }
+        if !slug
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            anyhow::bail!(
+                "Procedure job slug `{slug}` is invalid. Use only letters, numbers, or hyphen."
+            );
+        }
+        Ok(slug.to_string())
+    }
+
     fn truncate_text(value: &str, max_chars: usize) -> String {
         if value.chars().count() <= max_chars {
             return value.to_string();
@@ -2212,6 +2366,11 @@ mod tests {
                         status: ConversationPolicyStatus::Active,
                         objective: Some("Ayudar con temporada baja".to_string()),
                         skill_name: Some("whatsapp_objective_dm".to_string()),
+                        goal: None,
+                        procedure_job_slug: None,
+                        procedure_summary: None,
+                        procedure_input_schema: None,
+                        procedure_sop: None,
                         canonical_phone: Some("+5491134115686".to_string()),
                         rotate_after_bytes: 1024,
                         keep_log_segments: 2,
@@ -2234,6 +2393,11 @@ mod tests {
                         status: ConversationPolicyStatus::Active,
                         objective: Some("Ayudar con temporada baja".to_string()),
                         skill_name: Some("whatsapp_objective_dm".to_string()),
+                        goal: None,
+                        procedure_job_slug: None,
+                        procedure_summary: None,
+                        procedure_input_schema: None,
+                        procedure_sop: None,
                         canonical_phone: Some("+5491134115686".to_string()),
                         rotate_after_bytes: 1024,
                         keep_log_segments: 2,

@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::channels::whatsapp_observation::{
-    ConversationMode, WhatsAppObservationService,
+    ConversationMode, ConversationProcedureMetadata, WhatsAppObservationService,
 };
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
@@ -56,6 +56,85 @@ impl WhatsAppConfigureConversationPolicyTool {
         } else {
             Self::normalize_phone_token(chat_jid)
         }
+    }
+
+    fn normalize_optional_text_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+        args.get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    fn normalize_optional_schema_arg(args: &serde_json::Value) -> Option<String> {
+        let value = args.get("procedure_input_schema")?;
+        if let Some(text) = value.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+            return Some(text.to_string());
+        }
+        if value.is_null() {
+            return None;
+        }
+        serde_json::to_string_pretty(value).ok()
+    }
+
+    fn parse_procedure_metadata(
+        args: &serde_json::Value,
+        mode: ConversationMode,
+    ) -> anyhow::Result<Option<ConversationProcedureMetadata>> {
+        let clear_procedure = args
+            .get("clear_procedure")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let goal = Self::normalize_optional_text_arg(args, "goal");
+        let procedure_job_slug = Self::normalize_optional_text_arg(args, "procedure_job_slug");
+        let procedure_summary = Self::normalize_optional_text_arg(args, "procedure_summary");
+        let procedure_input_schema = Self::normalize_optional_schema_arg(args);
+        let procedure_sop = Self::normalize_optional_text_arg(args, "procedure_sop");
+
+        let has_metadata = clear_procedure
+            || goal.is_some()
+            || procedure_job_slug.is_some()
+            || procedure_summary.is_some()
+            || procedure_input_schema.is_some()
+            || procedure_sop.is_some();
+        if !has_metadata {
+            return Ok(None);
+        }
+
+        if procedure_job_slug.is_some() && !mode.allows_agent_reply() {
+            anyhow::bail!(
+                "Procedure jobs are only supported for observed-with-reply policies, not mode `{}`.",
+                mode.as_str()
+            );
+        }
+
+        if procedure_job_slug.is_none()
+            && (procedure_summary.is_some()
+                || procedure_input_schema.is_some()
+                || procedure_sop.is_some())
+        {
+            anyhow::bail!(
+                "Procedure metadata requires 'procedure_job_slug'. Use only 'goal' \
+                 for plain replies or 'clear_procedure=true' to remove an existing binding."
+            );
+        }
+
+        if procedure_job_slug.is_some() && procedure_sop.is_none() {
+            anyhow::bail!("Missing 'procedure_sop' for a procedure-backed policy");
+        }
+
+        if procedure_job_slug.is_some() && procedure_input_schema.is_none() {
+            anyhow::bail!("Missing 'procedure_input_schema' for a procedure-backed policy");
+        }
+
+        Ok(Some(ConversationProcedureMetadata {
+            goal,
+            procedure_job_slug,
+            procedure_summary,
+            procedure_input_schema,
+            procedure_sop,
+            clear_procedure,
+        }))
     }
 
     fn delivery_chat_conflicts_with_direct_target(
@@ -210,6 +289,29 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                 "objective": {
                     "type": "string",
                     "description": "Concrete direct-conversation objective. Required for mode='objective_dm'."
+                },
+                "goal": {
+                    "type": "string",
+                    "description": "Owner-facing goal for this observed-with-reply conversation policy."
+                },
+                "procedure_job_slug": {
+                    "type": "string",
+                    "description": "Verified tenant job slug to bind to this policy. The live WhatsApp worker can only run the job bound to the current policy."
+                },
+                "procedure_summary": {
+                    "type": "string",
+                    "description": "Short summary of what the bound procedure does."
+                },
+                "procedure_input_schema": {
+                    "description": "Expected structured input for the bound procedure. May be a JSON schema object or a compact textual schema."
+                },
+                "procedure_sop": {
+                    "type": "string",
+                    "description": "Instructions for the WhatsApp third-party worker: what to extract, what to omit, how to call the procedure, and how to reply after it completes."
+                },
+                "clear_procedure": {
+                    "type": "boolean",
+                    "description": "When true, remove any existing procedure binding from this policy."
                 }
             },
             "required": ["target_kind", "mode", "delivery_chat_jid"]
@@ -248,6 +350,16 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing 'delivery_chat_jid' parameter"))?;
+        let procedure = match Self::parse_procedure_metadata(&args, mode) {
+            Ok(procedure) => procedure,
+            Err(err) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(err.to_string()),
+                });
+            }
+        };
 
         let service = WhatsAppObservationService::new(self.workspace_dir.clone());
 
@@ -292,12 +404,13 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     }
                 };
 
-                let observed = match service.register_observed_group_with_mode_and_skill(
+                let observed = match service.register_observed_group_with_metadata(
                     &group.group_jid,
                     &group.group_name,
                     delivery_chat_jid,
                     Some(mode),
                     skill_name.as_deref(),
+                    procedure.as_ref(),
                 ) {
                     Ok(observed) => observed,
                     Err(err) => {
@@ -312,11 +425,12 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "WhatsApp group '{}' (jid={}) is now configured in mode `{}`. Skill: {}. Control chat: {}. Log path: {}.",
+                        "WhatsApp group '{}' (jid={}) is now configured in mode `{}`. Skill: {}. Procedure: {}. Control chat: {}. Log path: {}.",
                         observed.group_name,
                         observed.group_jid,
                         observed.mode.as_str(),
                         observed.skill_name.as_deref().unwrap_or("none"),
+                        observed.procedure_job_slug.as_deref().unwrap_or("none"),
                         observed.delivery_chat_jid,
                         service.observed_group_log_path(&observed.group_jid).display(),
                     ),
@@ -398,7 +512,7 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     }
                 };
 
-                let observed = match service.register_direct_chat_policy_with_skill(
+                let observed = match service.register_direct_chat_policy_with_metadata(
                     &chat_jid,
                     &contact_name,
                     delivery_chat_jid,
@@ -406,6 +520,7 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     objective,
                     canonical_phone.as_deref(),
                     skill_name.as_deref(),
+                    procedure.as_ref(),
                 ) {
                     Ok(observed) => observed,
                     Err(err) => {
@@ -421,22 +536,24 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     success: true,
                     output: if mode == ConversationMode::ObjectiveDm {
                         format!(
-                            "WhatsApp direct conversation '{}' (jid={}) is now configured in mode `{}`. Skill: {}. Control chat: {}. Log path: {}. Objective: {}. To kick off the conversation proactively, follow with `whatsapp_start_direct_conversation`.",
+                            "WhatsApp direct conversation '{}' (jid={}) is now configured in mode `{}`. Skill: {}. Procedure: {}. Control chat: {}. Log path: {}. Objective: {}. To kick off the conversation proactively, follow with `whatsapp_start_direct_conversation`.",
                             observed.group_name,
                             observed.group_jid,
                             observed.mode.as_str(),
                             observed.skill_name.as_deref().unwrap_or("none"),
+                            observed.procedure_job_slug.as_deref().unwrap_or("none"),
                             observed.delivery_chat_jid,
                             service.observed_group_log_path(&observed.group_jid).display(),
                             observed.objective.as_deref().unwrap_or(objective),
                         )
                     } else {
                         format!(
-                            "WhatsApp direct conversation '{}' (jid={}) is now configured in mode `{}`. Skill: {}. Control chat: {}. Log path: {}. Observation is passive and will not trigger agent replies in this 1:1.",
+                            "WhatsApp direct conversation '{}' (jid={}) is now configured in mode `{}`. Skill: {}. Procedure: {}. Control chat: {}. Log path: {}. Observation is passive and will not trigger agent replies in this 1:1.",
                             observed.group_name,
                             observed.group_jid,
                             observed.mode.as_str(),
                             observed.skill_name.as_deref().unwrap_or("none"),
+                            observed.procedure_job_slug.as_deref().unwrap_or("none"),
                             observed.delivery_chat_jid,
                             service.observed_group_log_path(&observed.group_jid).display(),
                         )
@@ -506,6 +623,221 @@ mod tests {
             .unwrap();
         assert_eq!(observed.chat_kind, ConversationChatKind::Group);
         assert_eq!(observed.skill_name.as_deref(), Some("whatsapp_mention_reply"));
+    }
+
+    #[tokio::test]
+    async fn configure_group_policy_stores_procedure_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("skills").join("whatsapp_mention_reply");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: whatsapp_mention_reply\ndescription: Mention reply\n---\n# Mention Reply\n",
+        )
+        .unwrap();
+
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363025123456789@g.us".into(),
+                group_name: "Los Pibes".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let tool = WhatsAppConfigureConversationPolicyTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "skill_name": "whatsapp_mention_reply",
+                "goal": "Validate spend messages",
+                "procedure_job_slug": "spend-guard",
+                "procedure_summary": "Validates and records spend messages.",
+                "procedure_input_schema": { "type": "object" },
+                "procedure_sop": "Extract valid input, run the procedure, and reply from the result."
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let observed = service
+            .observed_group_config("120363025123456789@g.us")
+            .unwrap();
+        assert_eq!(observed.goal.as_deref(), Some("Validate spend messages"));
+        assert_eq!(observed.procedure_job_slug.as_deref(), Some("spend-guard"));
+        assert!(observed
+            .procedure_input_schema
+            .as_deref()
+            .is_some_and(|schema| schema.contains("\"type\"")));
+        assert!(result.output.contains("Procedure: spend-guard"));
+    }
+
+    #[tokio::test]
+    async fn configure_observe_only_rejects_procedure_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363025123456789@g.us".into(),
+                group_name: "Los Pibes".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let tool = WhatsAppConfigureConversationPolicyTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "observe_only",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "procedure_job_slug": "spend-guard",
+                "procedure_input_schema": { "type": "object" },
+                "procedure_sop": "Run the procedure."
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("observed-with-reply"));
+    }
+
+    #[tokio::test]
+    async fn configure_group_policy_stores_plain_goal_without_procedure() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("skills").join("whatsapp_mention_reply");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: whatsapp_mention_reply\ndescription: Mention Reply\n---\n# Mention Reply\n",
+        )
+        .unwrap();
+
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363025123456789@g.us".into(),
+                group_name: "Los Pibes".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let tool = WhatsAppConfigureConversationPolicyTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "skill_name": "whatsapp_mention_reply",
+                "goal": "Answer only when summoned with lightweight jokes.",
+                "clear_procedure": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let observed = service
+            .observed_group_config("120363025123456789@g.us")
+            .unwrap();
+        assert_eq!(
+            observed.goal.as_deref(),
+            Some("Answer only when summoned with lightweight jokes.")
+        );
+        assert!(observed.procedure_job_slug.is_none());
+        assert!(result.output.contains("Procedure: none"));
+    }
+
+    #[tokio::test]
+    async fn configure_rejects_procedure_details_without_job_slug() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363025123456789@g.us".into(),
+                group_name: "Los Pibes".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let tool = WhatsAppConfigureConversationPolicyTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "goal": "Validate messages.",
+                "procedure_sop": "Run a missing job."
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("requires 'procedure_job_slug'"));
+    }
+
+    #[tokio::test]
+    async fn configure_rejects_procedure_job_without_input_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363025123456789@g.us".into(),
+                group_name: "Los Pibes".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let tool = WhatsAppConfigureConversationPolicyTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "goal": "Validate messages.",
+                "procedure_job_slug": "spend-guard",
+                "procedure_sop": "Run the procedure."
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("procedure_input_schema"));
     }
 
     #[tokio::test]

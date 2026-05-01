@@ -91,6 +91,7 @@ pub mod whatsapp_list_groups;
 pub mod whatsapp_list_observed_groups;
 pub mod whatsapp_observe_group;
 pub mod whatsapp_objective_dm;
+pub mod whatsapp_run_policy_procedure;
 pub mod whatsapp_start_direct_conversation;
 pub mod whatsapp_unobserve_group;
 pub mod workspace_tool;
@@ -170,6 +171,7 @@ pub use whatsapp_list_groups::WhatsAppListGroupsTool;
 pub use whatsapp_list_observed_groups::WhatsAppListObservedGroupsTool;
 pub use whatsapp_observe_group::WhatsAppObserveGroupTool;
 pub use whatsapp_objective_dm::WhatsAppObjectiveDmTool;
+pub use whatsapp_run_policy_procedure::WhatsAppRunPolicyProcedureTool;
 pub use whatsapp_start_direct_conversation::WhatsAppStartDirectConversationTool;
 pub use whatsapp_unobserve_group::WhatsAppUnobserveGroupTool;
 pub use workspace_tool::WorkspaceTool;
@@ -450,6 +452,10 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
         Arc::new(WhatsAppObjectiveDmTool::new(
+            workspace_dir.to_path_buf(),
+            security.clone(),
+        )),
+        Arc::new(WhatsAppRunPolicyProcedureTool::new(
             workspace_dir.to_path_buf(),
             security.clone(),
         )),
