@@ -705,6 +705,13 @@ fn should_enforce_artifact_existence(history: &[ChatMessage], display_text: &str
         return false;
     }
 
+    // Contract proposals contain template paths that don't exist on disk — skip enforcement.
+    if display_text.contains("STATUS: awaiting_confirmation")
+        || display_text.contains("STEP: propose_contract")
+    {
+        return false;
+    }
+
     let last_user = latest_user_message_lower(history);
 
     ARTIFACT_CREATION_HINTS
@@ -827,69 +834,6 @@ fn latest_user_message_requests_tool_first_execution(history: &[ChatMessage]) ->
         || history.iter().any(|message| {
             message.role == "system" && message_has_tool_first_directive_block(&message.content)
         })
-}
-
-fn recent_history_indicates_tenant_service_flow(history: &[ChatMessage]) -> bool {
-    history.iter().rev().take(12).any(|message| {
-        let content = message.content.as_str();
-        content.contains("\"agent\":\"service_builder\"")
-            || content.contains("\"agent\": \"service_builder\"")
-            || content.contains("EXISTING_JOB:")
-            || content.contains("NEW_JOB: true")
-            || content.contains("[Skill: tenant_service_builder]")
-            || content.contains("tenant-app/server/jobs/")
-            || content.contains("supercronic/generated/tenant-jobs.cron")
-    })
-}
-
-fn invalid_tenant_service_cron_add_reason(
-    history: &[ChatMessage],
-    tool_name: &str,
-    tool_args: &serde_json::Value,
-) -> Option<String> {
-    if tool_name != "cron_add" {
-        return None;
-    }
-
-    let Some(args) = tool_args.as_object() else {
-        return None;
-    };
-
-    let prompt = args
-        .get("prompt")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    if prompt.is_empty() {
-        return None;
-    }
-
-    let is_agent_job = args
-        .get("job_type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|job_type| job_type.eq_ignore_ascii_case("agent"))
-        || !prompt.is_empty();
-    if !is_agent_job {
-        return None;
-    }
-
-    let service_flow_active = recent_history_indicates_tenant_service_flow(history)
-        && (latest_user_message_requests_tool_first_execution(history)
-            || latest_user_message(history)
-                .map(looks_like_continue_request)
-                .unwrap_or(false));
-    if !service_flow_active {
-        return None;
-    }
-
-    if prompt.starts_with("@tenant-service-announce") {
-        return None;
-    }
-
-    Some(
-        "Error: In tenant service flows, do not create freeform agent cron jobs that restate the scraping or business logic. Implement and verify the tenant job first, write the execution schedule through `supercronic/generated/tenant-jobs.cron`, and use `cron_add` only with the canonical `@tenant-service-announce` prompt for delivery."
-            .to_string(),
-    )
 }
 
 fn internal_repair_message(instruction: impl AsRef<str>) -> ChatMessage {
@@ -4909,6 +4853,57 @@ fn maybe_inject_channel_delivery_defaults(
     }
 }
 
+fn maybe_normalize_tenant_service_announce_cron_prompt(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    workspace_dir: Option<&Path>,
+) {
+    if tool_name != "cron_add" && tool_name != "cron_update" {
+        return;
+    }
+    let Some(args) = tool_args.as_object_mut() else {
+        return;
+    };
+    let Some(raw_prompt) = args.get("prompt").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let trimmed = raw_prompt.trim();
+    let Some(raw_path) = trimmed
+        .strip_prefix("@tenant-service-announce")
+        .map(str::trim)
+    else {
+        return;
+    };
+    if raw_path.ends_with("announce_prompt.txt") {
+        return;
+    }
+    let candidate = std::path::Path::new(raw_path);
+    let resolved: std::path::PathBuf = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else if let Some(ws) = workspace_dir {
+        ws.join(candidate)
+    } else {
+        return;
+    };
+    // Walk up to find the job root (first ancestor that contains job.json).
+    let mut dir = Some(resolved.as_path());
+    while let Some(d) = dir {
+        if d.join("job.json").exists() {
+            let correct_path = d.join("announce_prompt.txt");
+            let new_prompt = format!("@tenant-service-announce {}", correct_path.display());
+            tracing::debug!(
+                tool = tool_name,
+                old_path = raw_path,
+                new_path = %correct_path.display(),
+                "Normalized @tenant-service-announce prompt to announce_prompt.txt"
+            );
+            args.insert("prompt".to_string(), serde_json::Value::String(new_prompt));
+            return;
+        }
+        dir = d.parent();
+    }
+}
+
 fn latest_user_message_batch_multiplier(history: &[ChatMessage]) -> usize {
     let last = history
         .iter()
@@ -5774,7 +5769,12 @@ pub(crate) async fn run_tool_call_loop(
                 continue;
             }
 
-            if user_requested_scheduling(history) && response_claims_schedule_success(&display_text)
+            if user_requested_scheduling(history)
+                && response_claims_schedule_success(&display_text)
+                // Only enforce cron_add/cron_list when the agent actually has cron_add available.
+                // Subagents like service_builder schedule via supercronic and must not be required
+                // to call a tool they do not have.
+                && tools_registry.iter().any(|t| t.name() == "cron_add")
             {
                 if !scheduled_delivery_created || !scheduled_delivery_verified {
                     let reason = if !scheduled_delivery_created {
@@ -6070,52 +6070,17 @@ pub(crate) async fn run_tool_call_loop(
                 channel_name,
                 channel_reply_target,
             );
+            maybe_normalize_tenant_service_announce_cron_prompt(
+                &tool_name,
+                &mut tool_args,
+                workspace_dir,
+            );
             maybe_inject_delegate_resume_metadata(
                 history,
                 &tool_name,
                 &mut tool_args,
                 continuation_scope,
             );
-
-            if let Some(reason) =
-                invalid_tenant_service_cron_add_reason(history, &tool_name, &tool_args)
-            {
-                runtime_trace::record_event(
-                    "tool_call_result",
-                    Some(channel_name),
-                    Some(provider_name),
-                    Some(model),
-                    Some(&turn_id),
-                    Some(false),
-                    Some(&reason),
-                    serde_json::json!({
-                        "iteration": iteration + 1,
-                        "tool": tool_name.clone(),
-                        "arguments": scrub_credentials(&tool_args.to_string()),
-                        "rejected_noncanonical_tenant_service_cron_add": true,
-                    }),
-                );
-                if let Some(ref tx) = on_delta {
-                    let _ = tx
-                        .send(format!(
-                            "\u{274c} {}: {}\n",
-                            tool_name,
-                            truncate_with_ellipsis(&reason, 200)
-                        ))
-                        .await;
-                }
-                ordered_results[idx] = Some((
-                    tool_name.clone(),
-                    call.tool_call_id.clone(),
-                    ToolExecutionOutcome {
-                        output: reason.clone(),
-                        success: false,
-                        error_reason: Some(reason),
-                        duration: Duration::ZERO,
-                    },
-                ));
-                continue;
-            }
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
@@ -6273,7 +6238,7 @@ pub(crate) async fn run_tool_call_loop(
         {
             let outcome = outcome;
             if outcome.success {
-                if call.name == "cron_add" {
+                if call.name == "cron_add" || call.name == "cron_update" {
                     scheduled_delivery_created = true;
                 }
                 if call.name == "cron_list" {
@@ -9239,12 +9204,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_blocks_noncanonical_cron_add_in_tenant_service_flow() {
+    async fn run_tool_call_loop_allows_noncanonical_cron_add_in_tenant_service_flow() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"cron_add","arguments":{"job_type":"agent","prompt":"Go to https://www.infobae.com/ and scrape 3 headlines","schedule":{"kind":"cron","expr":"*/2 * * * *"},"delivery":{"mode":"announce","channel":"whatsapp","to":"120363409640193279@g.us"}}}
 </tool_call>"#,
-            "blocked",
+            "done",
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
@@ -9310,22 +9275,17 @@ mod tests {
             None,
         )
         .await
-        .expect("loop should recover after rejecting the bad cron_add");
+        .expect("noncanonical tenant-service cron_add should reach tool execution");
 
-        assert_eq!(result, "blocked");
+        assert_eq!(result, "done");
         let recorded = recorded_args
             .lock()
             .expect("recorded args lock should be valid");
-        assert!(
-            recorded.is_empty(),
-            "noncanonical tenant-service cron_add should be rejected before tool execution"
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0]["prompt"],
+            "Go to https://www.infobae.com/ and scrape 3 headlines"
         );
-        assert!(history.iter().any(|message| {
-            message.role == "user"
-                && message.content.contains(
-                    "do not create freeform agent cron jobs that restate the scraping or business logic"
-                )
-        }));
     }
 
     #[tokio::test]
@@ -9410,6 +9370,93 @@ mod tests {
         assert_eq!(
             recorded[0]["prompt"],
             "@tenant-service-announce /zeroclaw-data/workspace/tenant-app/server/jobs/infobae-news-csv/announce_prompt.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_accepts_cron_update_plus_list_as_verified_schedule() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_update","arguments":{"name":"lanacion-ultimas-noticias-monitor__announce","enabled":true}}
+</tool_call>
+<tool_call>
+{"name":"cron_list","arguments":{}}
+</tool_call>"#,
+            "El monitor ya está activo y programado cada 2 minutos.",
+        ]);
+
+        let recorded_updates = Arc::new(Mutex::new(Vec::new()));
+        let recorded_lists = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RecordingArgsTool::new("cron_add", Arc::new(Mutex::new(Vec::new())))),
+            Box::new(RecordingArgsTool::new(
+                "cron_update",
+                Arc::clone(&recorded_updates),
+            )),
+            Box::new(RecordingArgsTool::new(
+                "cron_list",
+                Arc::clone(&recorded_lists),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "necesito que cada 2 minutos revise el portal y mande WhatsApp si hay novedades",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp",
+            Some("120363409640193279@g.us"),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("cron_update followed by cron_list should satisfy schedule verification");
+
+        assert_eq!(result, "El monitor ya está activo y programado cada 2 minutos.");
+        assert_eq!(
+            recorded_updates
+                .lock()
+                .expect("recorded updates lock should be valid")
+                .len(),
+            1
+        );
+        assert_eq!(
+            recorded_lists
+                .lock()
+                .expect("recorded lists lock should be valid")
+                .len(),
+            1
+        );
+        assert!(
+            !history.iter().any(|message| message
+                .content
+                .contains("final response claimed a scheduled delivery without creating"))
         );
     }
 

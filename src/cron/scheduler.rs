@@ -389,7 +389,13 @@ async fn run_agent_job(
             (
                 true,
                 if normalized_output.trim().is_empty() {
-                    "agent job executed".to_string()
+                    if resolved_prompt.tenant_service.kind == Some(TenantServiceCronKind::Announce)
+                        || resolved_prompt.tenant_service.delivery_command.is_some()
+                    {
+                        String::new()
+                    } else {
+                        "agent job executed".to_string()
+                    }
                 } else {
                     normalized_output
                 },
@@ -478,8 +484,15 @@ fn parse_tenant_service_cron_metadata(config: &Config, prompt: &str) -> TenantSe
         if metadata.kind.is_none() {
             metadata.kind = infer_tenant_service_prompt_kind(prompt_file);
         }
-        if let Some(job_name) = prompt_file.parent().and_then(|path| path.file_name()) {
-            let slug = job_name.to_string_lossy();
+        // Find the slug as the component immediately after a `jobs` directory so that
+        // paths like `.../jobs/<slug>/output/latest.json` yield `<slug>`, not `output`.
+        let slug_opt = job_slug_from_prompt_path(prompt_file).or_else(|| {
+            prompt_file
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        });
+        if let Some(slug) = slug_opt {
             if metadata.run_command.is_none() {
                 metadata.run_command = Some(format!(
                     "node tools/tenant_job_runner.mjs invoke --job {}",
@@ -495,6 +508,24 @@ fn parse_tenant_service_cron_metadata(config: &Config, prompt: &str) -> TenantSe
         }
     }
     metadata
+}
+
+// Returns the slug (the directory component immediately after a `jobs/` ancestor).
+// For `.../jobs/<slug>/announce_prompt.txt` this yields `<slug>`.
+// For `.../jobs/<slug>/output/latest.json` this also yields `<slug>`, not `output`.
+fn job_slug_from_prompt_path(path: &Path) -> Option<String> {
+    let components: Vec<_> = path.components().collect();
+    for i in 0..components.len() {
+        if components[i].as_os_str() == "jobs" {
+            if let Some(slug_comp) = components.get(i + 1) {
+                let slug = slug_comp.as_os_str().to_string_lossy().into_owned();
+                if !slug.is_empty() {
+                    return Some(slug);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn infer_tenant_service_prompt_kind(prompt_file: &Path) -> Option<TenantServiceCronKind> {
@@ -566,6 +597,10 @@ async fn normalize_tenant_service_cron_output(
 ) -> std::result::Result<String, String> {
     let trimmed = output.trim();
 
+    if output_requests_no_delivery(trimmed) {
+        return Ok(String::new());
+    }
+
     if metadata.kind == Some(TenantServiceCronKind::Announce)
         || (metadata.kind.is_none() && metadata.delivery_command.is_some())
     {
@@ -574,13 +609,17 @@ async fn normalize_tenant_service_cron_output(
         }
         if let Some(command) = metadata.delivery_command.as_deref() {
             let helper_output = run_tenant_service_helper_command(config, command).await?;
+            if output_requests_no_delivery(&helper_output) {
+                return Ok(String::new());
+            }
             if let Some(marker) = extract_delivery_marker(&helper_output) {
                 return Ok(marker);
             }
-            return Err(format!(
-                "tenant service delivery command did not return a delivery marker: {}",
-                truncate_for_error(&helper_output)
-            ));
+            let helper_output = helper_output.trim();
+            if helper_output.is_empty() {
+                return Ok(String::new());
+            }
+            return Ok(helper_output.to_string());
         }
     }
 
@@ -606,6 +645,26 @@ async fn normalize_tenant_service_cron_output(
     }
 
     Ok(trimmed.to_string())
+}
+
+fn output_requests_no_delivery(output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NO_DELIVERY") {
+        return true;
+    }
+
+    serde_json::from_str::<Value>(trimmed)
+        .map(|value| {
+            value
+                .get("deliver")
+                .and_then(Value::as_bool)
+                .is_some_and(|deliver| !deliver)
+                || value
+                    .get("marker")
+                    .and_then(Value::as_str)
+                    .is_some_and(|marker| marker.trim().is_empty())
+        })
+        .unwrap_or(false)
 }
 
 async fn tenant_service_latest_is_recent_success(
@@ -873,6 +932,13 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
             job_id = %job.id,
             delivery_mode = %delivery.mode,
             "Skipping cron delivery because mode is not announce"
+        );
+        return Ok(());
+    }
+    if output.trim().is_empty() {
+        tracing::trace!(
+            job_id = %job.id,
+            "Skipping cron delivery because output is empty"
         );
         return Ok(());
     }
@@ -1432,6 +1498,41 @@ mod tests {
             Some("[DOCUMENT:/tmp/report.csv]".to_string())
         );
         assert_eq!(extract_delivery_marker("sin marker"), None);
+    }
+
+    #[test]
+    fn output_requests_no_delivery_accepts_empty_sentinel_and_json() {
+        assert!(output_requests_no_delivery(""));
+        assert!(output_requests_no_delivery("NO_DELIVERY"));
+        assert!(output_requests_no_delivery(
+            r#"{"status":"ok","deliver":false,"marker":""}"#
+        ));
+        assert!(!output_requests_no_delivery(
+            r#"{"status":"ok","deliver":true,"marker":"[DOCUMENT:/tmp/report.csv]"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn announce_no_delivery_normalizes_to_empty_output() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let metadata = TenantServiceCronMetadata {
+            kind: Some(TenantServiceCronKind::Announce),
+            prompt_file: None,
+            run_command: None,
+            delivery_command: None,
+        };
+
+        let normalized = normalize_tenant_service_cron_output(
+            &config,
+            &metadata,
+            "NO_DELIVERY",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(normalized, "");
     }
 
     #[tokio::test]
