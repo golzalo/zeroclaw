@@ -5,6 +5,7 @@ pub mod dispatcher;
 pub mod loop_;
 pub mod memory_loader;
 pub mod prompt;
+pub(crate) mod side_effect_claims;
 pub mod subagent_history_store;
 pub mod task_checkpoint_store;
 

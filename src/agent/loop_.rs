@@ -1,4 +1,5 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::agent::side_effect_claims::{SideEffectClaimTracker, UnverifiedSideEffectClaim};
 use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
 use crate::config::Config;
 use crate::i18n::ToolDescriptions;
@@ -16,6 +17,7 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
@@ -119,33 +121,6 @@ const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
     "voy a programar",
     "ya pasaron",
 ];
-
-const WHATSAPP_GROUP_POLICY_SUCCESS_HINTS: &[&str] = &[
-    "estoy observando el grupo",
-    "ya dejé configurado el grupo",
-    "ya deje configurado el grupo",
-    "ya lo tenés configurado así",
-    "ya lo tenes configurado asi",
-];
-
-const WHATSAPP_POLICY_REMOVAL_HINTS: &[&str] = &[
-    "dejé de observar",
-    "deje de observar",
-    "dejé de contestar",
-    "deje de contestar",
-    "dejé de observar y contestar",
-    "deje de observar y contestar",
-    "ya no va a contestar",
-    "ya no responde",
-    "ya no le voy a responder",
-    "ya no le voy a contestar",
-    "removed the whatsapp conversation policy",
-];
-
-static WHATSAPP_GROUP_NAME_IN_RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)grupo\s+(?:\*\*([^*]+)\*\*|`([^`]+)`|"([^"]+)"|([^\n.!?]+))"#)
-        .expect("valid whatsapp group response regex")
-});
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PromptFileUsage {
@@ -745,52 +720,6 @@ fn response_claims_schedule_success(display_text: &str) -> bool {
             .any(|hint| lowered.contains(hint))
 }
 
-fn response_claims_whatsapp_group_policy_success(display_text: &str) -> bool {
-    let lowered = display_text.to_ascii_lowercase();
-    WHATSAPP_GROUP_POLICY_SUCCESS_HINTS
-        .iter()
-        .any(|hint| lowered.contains(hint))
-        || (lowered.contains("solo voy a responder cuando me arroben")
-            && lowered.contains("grupo"))
-}
-
-fn response_claims_whatsapp_policy_removal(display_text: &str) -> bool {
-    let lowered = display_text.to_ascii_lowercase();
-    WHATSAPP_POLICY_REMOVAL_HINTS
-        .iter()
-        .any(|hint| lowered.contains(hint))
-}
-
-fn extract_claimed_whatsapp_group_name(display_text: &str) -> Option<String> {
-    let captures = WHATSAPP_GROUP_NAME_IN_RESPONSE_RE.captures(display_text)?;
-    (1..=4)
-        .find_map(|idx| captures.get(idx))
-        .map(|capture| capture.as_str().trim().trim_end_matches(':').to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn whatsapp_list_output_confirms_group_policy(tool_output: &str, group_name: &str) -> bool {
-    let lowered_output = tool_output.to_ascii_lowercase();
-    let lowered_name = group_name.to_ascii_lowercase();
-    lowered_output.contains("kind=group") && lowered_output.contains(&lowered_name)
-}
-
-fn whatsapp_policy_call_targets_group(arguments: &serde_json::Value) -> bool {
-    if arguments
-        .get("target_kind")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| value.eq_ignore_ascii_case("group"))
-    {
-        return true;
-    }
-
-    arguments
-        .get("group_jid")
-        .or_else(|| arguments.get("chat_jid"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| value.ends_with("@g.us"))
-}
-
 fn latest_user_message(history: &[ChatMessage]) -> Option<&str> {
     history
         .iter()
@@ -846,6 +775,25 @@ fn internal_repair_message(instruction: impl AsRef<str>) -> ChatMessage {
          - After repairing, continue the task normally.\n\n{}",
         instruction.as_ref()
     ))
+}
+
+fn side_effect_claim_trace_payload(
+    iteration: usize,
+    display_text: &str,
+    claim: &UnverifiedSideEffectClaim,
+) -> serde_json::Value {
+    let mut details = claim.details.clone();
+    if let Some(object) = details.as_object_mut() {
+        object.insert("iteration".to_string(), json!(iteration + 1));
+        object.insert("text".to_string(), json!(scrub_credentials(display_text)));
+        details
+    } else {
+        json!({
+            "iteration": iteration + 1,
+            "text": scrub_credentials(display_text),
+            "details": details,
+        })
+    }
 }
 
 pub(crate) fn render_continuation_checkpoint_block(checkpoint: &ContinuationCheckpoint) -> String {
@@ -5414,9 +5362,7 @@ pub(crate) async fn run_tool_call_loop(
     let turn_id = Uuid::new_v4().to_string();
     let mut scheduled_delivery_created = false;
     let mut scheduled_delivery_verified = false;
-    let mut whatsapp_group_policy_written = false;
-    let mut whatsapp_group_policy_verifications: Vec<String> = Vec::new();
-    let mut whatsapp_policy_removed = false;
+    let mut side_effect_claims = SideEffectClaimTracker::default();
     let mut requests = Vec::new();
 
     for iteration in 0..max_iterations {
@@ -5810,68 +5756,20 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
-            if response_claims_whatsapp_group_policy_success(&display_text) {
-                let claimed_group_name = extract_claimed_whatsapp_group_name(&display_text);
-                let verified_existing_group = claimed_group_name.as_ref().is_some_and(|group_name| {
-                    whatsapp_group_policy_verifications
-                        .iter()
-                        .any(|output| whatsapp_list_output_confirms_group_policy(output, group_name))
-                });
-
-                if !whatsapp_group_policy_written && !verified_existing_group {
-                    let claimed_group = claimed_group_name
-                        .as_deref()
-                        .unwrap_or("(unknown group)");
-                    runtime_trace::record_event(
-                        "final_response_unverified_whatsapp_group_policy",
-                        Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
-                        Some(&turn_id),
-                        Some(false),
-                        Some(
-                            "assistant claimed a WhatsApp group policy without configuring or verifying it",
-                        ),
-                        serde_json::json!({
-                            "iteration": iteration + 1,
-                            "claimed_group": claimed_group,
-                            "group_policy_written": whatsapp_group_policy_written,
-                            "group_policy_verifications": whatsapp_group_policy_verifications
-                                .iter()
-                                .map(|output| scrub_credentials(output))
-                                .collect::<Vec<_>>(),
-                            "text": scrub_credentials(&display_text),
-                        }),
-                    );
-
-                    history.push(ChatMessage::assistant(response_text.clone()));
-                    history.push(internal_repair_message(format!(
-                        "You just told the user that WhatsApp group '{claimed_group}' is configured, but this turn neither persisted a group policy nor verified that exact group in whatsapp_list_observed_groups. If the user wants that group configured, call whatsapp_configure_conversation_policy now. If you believe it is already configured, run whatsapp_list_observed_groups and cite the exact matching group entry before confirming the mode."
-                    )));
-                    continue;
-                }
-            }
-
-            if response_claims_whatsapp_policy_removal(&display_text) && !whatsapp_policy_removed {
+            if let Some(claim) = side_effect_claims.unverified_final_response_claim(&display_text) {
                 runtime_trace::record_event(
-                    "final_response_unverified_whatsapp_policy_removal",
+                    claim.event,
                     Some(channel_name),
                     Some(provider_name),
                     Some(model),
                     Some(&turn_id),
                     Some(false),
-                    Some("assistant claimed a WhatsApp policy removal without executing whatsapp_unobserve_group"),
-                    serde_json::json!({
-                        "iteration": iteration + 1,
-                        "policy_removed": whatsapp_policy_removed,
-                        "text": scrub_credentials(&display_text),
-                    }),
+                    Some(claim.reason),
+                    side_effect_claim_trace_payload(iteration, &display_text, &claim),
                 );
 
                 history.push(ChatMessage::assistant(response_text.clone()));
-                history.push(internal_repair_message(
-                    "You just told the user that a WhatsApp conversation stopped being observed or answered, but this turn did not execute whatsapp_unobserve_group successfully. If the user asked to stop a WhatsApp direct chat or group, call whatsapp_unobserve_group now and only then confirm the deactivation.",
-                ));
+                history.push(internal_repair_message(claim.repair_prompt));
                 continue;
             }
 
@@ -6244,18 +6142,11 @@ pub(crate) async fn run_tool_call_loop(
                 if call.name == "cron_list" {
                     scheduled_delivery_verified = true;
                 }
-                if (call.name == "whatsapp_configure_conversation_policy"
-                    && whatsapp_policy_call_targets_group(&call.arguments))
-                    || call.name == "whatsapp_observe_group"
-                {
-                    whatsapp_group_policy_written = true;
-                }
-                if call.name == "whatsapp_list_observed_groups" {
-                    whatsapp_group_policy_verifications.push(outcome.output.clone());
-                }
-                if call.name == "whatsapp_unobserve_group" {
-                    whatsapp_policy_removed = true;
-                }
+                side_effect_claims.record_successful_tool(
+                    &call.name,
+                    &call.arguments,
+                    &outcome.output,
+                );
                 if call.name == "read_skill" {
                     if let (Some(skill_name), Some(skill_activations)) =
                         (extract_read_skill_name(&call.arguments), skill_activations)
@@ -10798,13 +10689,6 @@ Tail"#;
     }
 
     #[test]
-    fn response_claims_whatsapp_policy_removal_detects_deactivation_claims() {
-        let response = "Listo, ya dejé de observar y contestar a Ale.";
-
-        assert!(response_claims_whatsapp_policy_removal(response));
-    }
-
-    #[test]
     fn response_claims_schedule_success_ignores_unscheduled_denials() {
         let response =
             "No se ha programado ningun recordatorio ni tarea en tu agenda real en este momento.";
@@ -10824,48 +10708,6 @@ Tail"#;
         let response = "El proceso ya quedó configurado y funcionando cada 2 minutos.";
 
         assert!(response_claims_schedule_success(response));
-    }
-
-    #[test]
-    fn response_claims_whatsapp_group_policy_success_detects_group_configuration_claims() {
-        let response = "Ya lo tenés configurado así. Estoy observando el grupo **S86 - FoCA** y solo voy a responder cuando me arroben.";
-
-        assert!(response_claims_whatsapp_group_policy_success(response));
-    }
-
-    #[test]
-    fn extract_claimed_whatsapp_group_name_reads_bold_group_labels() {
-        let response =
-            "Mientras tanto, ya dejé configurado el grupo **S86 - FoCA**: me voy a quedar en silencio.";
-
-        assert_eq!(
-            extract_claimed_whatsapp_group_name(response).as_deref(),
-            Some("S86 - FoCA")
-        );
-    }
-
-    #[test]
-    fn whatsapp_list_output_confirms_group_policy_matches_exact_group_name() {
-        let output = "- S86 - FoCA | kind=group | jid=120363422659035828@g.us | mode=mention_reply | control_chat=__whatsapp_official_group__";
-
-        assert!(whatsapp_list_output_confirms_group_policy(
-            output,
-            "S86 - FoCA"
-        ));
-        assert!(!whatsapp_list_output_confirms_group_policy(
-            output,
-            "Nosotros"
-        ));
-    }
-
-    #[test]
-    fn whatsapp_policy_call_targets_group_prefers_group_target_kind() {
-        let args = serde_json::json!({
-            "target_kind": "group",
-            "chat_jid": "5491170742021@s.whatsapp.net"
-        });
-
-        assert!(whatsapp_policy_call_targets_group(&args));
     }
 
     #[test]

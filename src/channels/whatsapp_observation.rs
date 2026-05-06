@@ -8,75 +8,10 @@ use std::path::{Path, PathBuf};
 const DEFAULT_ROTATE_AFTER_BYTES: u64 = 512 * 1024;
 const DEFAULT_KEEP_LOG_SEGMENTS: usize = 8;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ConversationChatKind {
-    #[default]
-    Group,
-    Direct,
-}
-
-impl ConversationChatKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Group => "group",
-            Self::Direct => "direct",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ConversationMode {
-    #[default]
-    ObserveOnly,
-    MentionReply,
-    ObjectiveDm,
-    ManagedGroup,
-}
-
-impl ConversationMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::ObserveOnly => "observe_only",
-            Self::MentionReply => "mention_reply",
-            Self::ObjectiveDm => "objective_dm",
-            Self::ManagedGroup => "managed_group",
-        }
-    }
-
-    pub fn allows_agent_reply(&self) -> bool {
-        matches!(
-            self,
-            Self::MentionReply | Self::ObjectiveDm | Self::ManagedGroup
-        )
-    }
-}
-
-impl std::str::FromStr for ConversationMode {
-    type Err = String;
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value.trim() {
-            "observe_only" => Ok(Self::ObserveOnly),
-            "mention_reply" => Ok(Self::MentionReply),
-            "objective_dm" => Ok(Self::ObjectiveDm),
-            "managed_group" => Ok(Self::ManagedGroup),
-            other => Err(format!(
-                "Unknown conversation mode `{other}`. Expected one of: observe_only, mention_reply, objective_dm, managed_group"
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ConversationPolicyStatus {
-    #[default]
-    Active,
-    Paused,
-    Archived,
-}
+pub use crate::channels::conversation_policy::{
+    ConversationChatKind, ConversationMode, ConversationPolicyStatus,
+    ConversationProcedureMetadata,
+};
 
 fn default_channel() -> String {
     "whatsapp".to_string()
@@ -151,16 +86,6 @@ pub struct ObservedGroupConfig {
     pub initial_outreach_sent_at: Option<String>,
     #[serde(default)]
     pub initial_outreach_preview: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConversationProcedureMetadata {
-    pub goal: Option<String>,
-    pub procedure_job_slug: Option<String>,
-    pub procedure_summary: Option<String>,
-    pub procedure_input_schema: Option<String>,
-    pub procedure_sop: Option<String>,
-    pub clear_procedure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
