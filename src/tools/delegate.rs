@@ -6,7 +6,9 @@ use crate::agent::subagent_history_store;
 use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
-use crate::providers::{self, ChatMessage, ChatRequest, Provider};
+use crate::providers::{
+    self, with_provider_request_context, ChatMessage, ChatRequest, Provider, ProviderRequestContext,
+};
 use crate::remote_budget::RemoteBudgetClient;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
@@ -562,15 +564,18 @@ impl Tool for DelegateTool {
         let timeout_secs = agent_config
             .timeout_secs
             .unwrap_or(self.delegate_config.timeout_secs);
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            provider.chat(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                },
-                &agent_config.model,
-                temperature,
+        let result = with_provider_request_context(
+            ProviderRequestContext::delegate(agent_name),
+            tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                provider.chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                    },
+                    &agent_config.model,
+                    temperature,
+                ),
             ),
         )
         .await;
@@ -841,33 +846,36 @@ impl DelegateTool {
             .unwrap_or(self.delegate_config.agentic_timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(
-                provider,
-                &mut history,
-                &sub_tools,
-                &[],
-                None,
-                crate::config::SkillsPromptInjectionMode::Full,
-                &noop_observer,
-                &agent_config.provider,
-                &agent_config.model,
-                temperature,
-                true,
-                None,
-                "delegate",
-                None,
-                &self.multimodal_config,
-                effective_max_iterations,
-                None,
-                None,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                None,
-                self.workspace_dir.as_deref(),
-                delegate_scope.as_deref(),
+            with_provider_request_context(
+                ProviderRequestContext::delegate(agent_name),
+                run_tool_call_loop(
+                    provider,
+                    &mut history,
+                    &sub_tools,
+                    &[],
+                    None,
+                    crate::config::SkillsPromptInjectionMode::Full,
+                    &noop_observer,
+                    &agent_config.provider,
+                    &agent_config.model,
+                    temperature,
+                    true,
+                    None,
+                    "delegate",
+                    None,
+                    &self.multimodal_config,
+                    effective_max_iterations,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    None,
+                    self.workspace_dir.as_deref(),
+                    delegate_scope.as_deref(),
+                ),
             ),
         )
         .await;

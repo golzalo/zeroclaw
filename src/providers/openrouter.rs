@@ -1,13 +1,15 @@
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+    current_provider_request_context, ChatMessage, ChatRequest as ProviderChatRequest,
+    ChatResponse as ProviderChatResponse, Provider, ProviderCapabilities, ProviderRequestContext,
+    TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{header::HeaderMap, Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
@@ -22,6 +24,12 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,9 +78,106 @@ struct NativeChatRequest {
     messages: Vec<NativeMessage>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenRouterRequestContext {
+    user: Option<String>,
+    metadata: Option<BTreeMap<String, String>>,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenRouterResponseIds {
+    generation_id: Option<String>,
+    request_id: Option<String>,
+    response_id: Option<String>,
+}
+
+impl OpenRouterResponseIds {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            generation_id: Self::header_value(headers, "x-generation-id")
+                .or_else(|| Self::header_value(headers, "x-openrouter-generation-id")),
+            request_id: Self::header_value(headers, "x-request-id")
+                .or_else(|| Self::header_value(headers, "x-openrouter-request-id")),
+            response_id: None,
+        }
+    }
+
+    fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn merge_body(&mut self, body: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return;
+        };
+
+        if self.generation_id.is_none() {
+            self.generation_id = value
+                .get("generation_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+        }
+
+        if self.request_id.is_none() {
+            self.request_id = value
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+        }
+
+        if let Some(id) = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if self.generation_id.is_none() && id.starts_with("gen-") {
+                self.generation_id = Some(id.to_string());
+            } else if self.response_id.is_none() {
+                self.response_id = Some(id.to_string());
+            }
+        }
+    }
+
+    fn error_context(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(value) = self.generation_id.as_deref() {
+            parts.push(format!("openrouter_generation_id={value}"));
+        }
+        if let Some(value) = self.request_id.as_deref() {
+            parts.push(format!("openrouter_request_id={value}"));
+        }
+        if let Some(value) = self.response_id.as_deref() {
+            parts.push(format!("openrouter_response_id={value}"));
+        }
+
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", parts.join("; "))
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -172,6 +277,130 @@ impl OpenRouterProvider {
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
         self
+    }
+
+    fn env_value(name: &str) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn truncate_chars(value: &str, max_chars: usize) -> String {
+        value.chars().take(max_chars).collect()
+    }
+
+    fn metadata_value(value: &str) -> String {
+        Self::truncate_chars(value.trim(), 512)
+    }
+
+    fn session_value(value: &str) -> String {
+        Self::truncate_chars(value.trim(), 256)
+    }
+
+    fn detect_agent_name_from_system_contents<'a, I>(system_contents: I) -> Option<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        const MARKER: &str = "[LOG: agent ";
+
+        for content in system_contents {
+            let Some(start) = content.find(MARKER) else {
+                continue;
+            };
+            let after_marker = &content[start + MARKER.len()..];
+            let end = after_marker.find(']').unwrap_or(after_marker.len());
+            let agent = after_marker[..end].trim();
+            if !agent.is_empty() {
+                return Some(Self::metadata_value(agent));
+            }
+        }
+
+        None
+    }
+
+    fn build_request_context_from_parts<'a, I>(
+        system_contents: I,
+        instance_id: Option<String>,
+        actor_id: Option<String>,
+        provider_context: Option<ProviderRequestContext>,
+    ) -> OpenRouterRequestContext
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let detected_agent = Self::detect_agent_name_from_system_contents(system_contents);
+        let agent = provider_context
+            .as_ref()
+            .and_then(|context| context.agent.as_deref())
+            .map(Self::metadata_value)
+            .or_else(|| detected_agent.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let subagent = provider_context
+            .as_ref()
+            .and_then(|context| context.subagent.as_deref())
+            .map(Self::metadata_value)
+            .or(detected_agent)
+            .unwrap_or_else(|| agent.clone());
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("runtime".to_string(), "zeroclaw".to_string());
+        metadata.insert("agent".to_string(), agent.clone());
+        metadata.insert("subagent".to_string(), subagent.clone());
+
+        if let Some(instance_id) = instance_id.as_deref() {
+            metadata.insert("instance_id".to_string(), Self::metadata_value(instance_id));
+        }
+        if let Some(actor_id) = actor_id.as_deref() {
+            metadata.insert("actor_id".to_string(), Self::metadata_value(actor_id));
+        }
+
+        let session_id = instance_id
+            .as_deref()
+            .map(|instance_id| Self::session_value(&format!("zeroclaw:{instance_id}:{subagent}")))
+            .or_else(|| Some(Self::session_value(&format!("zeroclaw:{subagent}"))));
+
+        OpenRouterRequestContext {
+            user: actor_id.map(|value| Self::metadata_value(&value)),
+            metadata: if metadata.is_empty() {
+                None
+            } else {
+                Some(metadata)
+            },
+            session_id,
+        }
+    }
+
+    fn request_context_for_messages(messages: &[ChatMessage]) -> OpenRouterRequestContext {
+        Self::build_request_context_from_parts(
+            messages
+                .iter()
+                .filter(|message| message.role == "system")
+                .map(|message| message.content.as_str()),
+            Self::env_value("INSTANCE_ID"),
+            Self::env_value("OWNER_ACTOR_ID"),
+            current_provider_request_context(),
+        )
+    }
+
+    fn request_context_for_system_prompt(system_prompt: Option<&str>) -> OpenRouterRequestContext {
+        Self::build_request_context_from_parts(
+            system_prompt.into_iter(),
+            Self::env_value("INSTANCE_ID"),
+            Self::env_value("OWNER_ACTOR_ID"),
+            current_provider_request_context(),
+        )
+    }
+
+    fn log_request_context(kind: &str, model: &str, context: &OpenRouterRequestContext) {
+        tracing::info!(
+            provider = "OpenRouter",
+            model,
+            kind,
+            session_id = context.session_id.as_deref(),
+            user = context.user.as_deref(),
+            metadata = ?context.metadata,
+            "OpenRouter request metadata"
+        );
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -318,7 +547,7 @@ impl OpenRouterProvider {
     }
 
     fn compact_sanitized_body_snippet(body: &str) -> String {
-        super::sanitize_api_error(body)
+        super::sanitize_api_error(body.trim_start())
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -335,26 +564,60 @@ impl OpenRouterProvider {
     async fn read_response_body(
         provider_name: &str,
         response: reqwest::Response,
-    ) -> anyhow::Result<String> {
-        response.text().await.map_err(|error| {
+        kind: &str,
+        model: &str,
+    ) -> anyhow::Result<(String, OpenRouterResponseIds, StatusCode)> {
+        let status = response.status();
+        let mut ids = OpenRouterResponseIds::from_headers(response.headers());
+        let body = response.text().await.map_err(|error| {
             let sanitized = super::sanitize_api_error(&error.to_string());
             anyhow::anyhow!(
-                "{provider_name} transport error while reading response body: {sanitized}"
+                "{provider_name} transport error while reading response body{}: {sanitized}",
+                ids.error_context()
             )
-        })
+        })?;
+        ids.merge_body(&body);
+
+        tracing::info!(
+            provider = provider_name,
+            model,
+            kind,
+            status = %status,
+            openrouter_generation_id = ids.generation_id.as_deref(),
+            openrouter_request_id = ids.request_id.as_deref(),
+            openrouter_response_id = ids.response_id.as_deref(),
+            "OpenRouter response metadata"
+        );
+
+        Ok((body, ids, status))
     }
 
     fn parse_response_body<T: DeserializeOwned>(
         provider_name: &str,
         body: &str,
         kind: &str,
+        ids: &OpenRouterResponseIds,
     ) -> anyhow::Result<T> {
         serde_json::from_str::<T>(body).map_err(|error| {
             let snippet = Self::compact_sanitized_body_snippet(body);
             anyhow::anyhow!(
-                "{provider_name} API returned an unexpected {kind} payload: {error}; body={snippet}"
+                "{provider_name} API returned an unexpected {kind} payload: {error}{}; body={snippet}",
+                ids.error_context()
             )
         })
+    }
+
+    fn api_error_from_body(
+        provider_name: &str,
+        status: StatusCode,
+        body: &str,
+        ids: &OpenRouterResponseIds,
+    ) -> anyhow::Error {
+        let sanitized = super::sanitize_api_error(body.trim_start());
+        anyhow::anyhow!(
+            "{provider_name} API error ({status}){}: {sanitized}",
+            ids.error_context()
+        )
     }
 
     fn http_client(&self) -> Client {
@@ -414,10 +677,16 @@ impl Provider for OpenRouterProvider {
             content: Self::to_message_content("user", message),
         });
 
+        let context = Self::request_context_for_system_prompt(system_prompt);
+        Self::log_request_context("chat-completions", model, &context);
+
         let request = ChatRequest {
             model: model.to_string(),
             messages,
             temperature,
+            user: context.user,
+            metadata: context.metadata,
+            session_id: context.session_id,
         };
 
         let response = self
@@ -430,13 +699,18 @@ impl Provider for OpenRouterProvider {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+        let (body, ids, status) =
+            Self::read_response_body("OpenRouter", response, "chat-completions", model).await?;
+        if !status.is_success() {
+            return Err(Self::api_error_from_body("OpenRouter", status, &body, &ids));
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let chat_response =
-            Self::parse_response_body::<ApiChatResponse>("OpenRouter", &body, "chat-completions")?;
+        let chat_response = Self::parse_response_body::<ApiChatResponse>(
+            "OpenRouter",
+            &body,
+            "chat-completions",
+            &ids,
+        )?;
 
         chat_response
             .choices
@@ -463,10 +737,16 @@ impl Provider for OpenRouterProvider {
             })
             .collect();
 
+        let context = Self::request_context_for_messages(messages);
+        Self::log_request_context("chat-completions", model, &context);
+
         let request = ChatRequest {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            user: context.user,
+            metadata: context.metadata,
+            session_id: context.session_id,
         };
 
         let response = self
@@ -479,13 +759,18 @@ impl Provider for OpenRouterProvider {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+        let (body, ids, status) =
+            Self::read_response_body("OpenRouter", response, "chat-completions", model).await?;
+        if !status.is_success() {
+            return Err(Self::api_error_from_body("OpenRouter", status, &body, &ids));
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let chat_response =
-            Self::parse_response_body::<ApiChatResponse>("OpenRouter", &body, "chat-completions")?;
+        let chat_response = Self::parse_response_body::<ApiChatResponse>(
+            "OpenRouter",
+            &body,
+            "chat-completions",
+            &ids,
+        )?;
 
         chat_response
             .choices
@@ -508,10 +793,15 @@ impl Provider for OpenRouterProvider {
         })?;
 
         let tools = Self::convert_tools(request.tools);
+        let context = Self::request_context_for_messages(request.messages);
+        Self::log_request_context("native chat", model, &context);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
+            user: context.user,
+            metadata: context.metadata,
+            session_id: context.session_id,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -526,13 +816,18 @@ impl Provider for OpenRouterProvider {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+        let (body, ids, status) =
+            Self::read_response_body("OpenRouter", response, "native chat", model).await?;
+        if !status.is_success() {
+            return Err(Self::api_error_from_body("OpenRouter", status, &body, &ids));
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let native_response =
-            Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            &body,
+            "native chat",
+            &ids,
+        )?;
         let NativeChatResponse { choices, usage } = native_response;
         let usage = Self::map_usage(usage);
         let message = choices
@@ -598,10 +893,16 @@ impl Provider for OpenRouterProvider {
         // when history contains native tool-call metadata.
         let native_messages = Self::convert_messages(messages);
 
+        let context = Self::request_context_for_messages(messages);
+        Self::log_request_context("native chat", model, &context);
+
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: native_messages,
             temperature,
+            user: context.user,
+            metadata: context.metadata,
+            session_id: context.session_id,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
         };
@@ -616,13 +917,18 @@ impl Provider for OpenRouterProvider {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+        let (body, ids, status) =
+            Self::read_response_body("OpenRouter", response, "native chat", model).await?;
+        if !status.is_success() {
+            return Err(Self::api_error_from_body("OpenRouter", status, &body, &ids));
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let native_response =
-            Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            &body,
+            "native chat",
+            &ids,
+        )?;
         let NativeChatResponse { choices, usage } = native_response;
         let usage = Self::map_usage(usage);
         let message = choices
@@ -731,6 +1037,9 @@ mod tests {
                 },
             ],
             temperature: 0.5,
+            user: None,
+            metadata: None,
+            session_id: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -764,6 +1073,9 @@ mod tests {
                 })
                 .collect(),
             temperature: 0.0,
+            user: None,
+            metadata: None,
+            session_id: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -792,12 +1104,97 @@ mod tests {
     }
 
     #[test]
+    fn request_context_includes_instance_actor_and_agent_metadata() {
+        let context = OpenRouterProvider::build_request_context_from_parts(
+            ["subagent system prompt"],
+            Some("dedicated-gonzalo-b5273968".to_string()),
+            Some("85642050535518@lid".to_string()),
+            Some(ProviderRequestContext::delegate("calendar")),
+        );
+
+        assert_eq!(
+            context.session_id.as_deref(),
+            Some("zeroclaw:dedicated-gonzalo-b5273968:calendar")
+        );
+        assert_eq!(context.user.as_deref(), Some("85642050535518@lid"));
+        let metadata = context.metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata.get("runtime").map(String::as_str),
+            Some("zeroclaw")
+        );
+        assert_eq!(
+            metadata.get("instance_id").map(String::as_str),
+            Some("dedicated-gonzalo-b5273968")
+        );
+        assert_eq!(
+            metadata.get("actor_id").map(String::as_str),
+            Some("85642050535518@lid")
+        );
+        assert_eq!(metadata.get("agent").map(String::as_str), Some("delegate"));
+        assert_eq!(
+            metadata.get("subagent").map(String::as_str),
+            Some("calendar")
+        );
+    }
+
+    #[test]
+    fn chat_request_serializes_observability_fields() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("instance_id".to_string(), "dedicated-test".to_string());
+        metadata.insert("subagent".to_string(), "mail".to_string());
+        let request = ChatRequest {
+            model: "google/gemma-4-31b-it".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: MessageContent::Text("hello".into()),
+            }],
+            temperature: 0.2,
+            user: Some("actor-1".into()),
+            metadata: Some(metadata),
+            session_id: Some("zeroclaw:dedicated-test:mail".into()),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"user\":\"actor-1\""));
+        assert!(json.contains("\"session_id\":\"zeroclaw:dedicated-test:mail\""));
+        assert!(json.contains("\"instance_id\":\"dedicated-test\""));
+        assert!(json.contains("\"subagent\":\"mail\""));
+    }
+
+    #[test]
+    fn response_ids_merge_headers_and_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-generation-id",
+            reqwest::header::HeaderValue::from_static("gen-header"),
+        );
+
+        let mut ids = OpenRouterResponseIds::from_headers(&headers);
+        ids.merge_body(r#"{"id":"chatcmpl-body","request_id":"req-body"}"#);
+
+        assert_eq!(ids.generation_id.as_deref(), Some("gen-header"));
+        assert_eq!(ids.request_id.as_deref(), Some("req-body"));
+        assert_eq!(ids.response_id.as_deref(), Some("chatcmpl-body"));
+        assert!(ids
+            .error_context()
+            .contains("openrouter_generation_id=gen-header"));
+        assert!(ids
+            .error_context()
+            .contains("openrouter_request_id=req-body"));
+        assert!(ids
+            .error_context()
+            .contains("openrouter_response_id=chatcmpl-body"));
+    }
+
+    #[test]
     fn parse_chat_response_body_reports_sanitized_snippet() {
         let body = r#"{"choices":"invalid","api_key":"sk-test-secret-value"}"#;
         let err = OpenRouterProvider::parse_response_body::<ApiChatResponse>(
             "OpenRouter",
             body,
             "chat-completions",
+            &OpenRouterResponseIds::default(),
         )
         .expect_err("payload should fail");
         let msg = err.to_string();
@@ -815,6 +1212,7 @@ mod tests {
             "OpenRouter",
             body,
             "native chat",
+            &OpenRouterResponseIds::default(),
         )
         .expect_err("payload should fail");
         let msg = err.to_string();

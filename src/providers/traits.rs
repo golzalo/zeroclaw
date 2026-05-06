@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
+use std::future::Future;
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +93,36 @@ impl ChatResponse {
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
     pub tools: Option<&'a [ToolSpec]>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderRequestContext {
+    pub agent: Option<String>,
+    pub subagent: Option<String>,
+}
+
+impl ProviderRequestContext {
+    pub fn delegate(agent_name: impl Into<String>) -> Self {
+        Self {
+            agent: Some("delegate".to_string()),
+            subagent: Some(agent_name.into()),
+        }
+    }
+}
+
+tokio::task_local! {
+    static PROVIDER_REQUEST_CONTEXT: ProviderRequestContext;
+}
+
+pub async fn with_provider_request_context<F, T>(context: ProviderRequestContext, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    PROVIDER_REQUEST_CONTEXT.scope(context, future).await
+}
+
+pub fn current_provider_request_context() -> Option<ProviderRequestContext> {
+    PROVIDER_REQUEST_CONTEXT.try_with(Clone::clone).ok()
 }
 
 /// A tool result to feed back to the LLM.
