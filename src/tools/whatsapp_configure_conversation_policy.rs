@@ -307,7 +307,7 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                 },
                 "procedure_sop": {
                     "type": "string",
-                    "description": "Instructions for the WhatsApp third-party worker: what to extract, what to omit, how to call the procedure, and how to reply after it completes."
+                    "description": "Instructions for the restricted conversation worker: what to extract, what to omit, how to call the procedure, and how to reply after it completes."
                 },
                 "clear_procedure": {
                     "type": "boolean",

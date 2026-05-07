@@ -30,6 +30,9 @@
 //! The Cloud API channel is used when `phone_number_id` is set.
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::conversation_policy::{
+    should_invoke_restricted_worker, RestrictedConversationTrigger,
+};
 use super::whatsapp_observation::{
     ConversationChatKind, ConversationMode, ConversationPolicyStatus, ObservedGroupConfig,
     ObservedGroupMessageMetadata, VisibleGroupRecord, WhatsAppObservationService,
@@ -2975,20 +2978,15 @@ impl WhatsAppWebChannel {
         _is_main_channel: bool,
         trigger: &ObservedGroupTrigger,
     ) -> bool {
-        if observed_group.status != ConversationPolicyStatus::Active {
-            return false;
-        }
-
-        if !observed_group.mode.allows_agent_reply() {
-            return false;
-        }
-
-        match observed_group.mode {
-            ConversationMode::MentionReply => trigger.should_invoke(),
-            ConversationMode::ManagedGroup => trigger.should_invoke(),
-            ConversationMode::ObjectiveDm => false,
-            ConversationMode::ObserveOnly => false,
-        }
+        should_invoke_restricted_worker(
+            observed_group.chat_kind,
+            observed_group.mode,
+            observed_group.status,
+            RestrictedConversationTrigger {
+                mentions_agent: trigger.mentions_agent,
+                replied_to_agent: trigger.replied_to_agent,
+            },
+        )
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3012,21 +3010,15 @@ impl WhatsAppWebChannel {
         observed_direct: &ObservedGroupConfig,
         trigger: &ObservedGroupTrigger,
     ) -> bool {
-        if observed_direct.status != ConversationPolicyStatus::Active {
-            return false;
-        }
-
-        if !observed_direct.mode.allows_agent_reply() {
-            return false;
-        }
-
-        match observed_direct.mode {
-            ConversationMode::MentionReply | ConversationMode::ObjectiveDm => {
-                trigger.should_invoke()
-            }
-            ConversationMode::ManagedGroup => trigger.should_invoke(),
-            ConversationMode::ObserveOnly => false,
-        }
+        should_invoke_restricted_worker(
+            observed_direct.chat_kind,
+            observed_direct.mode,
+            observed_direct.status,
+            RestrictedConversationTrigger {
+                mentions_agent: trigger.mentions_agent,
+                replied_to_agent: trigger.replied_to_agent,
+            },
+        )
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -6183,6 +6175,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: None,
             skill_name: None,
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
             keep_log_segments: 2,
@@ -6251,6 +6248,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: Some("Cerrar acuerdo comercial".to_string()),
             skill_name: Some("whatsapp_objective_dm".to_string()),
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: Some("+5491159297734".to_string()),
             rotate_after_bytes: 1024,
             keep_log_segments: 2,
@@ -6281,6 +6283,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: Some("Coordinar idioma".to_string()),
             skill_name: None,
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
             keep_log_segments: 2,
@@ -6312,6 +6319,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: Some("Coordinar idioma".to_string()),
             skill_name: None,
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
             keep_log_segments: 2,
@@ -6343,6 +6355,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: Some("Coordinar idioma".to_string()),
             skill_name: None,
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
             keep_log_segments: 2,
@@ -6568,6 +6585,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: None,
             skill_name: Some("whatsapp_mention_reply".to_string()),
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
             keep_log_segments: 2,
@@ -6629,6 +6651,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: None,
             skill_name: Some("whatsapp_mention_reply".to_string()),
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
             keep_log_segments: 2,
@@ -6659,6 +6686,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: Some("Cerrar el acuerdo".to_string()),
             skill_name: Some("whatsapp_objective_dm".to_string()),
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
             keep_log_segments: 2,
@@ -6721,6 +6753,11 @@ mod tests {
             status: ConversationPolicyStatus::Active,
             objective: None,
             skill_name: Some("whatsapp_mention_reply".to_string()),
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
             keep_log_segments: 2,

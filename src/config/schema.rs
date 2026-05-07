@@ -12181,7 +12181,7 @@ require_otp_to_resume = true
     }
 
     #[test]
-    fn partial_cost_section_preserves_default_model_pricing() {
+    async fn partial_cost_section_preserves_default_model_pricing() {
         let raw_toml = r#"
 default_provider = "openrouter"
 default_model = "google/gemma-4-31b-it"
