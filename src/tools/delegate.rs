@@ -34,30 +34,8 @@ fn looks_like_delegate_batch_continue_request(prompt: &str) -> bool {
     )
 }
 
-fn is_legacy_delegate_resume_prompt(prompt: &str) -> bool {
-    let normalized = prompt
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['\n', '\r', '\t'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
 
-    normalized.contains("continue the same service job from the saved checkpoint")
-        || normalized.contains("continue the same task from the saved checkpoint")
-}
 
-fn build_delegate_resume_followup_message(full_prompt: &str) -> String {
-    let trimmed = full_prompt.trim();
-    if trimmed.is_empty()
-        || looks_like_delegate_batch_continue_request(trimmed)
-        || is_legacy_delegate_resume_prompt(trimmed)
-    {
-        "Continue.".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
 
 fn delegate_task_scope(scope_key: &str, agent_name: &str) -> String {
     format!("{scope_key}::delegate::{agent_name}")
@@ -798,7 +776,7 @@ impl DelegateTool {
         }
 
         let effective_prompt = match resume_checkpoint.as_ref() {
-            Some(_) if restored_prior_history => build_delegate_resume_followup_message(full_prompt),
+            Some(_) if restored_prior_history => full_prompt.to_string(),
             Some(checkpoint) => build_delegate_resume_prompt(agent_name, full_prompt, checkpoint),
             None => full_prompt.to_string(),
         };
@@ -1308,20 +1286,7 @@ mod tests {
         assert!(prompt.contains("Refactor the handler"));
     }
 
-    #[test]
-    fn build_delegate_resume_followup_message_normalizes_internal_batch_resume_prompts() {
-        assert_eq!(build_delegate_resume_followup_message("10x"), "Continue.");
-        assert_eq!(
-            build_delegate_resume_followup_message(
-                "EXISTING_JOB: infobae-news-csv\n\nContinue the same service job from the saved checkpoint. Reuse completed work and focus only on the remaining steps.\n\nImplement it"
-            ),
-            "Continue."
-        );
-        assert_eq!(
-            build_delegate_resume_followup_message("Please finish the publish step."),
-            "Please finish the publish step."
-        );
-    }
+   
 
     #[test]
     fn normalize_delegate_prompt_routes_drive_doc_with_image_to_docx_upload() {
@@ -1988,7 +1953,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert!(seen.iter().any(|msg| msg.role == "assistant" && msg.content == "Scaffold listo."));
         assert!(seen.iter().any(|msg| msg.role == "assistant" && msg.content.contains("¿Quieres que siga?")));
-        assert!(seen.iter().any(|msg| msg.role == "user" && msg.content == "Continue."));
+        assert!(seen.iter().any(|msg| msg.role == "user" && msg.content == "10x"));
         assert!(!seen.iter().any(|msg| msg.content.contains("Prior subagent transcript")));
         assert!(!seen.iter().any(|msg| msg.content.contains("CONTINUATION RESUME DIRECTIVE")));
         assert!(!seen.iter().any(|msg| msg.content.contains("saved checkpoint")));

@@ -101,6 +101,7 @@ struct OpenRouterResponseIds {
     generation_id: Option<String>,
     request_id: Option<String>,
     response_id: Option<String>,
+    upstream_provider: Option<String>,
 }
 
 impl OpenRouterResponseIds {
@@ -111,6 +112,7 @@ impl OpenRouterResponseIds {
             request_id: Self::header_value(headers, "x-request-id")
                 .or_else(|| Self::header_value(headers, "x-openrouter-request-id")),
             response_id: None,
+            upstream_provider: Self::header_value(headers, "x-openrouter-provider"),
         }
     }
 
@@ -586,6 +588,7 @@ impl OpenRouterProvider {
             openrouter_generation_id = ids.generation_id.as_deref(),
             openrouter_request_id = ids.request_id.as_deref(),
             openrouter_response_id = ids.response_id.as_deref(),
+            upstream_provider = ids.upstream_provider.as_deref(),
             "OpenRouter response metadata"
         );
 
@@ -599,6 +602,14 @@ impl OpenRouterProvider {
         ids: &OpenRouterResponseIds,
     ) -> anyhow::Result<T> {
         serde_json::from_str::<T>(body).map_err(|error| {
+            let sanitized = super::sanitize_api_error(body);
+            tracing::warn!(
+                openrouter_generation_id = ids.generation_id.as_deref(),
+                upstream_provider = ids.upstream_provider.as_deref(),
+                kind,
+                raw_body = sanitized.as_str(),
+                "OpenRouter unexpected response body"
+            );
             let snippet = Self::compact_sanitized_body_snippet(body);
             anyhow::anyhow!(
                 "{provider_name} API returned an unexpected {kind} payload: {error}{}; body={snippet}",
