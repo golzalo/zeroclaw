@@ -1592,6 +1592,123 @@ impl SlackChannel {
             .clone()
     }
 
+    fn track_active_thread_parent(
+        active_threads: &mut HashMap<String, (String, String, Instant)>,
+        channel_id: &str,
+        thread_ts: &str,
+    ) {
+        Self::track_active_thread_parent_from_cursor(
+            active_threads,
+            channel_id,
+            thread_ts,
+            thread_ts,
+        );
+    }
+
+    fn track_active_thread_parent_from_cursor(
+        active_threads: &mut HashMap<String, (String, String, Instant)>,
+        channel_id: &str,
+        thread_ts: &str,
+        reply_cursor_ts: &str,
+    ) {
+        let entry = active_threads
+            .entry(thread_ts.to_string())
+            .or_insert_with(|| {
+                (
+                    channel_id.to_string(),
+                    reply_cursor_ts.to_string(),
+                    Instant::now(),
+                )
+            });
+        entry.0 = channel_id.to_string();
+        entry.2 = Instant::now();
+    }
+
+    fn track_top_level_message_thread(
+        active_threads: &mut HashMap<String, (String, String, Instant)>,
+        channel_id: &str,
+        msg: &serde_json::Value,
+        ts: &str,
+    ) {
+        if ts.is_empty() {
+            return;
+        }
+
+        if msg
+            .get("thread_ts")
+            .and_then(|value| value.as_str())
+            .is_some_and(|thread_ts| thread_ts != ts)
+        {
+            return;
+        }
+
+        Self::track_active_thread_parent(active_threads, channel_id, ts);
+    }
+
+    fn bootstrap_thread_reply_cursor(
+        replies: &[serde_json::Value],
+        thread_ts: &str,
+        default_cursor_ts: &str,
+        bot_user_id: &str,
+    ) -> String {
+        let mut latest_human_ts: Option<&str> = None;
+        let mut latest_bot_ts: Option<&str> = None;
+
+        for reply in replies {
+            let ts = reply
+                .get("ts")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if ts.is_empty() {
+                continue;
+            }
+
+            let user = reply
+                .get("user")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let is_bot_reply = (!bot_user_id.is_empty() && user == bot_user_id)
+                || (user.is_empty() && reply.get("bot_id").is_some());
+
+            if is_bot_reply {
+                if latest_bot_ts.is_none_or(|current| ts > current) {
+                    latest_bot_ts = Some(ts);
+                }
+            } else if !user.is_empty() && latest_human_ts.is_none_or(|current| ts > current) {
+                latest_human_ts = Some(ts);
+            }
+        }
+
+        if let Some(latest_human_ts) = latest_human_ts {
+            if latest_bot_ts.is_none_or(|latest_bot_ts| latest_human_ts > latest_bot_ts) {
+                return latest_bot_ts.unwrap_or(thread_ts).to_string();
+            }
+        }
+
+        default_cursor_ts.to_string()
+    }
+
+    async fn resolve_bootstrap_thread_reply_cursor(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        default_cursor_ts: &str,
+        bot_user_id: &str,
+    ) -> String {
+        let Some(data) = self
+            .fetch_thread_replies_with_retry(channel_id, thread_ts, thread_ts)
+            .await
+        else {
+            return default_cursor_ts.to_string();
+        };
+
+        let Some(replies) = data.get("messages").and_then(|value| value.as_array()) else {
+            return default_cursor_ts.to_string();
+        };
+
+        Self::bootstrap_thread_reply_cursor(replies, thread_ts, default_cursor_ts, bot_user_id)
+    }
+
     async fn open_socket_mode_url(&self) -> anyhow::Result<String> {
         let app_token = self
             .configured_app_token()
@@ -2292,6 +2409,33 @@ impl Channel for SlackChannel {
                         channel_id,
                         cursor_ts
                     );
+                    let bootstrap_params = vec![
+                        ("channel", channel_id.clone()),
+                        ("limit", "10".to_string()),
+                    ];
+                    if let Some(data) = self
+                        .fetch_history_with_retry(&channel_id, &bootstrap_params)
+                        .await
+                    {
+                        if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
+                            for (thread_ts, _) in Self::extract_active_threads(messages) {
+                                let reply_cursor_ts = self
+                                    .resolve_bootstrap_thread_reply_cursor(
+                                        &channel_id,
+                                        &thread_ts,
+                                        &cursor_ts,
+                                        &bot_user_id,
+                                    )
+                                    .await;
+                                Self::track_active_thread_parent_from_cursor(
+                                    &mut active_threads,
+                                    &channel_id,
+                                    &thread_ts,
+                                    &reply_cursor_ts,
+                                );
+                            }
+                        }
+                    }
                 }
                 let params = vec![
                     ("channel", channel_id.clone()),
@@ -2305,14 +2449,12 @@ impl Channel for SlackChannel {
 
                 if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                     // Register thread parents discovered in channel history.
-                    for (thread_ts, latest_reply) in Self::extract_active_threads(messages) {
-                        let entry = active_threads.entry(thread_ts.clone()).or_insert_with(|| {
-                            (channel_id.clone(), thread_ts.clone(), Instant::now())
-                        });
-                        if latest_reply > entry.1 {
-                            entry.1 = latest_reply;
-                        }
-                        entry.2 = Instant::now();
+                    for (thread_ts, _) in Self::extract_active_threads(messages) {
+                        Self::track_active_thread_parent(
+                            &mut active_threads,
+                            &channel_id,
+                            &thread_ts,
+                        );
                     }
 
                     // Messages come newest-first, reverse to process oldest first
@@ -2361,6 +2503,12 @@ impl Channel for SlackChannel {
                         };
 
                         last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
+                        Self::track_top_level_message_thread(
+                            &mut active_threads,
+                            &channel_id,
+                            msg,
+                            ts,
+                        );
                         let sender = self.resolve_sender_identity(user).await;
 
                         let channel_msg = ChannelMessage {
@@ -2410,6 +2558,14 @@ impl Channel for SlackChannel {
                     if reply_ts.is_empty() || reply_ts <= last_reply_ts.as_str() {
                         continue;
                     }
+
+                    if let Some(entry) = active_threads.get_mut(&thread_ts) {
+                        if reply_ts > entry.1.as_str() {
+                            entry.1 = reply_ts.to_string();
+                        }
+                        entry.2 = Instant::now();
+                    }
+
                     let subtype = reply.get("subtype").and_then(|v| v.as_str());
                     if !Self::is_supported_message_subtype(subtype) {
                         continue;
@@ -2437,14 +2593,6 @@ impl Channel for SlackChannel {
                     else {
                         continue;
                     };
-
-                    // Update the last-seen reply ts for this thread.
-                    if let Some(entry) = active_threads.get_mut(&thread_ts) {
-                        if reply_ts > entry.1.as_str() {
-                            entry.1 = reply_ts.to_string();
-                        }
-                        entry.2 = Instant::now();
-                    }
 
                     let sender = self.resolve_sender_identity(user).await;
 
@@ -3206,6 +3354,170 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].0, "100.000");
         assert_eq!(threads[0].1, "103.000");
+    }
+
+    #[test]
+    fn track_active_thread_parent_starts_reply_cursor_at_thread_root() {
+        let mut threads = HashMap::new();
+
+        SlackChannel::track_active_thread_parent(&mut threads, "D123", "100.000");
+
+        let entry = threads.get("100.000").expect("thread should be tracked");
+        assert_eq!(entry.0, "D123");
+        assert_eq!(entry.1, "100.000");
+    }
+
+    #[test]
+    fn track_active_thread_parent_from_cursor_uses_bootstrap_cursor() {
+        let mut threads = HashMap::new();
+
+        SlackChannel::track_active_thread_parent_from_cursor(
+            &mut threads,
+            "D123",
+            "100.000",
+            "120.000",
+        );
+
+        let entry = threads.get("100.000").expect("thread should be tracked");
+        assert_eq!(entry.0, "D123");
+        assert_eq!(entry.1, "120.000");
+    }
+
+    #[test]
+    fn track_active_thread_parent_does_not_overwrite_reply_cursor() {
+        let mut threads = HashMap::new();
+        threads.insert(
+            "100.000".to_string(),
+            ("D123".to_string(), "101.000".to_string(), Instant::now()),
+        );
+
+        SlackChannel::track_active_thread_parent(&mut threads, "D123", "100.000");
+
+        let entry = threads.get("100.000").expect("thread should stay tracked");
+        assert_eq!(entry.1, "101.000");
+    }
+
+    #[test]
+    fn track_top_level_message_thread_registers_root_before_replies_exist() {
+        let mut threads = HashMap::new();
+        let msg = serde_json::json!({
+            "ts": "100.000",
+            "text": "root with no replies yet"
+        });
+
+        SlackChannel::track_top_level_message_thread(&mut threads, "C123", &msg, "100.000");
+
+        let entry = threads.get("100.000").expect("thread should be tracked");
+        assert_eq!(entry.0, "C123");
+        assert_eq!(entry.1, "100.000");
+    }
+
+    #[test]
+    fn track_top_level_message_thread_ignores_existing_replies() {
+        let mut threads = HashMap::new();
+        let reply = serde_json::json!({
+            "ts": "101.000",
+            "thread_ts": "100.000",
+            "text": "reply in thread"
+        });
+
+        SlackChannel::track_top_level_message_thread(&mut threads, "C123", &reply, "101.000");
+
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_thread_reply_cursor_uses_last_bot_when_human_reply_is_pending() {
+        let replies = vec![
+            serde_json::json!({
+                "ts": "100.000",
+                "user": "U_HUMAN",
+                "text": "root"
+            }),
+            serde_json::json!({
+                "ts": "101.000",
+                "user": "U_BOT",
+                "text": "bot reply"
+            }),
+            serde_json::json!({
+                "ts": "102.000",
+                "user": "U_HUMAN",
+                "text": "pending human reply"
+            }),
+        ];
+
+        let cursor =
+            SlackChannel::bootstrap_thread_reply_cursor(&replies, "100.000", "200.000", "U_BOT");
+
+        assert_eq!(cursor, "101.000");
+    }
+
+    #[test]
+    fn bootstrap_thread_reply_cursor_uses_thread_root_when_no_bot_replied() {
+        let replies = vec![
+            serde_json::json!({
+                "ts": "100.000",
+                "user": "U_HUMAN",
+                "text": "root"
+            }),
+            serde_json::json!({
+                "ts": "102.000",
+                "user": "U_HUMAN",
+                "text": "pending human reply"
+            }),
+        ];
+
+        let cursor =
+            SlackChannel::bootstrap_thread_reply_cursor(&replies, "100.000", "200.000", "U_BOT");
+
+        assert_eq!(cursor, "100.000");
+    }
+
+    #[test]
+    fn bootstrap_thread_reply_cursor_uses_default_when_bot_answered_latest() {
+        let replies = vec![
+            serde_json::json!({
+                "ts": "100.000",
+                "user": "U_HUMAN",
+                "text": "root"
+            }),
+            serde_json::json!({
+                "ts": "103.000",
+                "user": "U_BOT",
+                "text": "latest bot reply"
+            }),
+        ];
+
+        let cursor =
+            SlackChannel::bootstrap_thread_reply_cursor(&replies, "100.000", "200.000", "U_BOT");
+
+        assert_eq!(cursor, "200.000");
+    }
+
+    #[test]
+    fn bootstrap_thread_reply_cursor_recognizes_bot_id_when_user_is_missing() {
+        let replies = vec![
+            serde_json::json!({
+                "ts": "100.000",
+                "user": "U_HUMAN",
+                "text": "root"
+            }),
+            serde_json::json!({
+                "ts": "101.000",
+                "bot_id": "B123",
+                "text": "bot reply"
+            }),
+            serde_json::json!({
+                "ts": "102.000",
+                "user": "U_HUMAN",
+                "text": "pending human reply"
+            }),
+        ];
+
+        let cursor =
+            SlackChannel::bootstrap_thread_reply_cursor(&replies, "100.000", "200.000", "U_BOT");
+
+        assert_eq!(cursor, "101.000");
     }
 
     #[test]

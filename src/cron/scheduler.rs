@@ -439,13 +439,21 @@ fn parse_tenant_service_cron_metadata(config: &Config, prompt: &str) -> TenantSe
         let value = candidate.trim();
         if !value.is_empty() {
             metadata.kind = Some(TenantServiceCronKind::Execution);
-            metadata.prompt_file = Some(resolve_cron_prompt_path(config, value));
+            metadata.prompt_file = Some(resolve_tenant_service_prompt_path(
+                config,
+                value,
+                TenantServiceCronKind::Execution,
+            ));
         }
     } else if let Some(candidate) = trimmed.strip_prefix("@tenant-service-announce") {
         let value = candidate.trim();
         if !value.is_empty() {
             metadata.kind = Some(TenantServiceCronKind::Announce);
-            metadata.prompt_file = Some(resolve_cron_prompt_path(config, value));
+            metadata.prompt_file = Some(resolve_tenant_service_prompt_path(
+                config,
+                value,
+                TenantServiceCronKind::Announce,
+            ));
         }
     }
     for line in prompt.lines() {
@@ -460,11 +468,19 @@ fn parse_tenant_service_cron_metadata(config: &Config, prompt: &str) -> TenantSe
         match key {
             "TENANT_SERVICE_EXECUTION_PROMPT_FILE" => {
                 metadata.kind = Some(TenantServiceCronKind::Execution);
-                metadata.prompt_file = Some(resolve_cron_prompt_path(config, value));
+                metadata.prompt_file = Some(resolve_tenant_service_prompt_path(
+                    config,
+                    value,
+                    TenantServiceCronKind::Execution,
+                ));
             }
             "TENANT_SERVICE_ANNOUNCE_PROMPT_FILE" => {
                 metadata.kind = Some(TenantServiceCronKind::Announce);
-                metadata.prompt_file = Some(resolve_cron_prompt_path(config, value));
+                metadata.prompt_file = Some(resolve_tenant_service_prompt_path(
+                    config,
+                    value,
+                    TenantServiceCronKind::Announce,
+                ));
             }
             "TENANT_SERVICE_RUN_COMMAND" => {
                 metadata.run_command = Some(value.to_string());
@@ -789,6 +805,29 @@ fn resolve_cron_prompt_path(config: &Config, candidate: &str) -> PathBuf {
         return path;
     }
     config.workspace_dir.join(path)
+}
+
+fn resolve_tenant_service_prompt_path(
+    config: &Config,
+    candidate: &str,
+    kind: TenantServiceCronKind,
+) -> PathBuf {
+    let mut path = resolve_cron_prompt_path(config, candidate);
+
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix("/tenant-app") {
+            path = config.workspace_dir.join("tenant-app").join(relative);
+        }
+    }
+
+    if path.is_dir() {
+        return path.join(match kind {
+            TenantServiceCronKind::Execution => "execution_prompt.txt",
+            TenantServiceCronKind::Announce => "announce_prompt.txt",
+        });
+    }
+
+    path
 }
 
 fn resolve_cron_model(config: &Config, raw_model: Option<&str>) -> Option<String> {
@@ -1416,6 +1455,60 @@ mod tests {
         assert_eq!(
             resolved.tenant_service.delivery_command.as_deref(),
             Some("node tools/tenant_job_delivery.mjs --job sample --skip-run")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_job_prompt_maps_tenant_app_alias_directories_to_prompt_files() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job_root = config.workspace_dir.join("tenant-app/server/jobs/sample");
+        tokio::fs::create_dir_all(&job_root).await.unwrap();
+        tokio::fs::write(
+            job_root.join("announce_prompt.txt"),
+            "Use only http_request.\nReply with OK.\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            job_root.join("execution_prompt.txt"),
+            "Use only http_request.\nRun the job.\n",
+        )
+        .await
+        .unwrap();
+
+        let resolved = resolve_agent_job_prompt(
+            &config,
+            "@tenant-service-announce /tenant-app/server/jobs/sample",
+        )
+        .await
+        .unwrap();
+
+        assert!(resolved.prompt.contains("Use only http_request."));
+        assert_eq!(
+            resolved.tenant_service.kind,
+            Some(TenantServiceCronKind::Announce)
+        );
+        assert_eq!(
+            resolved.tenant_service.delivery_command.as_deref(),
+            Some("node tools/tenant_job_delivery.mjs --job sample --skip-run")
+        );
+
+        let execution_resolved = resolve_agent_job_prompt(
+            &config,
+            "@tenant-service-execution /tenant-app/server/jobs/sample",
+        )
+        .await
+        .unwrap();
+
+        assert!(execution_resolved.prompt.contains("Run the job."));
+        assert_eq!(
+            execution_resolved.tenant_service.kind,
+            Some(TenantServiceCronKind::Execution)
+        );
+        assert_eq!(
+            execution_resolved.tenant_service.run_command.as_deref(),
+            Some("node tools/tenant_job_runner.mjs invoke --job sample")
         );
     }
 

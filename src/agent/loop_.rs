@@ -4822,17 +4822,26 @@ fn maybe_normalize_tenant_service_announce_cron_prompt(
     else {
         return;
     };
-    if raw_path.ends_with("announce_prompt.txt") {
-        return;
-    }
-    let candidate = std::path::Path::new(raw_path);
-    let resolved: std::path::PathBuf = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else if let Some(ws) = workspace_dir {
-        ws.join(candidate)
-    } else {
+    let Some(resolved) =
+        resolve_tenant_service_announce_prompt_candidate(raw_path, workspace_dir)
+    else {
         return;
     };
+
+    if resolved.file_name().and_then(|name| name.to_str()) == Some("announce_prompt.txt") {
+        let new_prompt = format!("@tenant-service-announce {}", resolved.display());
+        if new_prompt != trimmed {
+            tracing::debug!(
+                tool = tool_name,
+                old_path = raw_path,
+                new_path = %resolved.display(),
+                "Normalized @tenant-service-announce prompt path"
+            );
+            args.insert("prompt".to_string(), serde_json::Value::String(new_prompt));
+        }
+        return;
+    }
+
     // Walk up to find the job root (first ancestor that contains job.json).
     let mut dir = Some(resolved.as_path());
     while let Some(d) = dir {
@@ -4850,6 +4859,22 @@ fn maybe_normalize_tenant_service_announce_cron_prompt(
         }
         dir = d.parent();
     }
+}
+
+fn resolve_tenant_service_announce_prompt_candidate(
+    raw_path: &str,
+    workspace_dir: Option<&Path>,
+) -> Option<std::path::PathBuf> {
+    let candidate = std::path::Path::new(raw_path);
+    if candidate.is_absolute() {
+        if let Some(ws) = workspace_dir {
+            if let Ok(relative) = candidate.strip_prefix("/tenant-app") {
+                return Some(ws.join("tenant-app").join(relative));
+            }
+        }
+        return Some(candidate.to_path_buf());
+    }
+    workspace_dir.map(|ws| ws.join(candidate))
 }
 
 fn latest_user_message_batch_multiplier(history: &[ChatMessage]) -> usize {
@@ -8139,6 +8164,50 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
+    }
+
+    #[test]
+    fn maybe_normalize_tenant_service_announce_cron_prompt_maps_tenant_app_alias() {
+        let tmp = tempdir().unwrap();
+        let job_root = tmp.path().join("tenant-app/server/jobs/sample");
+        std::fs::create_dir_all(&job_root).unwrap();
+        std::fs::write(job_root.join("job.json"), "{}").unwrap();
+
+        let mut args = serde_json::json!({
+            "prompt": "@tenant-service-announce /tenant-app/server/jobs/sample"
+        });
+
+        maybe_normalize_tenant_service_announce_cron_prompt(
+            "cron_add",
+            &mut args,
+            Some(tmp.path()),
+        );
+
+        assert_eq!(
+            args["prompt"],
+            serde_json::json!(format!(
+                "@tenant-service-announce {}",
+                job_root.join("announce_prompt.txt").display()
+            ))
+        );
+
+        let mut file_args = serde_json::json!({
+            "prompt": "@tenant-service-announce /tenant-app/server/jobs/sample/announce_prompt.txt"
+        });
+
+        maybe_normalize_tenant_service_announce_cron_prompt(
+            "cron_add",
+            &mut file_args,
+            Some(tmp.path()),
+        );
+
+        assert_eq!(
+            file_args["prompt"],
+            serde_json::json!(format!(
+                "@tenant-service-announce {}",
+                job_root.join("announce_prompt.txt").display()
+            ))
+        );
     }
 
     #[tokio::test]
