@@ -707,34 +707,48 @@ impl DelegateTool {
 
         let effective_max_iterations = (agent_config.max_iterations * iterations_multiplier).min(100);
 
-        let mut history = Vec::new();
-        if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
-            history.push(ChatMessage::system(system_prompt.clone()));
-        }
-
-        // Pre-load skills declared in agent config — eliminates bootstrap read_skill calls.
-        if !agent_config.skills.is_empty() {
+        let agent_skills: Vec<crate::skills::Skill> = if !agent_config.skills.is_empty() {
             if let Some(workspace_dir) = &self.workspace_dir {
-                let loaded_skills = crate::skills::load_skills_with_open_skills_settings(
+                let loaded = crate::skills::load_skills_with_open_skills_settings(
                     workspace_dir,
                     self.open_skills_enabled,
                     self.open_skills_dir.as_deref(),
                 );
-                for skill_name in &agent_config.skills {
-                    if let Some(skill) = loaded_skills
-                        .iter()
-                        .find(|s| s.name.eq_ignore_ascii_case(skill_name))
-                    {
-                        if let Some(location) = skill.location.as_ref() {
-                            if let Ok(content) = std::fs::read_to_string(location) {
-                                history.push(ChatMessage::system(format!(
-                                    "[Skill: {skill_name}]\n{content}"
-                                )));
-                            }
-                        }
+                agent_config
+                    .skills
+                    .iter()
+                    .filter_map(|name| {
+                        loaded
+                            .iter()
+                            .find(|s| s.name.eq_ignore_ascii_case(name))
+                            .cloned()
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        let mut history = Vec::new();
+        if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
+            let mut content = system_prompt.clone();
+            if !agent_skills.is_empty() {
+                if let Some(workspace_dir) = &self.workspace_dir {
+                    let skills_section = crate::skills::skills_to_prompt_with_mode(
+                        &agent_skills,
+                        workspace_dir,
+                        crate::config::SkillsPromptInjectionMode::Compact,
+                    );
+                    if !skills_section.is_empty() {
+                        content.push('\n');
+                        content.push('\n');
+                        content.push_str(&skills_section);
                     }
                 }
             }
+            history.push(ChatMessage::system(content));
         }
 
         // Pre-load workspace files declared in agent config — eliminates bootstrap file_read calls.
@@ -830,9 +844,9 @@ impl DelegateTool {
                     provider,
                     &mut history,
                     &sub_tools,
-                    &[],
+                    &agent_skills,
                     None,
-                    crate::config::SkillsPromptInjectionMode::Full,
+                    crate::config::SkillsPromptInjectionMode::Compact,
                     &noop_observer,
                     &agent_config.provider,
                     &agent_config.model,
