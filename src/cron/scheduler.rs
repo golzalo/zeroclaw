@@ -258,9 +258,8 @@ async fn run_agent_job(
             .clone()
             .unwrap_or_else(|| "gpt-5.1".to_string())
     });
-    let mut run_config = config.clone();
+    let run_config = configure_agent_job_run(config, job, model_name.clone());
     let run_temperature = run_config.default_temperature;
-    run_config.default_model = Some(model_name.clone());
 
     if job.model.as_deref() != selected_model.as_deref() {
         let _ = update_job(
@@ -355,6 +354,7 @@ async fn run_agent_job(
                     "requestCount": report.usage.request_count,
                     "promptComponents": report.usage.prompt_components,
                     "requests": report.usage.requests,
+                    "toolFailures": &report.tool_failures,
                 });
                 if let Err(error) = remote_budget
                     .consume_text_quote(
@@ -374,6 +374,9 @@ async fn run_agent_job(
                 {
                     tracing::warn!(job_id = %job.id, error = %error, "Cron remote budget consume failed");
                 }
+            }
+            if let Some(reason) = hard_agent_tool_failure(&report) {
+                return (false, format!("agent job failed: {reason}"));
             }
             let normalized_output = match normalize_tenant_service_cron_output(
                 config,
@@ -858,6 +861,30 @@ fn estimate_cron_input_tokens(prompt: &str) -> u64 {
     }
 }
 
+fn configure_agent_job_run(config: &Config, job: &CronJob, model_name: String) -> Config {
+    let mut run_config = config.clone();
+    run_config.default_model = Some(model_name);
+
+    if job.allowed_tools.is_some() {
+        // A cron job's explicit allowlist is its execution contract. Do not
+        // intersect it with the interactive main-agent allowlist, which may be
+        // intentionally narrower.
+        run_config.agent.allowed_tools.clear();
+    }
+
+    run_config
+}
+
+fn hard_agent_tool_failure(
+    report: &crate::agent::loop_::ProcessMessageReport,
+) -> Option<String> {
+    report
+        .tool_failures
+        .iter()
+        .find(|failure| failure.contains("Unknown tool:"))
+        .cloned()
+}
+
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
@@ -868,7 +895,12 @@ async fn persist_job_result(
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
 
-    if let Err(e) = deliver_if_configured(config, job, output).await {
+    if !success && output.contains("Unknown tool:") {
+        tracing::warn!(
+            job_id = %job.id,
+            "Skipping cron delivery because the agent failed before completing its tool contract"
+        );
+    } else if let Err(e) = deliver_if_configured(config, job, output).await {
         if job.delivery.best_effort {
             tracing::warn!("Cron delivery failed (best_effort): {e}");
         } else {
@@ -1852,6 +1884,36 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn cron_agent_explicit_tools_are_not_intersected_with_main_allowlist() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.agent.allowed_tools = vec!["memory_recall".into()];
+
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.allowed_tools = Some(vec!["shell".into()]);
+
+        let run_config = configure_agent_job_run(&config, &job, "gpt-test".into());
+
+        assert!(run_config.agent.allowed_tools.is_empty());
+        assert_eq!(run_config.default_model.as_deref(), Some("gpt-test"));
+    }
+
+    #[test]
+    fn hard_agent_tool_failure_detects_unknown_tool() {
+        let report = crate::agent::loop_::ProcessMessageReport {
+            output: "I could not complete that.".into(),
+            tool_failures: vec!["shell: Unknown tool: shell".into()],
+            usage: crate::agent::loop_::UsageSummary::default(),
+        };
+
+        assert_eq!(
+            hard_agent_tool_failure(&report).as_deref(),
+            Some("shell: Unknown tool: shell")
+        );
     }
 
     #[tokio::test]

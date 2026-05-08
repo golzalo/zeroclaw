@@ -184,6 +184,8 @@ pub struct UsageSummary {
 pub struct ProcessMessageReport {
     pub output: String,
     pub usage: UsageSummary,
+    #[serde(default)]
+    pub tool_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -215,6 +217,7 @@ pub(crate) struct AgentTurnOutcome {
     pub(crate) output: String,
     pub(crate) continuation: Option<ContinuationCheckpoint>,
     pub(crate) requests: Vec<LlmCallUsage>,
+    pub(crate) tool_failures: Vec<String>,
 }
 
 struct SingleTurnExecution {
@@ -1272,6 +1275,7 @@ pub(crate) async fn maybe_auto_continue_delegate(
             output: checkpoint.user_message.clone(),
             continuation: Some(checkpoint),
             requests: vec![],
+            tool_failures: vec![],
         }));
     }
 
@@ -2024,6 +2028,9 @@ fn extract_artifact_references(text: &str) -> Vec<String> {
         if normalized_candidate.is_empty() {
             continue;
         }
+        if !looks_like_artifact_path_reference(normalized_candidate) {
+            continue;
+        }
         if !looks_like_artifact_reference(normalized_candidate) {
             continue;
         }
@@ -2071,6 +2078,23 @@ fn strip_artifact_marker_prefix(candidate: &str) -> &str {
     }
 
     candidate
+}
+
+fn looks_like_artifact_path_reference(candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate.contains('=') {
+        return false;
+    }
+
+    candidate.starts_with('/')
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+        || candidate.starts_with("~/")
+        || candidate.starts_with("workspace/")
+        || candidate.starts_with("outbox/")
+        || candidate.starts_with("attachments/")
+        || candidate.contains('/')
+        || candidate.contains('\\')
 }
 
 fn looks_like_artifact_reference(candidate: &str) -> bool {
@@ -5389,6 +5413,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut scheduled_delivery_verified = false;
     let mut side_effect_claims = SideEffectClaimTracker::default();
     let mut requests = Vec::new();
+    let mut tool_failures = Vec::new();
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -5900,6 +5925,7 @@ pub(crate) async fn run_tool_call_loop(
                 output: display_text,
                 continuation: None,
                 requests,
+                tool_failures,
             });
         }
 
@@ -6241,6 +6267,13 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            if !outcome.success {
+                let reason = outcome
+                    .error_reason
+                    .clone()
+                    .unwrap_or_else(|| outcome.output.clone());
+                tool_failures.push(format!("{tool_name}: {}", scrub_credentials(&reason)));
+            }
             let (compact_output, delegate_checkpoint) = normalize_tool_output_for_history(
                 &tool_name,
                 &outcome.output,
@@ -6390,6 +6423,7 @@ pub(crate) async fn run_tool_call_loop(
                 output: checkpoint.user_message.clone(),
                 continuation: Some(checkpoint),
                 requests,
+                tool_failures,
             });
         }
     }
@@ -6524,10 +6558,12 @@ pub(crate) async fn run_tool_call_loop(
         ))
         .await?;
         requests.append(&mut resumed.requests);
+        tool_failures.append(&mut resumed.tool_failures);
         return Ok(AgentTurnOutcome {
             output: resumed.output,
             continuation: resumed.continuation,
             requests,
+            tool_failures,
         });
     }
 
@@ -6540,6 +6576,7 @@ pub(crate) async fn run_tool_call_loop(
         output: checkpoint.user_message.clone(),
         continuation: Some(checkpoint),
         requests,
+        tool_failures,
     })
 }
 
@@ -7710,6 +7747,7 @@ async fn run_single_turn_with_report(
 
     Ok(ProcessMessageReport {
         output: outcome.output,
+        tool_failures: outcome.tool_failures,
         usage: UsageSummary {
             request_count: outcome.requests.len(),
             input_tokens,
@@ -8078,6 +8116,7 @@ pub async fn process_message(
 
     Ok(ProcessMessageReport {
         output: outcome.output,
+        tool_failures: outcome.tool_failures,
         usage: UsageSummary {
             request_count: outcome.requests.len(),
             input_tokens,
@@ -8146,6 +8185,42 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn artifact_reference_extraction_ignores_remote_provider_filenames() {
+        let output = r#"PROVIDER_RESULT:
+STATUS: done
+PROVIDER: google
+SERVICE: drive
+AUTH_STATUS: connected
+EVIDENCE:
+- fileId=abc name=lanacion-news-csv.csv
+- fileId=def name=README.md
+USER_MESSAGE:
+Encontré estos 5 archivos en Google Drive:
+1. zeroclaw-multifile-demo
+2. lanacion-news-csv.csv
+3. README.md
+4. archivo_a_disponibilidad_staff.csv
+"#;
+
+        assert!(extract_artifact_references(output).is_empty());
+    }
+
+    #[test]
+    fn artifact_reference_extraction_keeps_explicit_paths_and_markers() {
+        let output = "Listo [DOCUMENT:/tmp/report.pdf] y tambien outbox/documents/data.csv";
+
+        let references = extract_artifact_references(output);
+
+        assert_eq!(
+            references,
+            vec![
+                "/tmp/report.pdf".to_string(),
+                "outbox/documents/data.csv".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn scrub_credentials_redacts_bearer_token() {

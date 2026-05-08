@@ -1061,6 +1061,7 @@ async fn run_gateway_chat_simple(
 
     Ok(crate::agent::loop_::ProcessMessageReport {
         output: response.text_or_empty().to_string(),
+        tool_failures: vec![],
         usage: crate::agent::loop_::UsageSummary {
             request_count: 1,
             input_tokens,

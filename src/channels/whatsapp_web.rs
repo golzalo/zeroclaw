@@ -3633,7 +3633,11 @@ impl WhatsAppWebChannel {
                     Some(WhatsAppAttachment { kind, target })
                 })
                 .or_else(|| {
-                    let normalized = Self::normalize_marker_path(marker.trim())?;
+                    let marker = marker.trim();
+                    if !Self::looks_like_attachment_path_reference(marker) {
+                        return None;
+                    }
+                    let normalized = Self::normalize_marker_path(marker)?;
                     let kind = Self::infer_attachment_kind_from_target(&normalized)?;
                     let target = Self::resolve_attachment_target(&normalized, &kind)?;
                     Some(WhatsAppAttachment { kind, target })
@@ -3663,6 +3667,26 @@ impl WhatsAppWebChannel {
             || trimmed.contains("[VOICE:")
             || trimmed.contains("<artifact")
             || trimmed.starts_with("![")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn looks_like_attachment_path_reference(candidate: &str) -> bool {
+        let candidate = candidate.trim();
+        if candidate.is_empty() || candidate.contains('=') {
+            return false;
+        }
+
+        candidate.starts_with('/')
+            || candidate.starts_with("./")
+            || candidate.starts_with("../")
+            || candidate.starts_with("~/")
+            || candidate.starts_with("workspace/")
+            || candidate.starts_with("outbox/")
+            || candidate.starts_with("attachments/")
+            || candidate.contains('/')
+            || candidate.contains('\\')
+            || Self::is_http_url(candidate)
+            || candidate.starts_with("data:")
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -7460,6 +7484,27 @@ mod tests {
         let (cleaned, attachments) = WhatsAppWebChannel::extract_outgoing_attachments(message);
         assert_eq!(cleaned, message);
         assert!(attachments.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_extract_outgoing_attachments_keeps_bracketed_remote_filenames_in_text() {
+        let _guard = env_lock().lock().unwrap();
+        let workspace = std::env::temp_dir().join("zeroclaw_whatsapp_remote_filename_list");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let readme = workspace.join("README.md");
+        std::fs::write(&readme, b"dummy").unwrap();
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace);
+
+        let message = "Archivos remotos:\n1. [README.md]\n2. [lanacion-news-csv.csv]";
+        let (cleaned, attachments) = WhatsAppWebChannel::extract_outgoing_attachments(message);
+
+        assert_eq!(cleaned, message);
+        assert!(attachments.is_empty());
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        let _ = std::fs::remove_file(&readme);
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
