@@ -5433,7 +5433,7 @@ impl Channel for WhatsAppWebChannel {
                                     self_phone.as_deref(),
                                     &official_group_jid,
                                 );
-                                let runtime_channel = if sender_is_owner {
+                                let runtime_channel = if sender_is_owner && !direct_objective_policy_active {
                                     super::WHATSAPP_MAIN_RUNTIME_CHANNEL
                                 } else {
                                     super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
