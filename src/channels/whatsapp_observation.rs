@@ -71,6 +71,8 @@ pub struct ObservedGroupConfig {
     #[serde(default)]
     pub procedure_input_schema: Option<String>,
     #[serde(default)]
+    pub procedure_input_contract: Option<String>,
+    #[serde(default)]
     pub procedure_sop: Option<String>,
     #[serde(default)]
     pub canonical_phone: Option<String>,
@@ -369,6 +371,7 @@ impl WhatsAppObservationService {
                 procedure_job_slug: None,
                 procedure_summary: None,
                 procedure_input_schema: None,
+                procedure_input_contract: None,
                 procedure_sop: None,
                 canonical_phone: None,
                 rotate_after_bytes: default_rotate_after_bytes(),
@@ -527,6 +530,7 @@ impl WhatsAppObservationService {
                 procedure_job_slug: None,
                 procedure_summary: None,
                 procedure_input_schema: None,
+                procedure_input_contract: None,
                 procedure_sop: None,
                 canonical_phone: canonical_phone.clone(),
                 rotate_after_bytes: default_rotate_after_bytes(),
@@ -1427,6 +1431,7 @@ impl WhatsAppObservationService {
             entry.procedure_job_slug = None;
             entry.procedure_summary = None;
             entry.procedure_input_schema = None;
+            entry.procedure_input_contract = None;
             entry.procedure_sop = None;
         }
 
@@ -1451,6 +1456,10 @@ impl WhatsAppObservationService {
                 .and_then(Self::normalize_optional_text);
             entry.procedure_input_schema = procedure
                 .procedure_input_schema
+                .as_deref()
+                .and_then(Self::normalize_optional_text);
+            entry.procedure_input_contract = procedure
+                .procedure_input_contract
                 .as_deref()
                 .and_then(Self::normalize_optional_text);
             entry.procedure_sop = procedure
@@ -2295,6 +2304,7 @@ mod tests {
                         procedure_job_slug: None,
                         procedure_summary: None,
                         procedure_input_schema: None,
+                        procedure_input_contract: None,
                         procedure_sop: None,
                         canonical_phone: Some("+5491134115686".to_string()),
                         rotate_after_bytes: 1024,
@@ -2322,6 +2332,7 @@ mod tests {
                         procedure_job_slug: None,
                         procedure_summary: None,
                         procedure_input_schema: None,
+                        procedure_input_contract: None,
                         procedure_sop: None,
                         canonical_phone: Some("+5491134115686".to_string()),
                         rotate_after_bytes: 1024,

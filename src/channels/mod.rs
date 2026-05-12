@@ -1185,6 +1185,19 @@ fn build_channel_system_prompt(
                                 "\n\nProcedure input schema:\n{input_schema}"
                             ));
                         }
+                        if let Some(input_contract) = policy
+                            .procedure_input_contract
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            procedure_context.push_str(&format!(
+                                "\n\nProcedure input/output contract:\n{input_contract}"
+                            ));
+                            procedure_context.push_str(
+                                "\n\nBefore calling the procedure, validate the current turn against this contract. If required current-turn inputs are missing or invalid, do not call the procedure; reply with the contract's requested correction or missing-input message.",
+                            );
+                        }
                         if let Some(sop) = policy
                             .procedure_sop
                             .as_deref()
@@ -4183,6 +4196,7 @@ async fn process_channel_message(
                 msg.channel.as_str(),
                 Some(msg.reply_target.as_str()),
                 &ctx.multimodal,
+                ctx.reliability.as_ref(),
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx.clone(),
@@ -9534,6 +9548,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     procedure_input_schema: Some(
                         "{\"type\":\"object\",\"additionalProperties\":true}".to_string(),
                     ),
+                    procedure_input_contract: Some(
+                        "Only call the procedure when the current turn contains valid spend data; otherwise ask for the missing spend details.".to_string(),
+                    ),
                     procedure_sop: Some(
                         "Extract only valid spend data and call the bound procedure.".to_string(),
                     ),
@@ -9555,6 +9572,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("bound on-demand tenant job `spend-guard`"));
         assert!(prompt.contains("whatsapp_run_policy_procedure"));
         assert!(prompt.contains("Procedure input schema:"));
+        assert!(prompt.contains("Procedure input/output contract:"));
+        assert!(prompt.contains("validate the current turn against this contract"));
         assert!(prompt.contains("Procedure SOP:"));
         assert!(!prompt.contains("Conversation skill instructions:"));
     }
@@ -9576,6 +9595,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     procedure_summary: Some("Validates spend messages".to_string()),
                     procedure_input_schema: Some(
                         "{\"type\":\"object\",\"additionalProperties\":true}".to_string(),
+                    ),
+                    procedure_input_contract: Some(
+                        "Only call the procedure when the current turn contains valid spend data; otherwise ask for the missing spend details.".to_string(),
                     ),
                     procedure_sop: Some(
                         "Extract valid data and call the bound procedure.".to_string(),

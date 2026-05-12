@@ -1,8 +1,11 @@
-use crate::config::{build_runtime_proxy_client_with_timeouts, MultimodalConfig};
-use crate::providers::ChatMessage;
+use crate::config::{build_runtime_proxy_client_with_timeouts, MultimodalConfig, ReliabilityConfig};
+use crate::providers::{self, ChatMessage, ChatRequest};
+use crate::remote_budget::RemoteBudgetClient;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use std::path::Path;
+use std::time::Instant;
+use uuid::Uuid;
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
@@ -95,6 +98,205 @@ pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
 
 pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
+}
+
+pub async fn preprocess_images_to_text_context(
+    messages: &mut Vec<ChatMessage>,
+    config: &MultimodalConfig,
+    reliability: &ReliabilityConfig,
+    workspace_dir: Option<&Path>,
+) -> anyhow::Result<bool> {
+    if !config.processor.enabled || !contains_image_markers(messages) {
+        return Ok(false);
+    }
+
+    let provider = providers::create_resilient_provider(
+        config.processor.provider.trim(),
+        None,
+        None,
+        reliability,
+    )?;
+    if !provider.supports_vision() {
+        anyhow::bail!(
+            "multimodal processor provider '{}' does not support vision input",
+            config.processor.provider
+        );
+    }
+
+    let processor_system = load_processor_prompt(config, workspace_dir);
+
+    let mut changed = false;
+    let mut next_messages = Vec::with_capacity(messages.len());
+
+    for message in messages.iter() {
+        if message.role != "user" {
+            next_messages.push(message.clone());
+            continue;
+        }
+
+        let (cleaned_text, image_refs) = parse_image_markers(&message.content);
+        if image_refs.is_empty() {
+            next_messages.push(message.clone());
+            continue;
+        }
+
+        let request_text = if cleaned_text.trim().is_empty() {
+            "The user sent image attachment(s) without additional text."
+        } else {
+            cleaned_text.trim()
+        };
+        let vision_prompt = format!(
+            "User request:\n{request_text}\n\nImage attachment(s):\n{}",
+            image_refs
+                .iter()
+                .map(|reference| format!("[IMAGE:{reference}]"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let vision_messages = vec![
+            ChatMessage::system(processor_system.clone()),
+            ChatMessage::user(vision_prompt),
+        ];
+        let prepared = prepare_messages_for_provider(&vision_messages, config).await?;
+        let estimated_input_tokens = prepared
+            .messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>()
+            .div_ceil(4) as u64;
+        let estimated_output_tokens = 1024;
+        let budget_client = RemoteBudgetClient::from_env();
+        let budget_quote_id = if let Some(remote_budget) = budget_client.as_ref() {
+            let check = remote_budget
+                .check_text_quote(
+                    None,
+                    "multimodal_processor",
+                    config.processor.provider.trim(),
+                    config.processor.model.trim(),
+                    estimated_input_tokens,
+                    estimated_output_tokens,
+                    serde_json::json!({
+                        "component": "multimodal_processor",
+                        "mode": config.processor.mode.trim(),
+                        "imageCount": image_refs.len(),
+                    }),
+                )
+                .await?;
+            if !check.allowed {
+                anyhow::bail!(
+                    "multimodal processor budget check denied: {}",
+                    check.reason.unwrap_or_else(|| "budget exhausted".to_string())
+                );
+            }
+            check.quote_id
+        } else {
+            None
+        };
+
+        let started_at = Instant::now();
+        let response = provider
+            .chat(
+                ChatRequest {
+                    messages: &prepared.messages,
+                    tools: None,
+                },
+                config.processor.model.trim(),
+                config.processor.temperature,
+            )
+            .await?;
+        if let Some(remote_budget) = budget_client.as_ref() {
+            let input_tokens = response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.input_tokens)
+                .unwrap_or(estimated_input_tokens);
+            let output_tokens = response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens)
+                .unwrap_or_else(|| response.text_or_empty().chars().count().div_ceil(4) as u64);
+            let cached_input_tokens = response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.cached_input_tokens)
+                .unwrap_or(0);
+            #[allow(clippy::cast_possible_truncation)]
+            if let Err(error) = remote_budget
+                .consume_text_quote(
+                    None,
+                    &format!("multimodal-processor-{}", Uuid::new_v4()),
+                    budget_quote_id.as_deref(),
+                    "multimodal_processor",
+                    config.processor.provider.trim(),
+                    config.processor.model.trim(),
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    started_at.elapsed().as_millis() as u64,
+                    serde_json::json!({
+                        "component": "multimodal_processor",
+                        "mode": config.processor.mode.trim(),
+                        "imageCount": image_refs.len(),
+                    }),
+                )
+                .await
+            {
+                tracing::warn!("failed to consume multimodal processor budget: {error}");
+            }
+        }
+        let analysis = response.text_or_empty().trim();
+        let sources = if config.processor.include_image_paths {
+            format!(
+                "\nSources:\n{}",
+                image_refs
+                    .iter()
+                    .map(|reference| format!("- {reference}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        } else {
+            String::new()
+        };
+        let analysis = if analysis.is_empty() {
+            r#"{"schema_version":"visual_analysis.v1","visual_summary":"","extracted_text":"","structured_data":{"document_type":"unknown","fields":{},"tables":[],"line_items":[],"entities":[],"totals":{},"dates":[],"identifiers":[]},"uncertainties":["The visual processor returned no analysis."],"action_context":"","images":[]}"#.to_string()
+        } else {
+            analysis.to_string()
+        };
+
+        next_messages.push(ChatMessage {
+            role: message.role.clone(),
+            content: format!(
+                "{request_text}\n\n[Image analysis]\nSchema: visual_analysis.v1\nProcessor: {}/{}\nMode: {}\n{sources}\nVisualAnalysisV1:\n{analysis}\n[/Image analysis]",
+                config.processor.provider.trim(),
+                config.processor.model.trim(),
+                config.processor.mode.trim()
+            ),
+        });
+        changed = true;
+    }
+
+    if changed {
+        *messages = next_messages;
+    }
+
+    Ok(changed)
+}
+
+fn load_processor_prompt(config: &MultimodalConfig, workspace_dir: Option<&Path>) -> String {
+    if let Some(workspace_dir) = workspace_dir {
+        let prompt_file = config.processor.prompt_file.trim();
+        if !prompt_file.is_empty() {
+            let path = workspace_dir.join(prompt_file);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+
+    r#"Analyze the supplied image(s) in the context of the user's text request. Return ONLY valid JSON with schema_version "visual_analysis.v1" for a text-only agent that may execute tools."#.to_string()
 }
 
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
@@ -507,6 +709,7 @@ mod tests {
             max_images: 1,
             max_image_size_mb: 5,
             allow_remote_fetch: false,
+            processor: Default::default(),
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
@@ -549,6 +752,7 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            processor: Default::default(),
         };
 
         let error = prepare_messages_for_provider(&messages, &config)

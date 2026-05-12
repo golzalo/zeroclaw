@@ -82,6 +82,7 @@ pub struct ConversationProcedureMetadata {
     pub procedure_job_slug: Option<String>,
     pub procedure_summary: Option<String>,
     pub procedure_input_schema: Option<String>,
+    pub procedure_input_contract: Option<String>,
     pub procedure_sop: Option<String>,
     pub clear_procedure: bool,
 }

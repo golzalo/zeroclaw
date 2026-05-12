@@ -33,6 +33,7 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+const REPEATED_TOOL_FAILURE_LIMIT: usize = 2;
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -4679,6 +4680,7 @@ pub(crate) async fn agent_turn(
         channel_name,
         channel_reply_target,
         multimodal_config,
+        &crate::config::ReliabilityConfig::default(),
         max_tool_iterations,
         None,
         None,
@@ -5363,6 +5365,7 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     channel_reply_target: Option<&str>,
     multimodal_config: &crate::config::MultimodalConfig,
+    reliability_config: &crate::config::ReliabilityConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
@@ -5408,15 +5411,34 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
+    if multimodal::contains_image_markers(history) && multimodal_config.processor.enabled {
+        let processed = multimodal::preprocess_images_to_text_context(
+            history,
+            multimodal_config,
+            reliability_config,
+            workspace_dir,
+        )
+        .await?;
+        if processed {
+            tracing::info!(
+                provider = multimodal_config.processor.provider.as_str(),
+                model = multimodal_config.processor.model.as_str(),
+                "Preprocessed image attachments into text context"
+            );
+        }
+    }
+
     let turn_id = Uuid::new_v4().to_string();
     let mut scheduled_delivery_created = false;
     let mut scheduled_delivery_verified = false;
     let mut side_effect_claims = SideEffectClaimTracker::default();
     let mut requests = Vec::new();
     let mut tool_failures = Vec::new();
+    let mut repeated_tool_failures: HashMap<(String, String, String), usize> = HashMap::new();
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+        let mut repeated_failure_blocker: Option<String> = None;
 
         if cancellation_token
             .as_ref()
@@ -6233,6 +6255,50 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
 
+            if !outcome.success && repeated_failure_blocker.is_none() {
+                let reason = outcome
+                    .error_reason
+                    .clone()
+                    .unwrap_or_else(|| outcome.output.clone());
+                let safe_reason = scrub_credentials(&reason);
+                let (tool, args) = tool_call_signature(&call.name, &call.arguments);
+                let failure_count = repeated_tool_failures
+                    .entry((tool.clone(), args, safe_reason.clone()))
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+
+                if *failure_count >= REPEATED_TOOL_FAILURE_LIMIT {
+                    let prefers_spanish = prefers_spanish_for_user_message(history, None, None);
+                    let message = if prefers_spanish {
+                        format!(
+                            "No pude continuar porque la herramienta `{}` falló {} veces con el mismo error: {}. Corté los reintentos para evitar un loop y gasto innecesario.",
+                            call.name, *failure_count, safe_reason
+                        )
+                    } else {
+                        format!(
+                            "I couldn't continue because tool `{}` failed {} times with the same error: {}. I stopped retrying to avoid a loop and unnecessary spend.",
+                            call.name, *failure_count, safe_reason
+                        )
+                    };
+
+                    runtime_trace::record_event(
+                        "tool_loop_repeated_failure_guard",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some(&safe_reason),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "tool": tool,
+                            "failure_count": *failure_count,
+                        }),
+                    );
+                    repeated_failure_blocker = Some(message);
+                }
+            }
+
             // ── Hook: after_tool_call (void) ─────────────────
             if let Some(hooks) = hooks {
                 let tool_result_obj = crate::tools::ToolResult {
@@ -6322,6 +6388,29 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        if let Some(blocker) = repeated_failure_blocker {
+            runtime_trace::record_event(
+                "turn_final_response",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(&turn_id),
+                Some(false),
+                Some("repeated tool failure guard stopped the tool loop"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "text": scrub_credentials(&blocker),
+                }),
+            );
+            history.push(ChatMessage::assistant(blocker.clone()));
+            return Ok(AgentTurnOutcome {
+                output: blocker,
+                continuation: None,
+                requests,
+                tool_failures,
+            });
         }
 
         // A model switch can be requested by a tool in the same batch as file
@@ -6544,6 +6633,7 @@ pub(crate) async fn run_tool_call_loop(
             channel_name,
             channel_reply_target,
             multimodal_config,
+            reliability_config,
             max_tool_iterations,
             cancellation_token,
             on_delta,
@@ -6994,6 +7084,7 @@ pub async fn run(
                 channel_name,
                 None,
                 &config.multimodal,
+                &config.reliability,
                 config.agent.max_tool_iterations,
                 None,
                 None,
@@ -7243,6 +7334,7 @@ pub async fn run(
                     channel_name,
                     None,
                     &config.multimodal,
+                    &config.reliability,
                     config.agent.max_tool_iterations,
                     None,
                     None,
@@ -7672,6 +7764,7 @@ async fn run_single_turn_with_report(
             "daemon",
             None,
             &config.multimodal,
+            &config.reliability,
             config.agent.max_tool_iterations,
             None,
             None,
@@ -8077,6 +8170,7 @@ pub async fn process_message(
         "daemon",
         None,
         &config.multimodal,
+        &config.reliability,
         config.agent.max_tool_iterations,
         None,
         None,
@@ -8519,6 +8613,54 @@ Encontré estos 5 archivos en Google Drive:
         }
     }
 
+    struct CountingFailingTool {
+        name: String,
+        invocations: Arc<AtomicUsize>,
+        error: String,
+    }
+
+    impl CountingFailingTool {
+        fn new(name: &str, invocations: Arc<AtomicUsize>, error: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                invocations,
+                error: error.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingFailingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Fails deterministically for loop guard tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.error.clone()),
+            })
+        }
+    }
+
     struct RecordingArgsTool {
         name: String,
         recorded_args: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -8799,6 +8941,7 @@ Encontré estos 5 archivos en Google Drive:
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            processor: Default::default(),
         };
 
         let err = run_tool_call_loop(
@@ -9563,6 +9706,69 @@ Encontré estos 5 archivos en Google Drive:
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_after_repeated_identical_tool_failures() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"failing_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"failing_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "should not be requested",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingFailingTool::new(
+            "failing_tool",
+            Arc::clone(&invocations),
+            "action budget exhausted",
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run failing tool"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            10,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("loop should return a blocker after repeated identical failures");
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        assert!(result
+            .output
+            .contains("I couldn't continue because tool `failing_tool` failed 2 times"));
+        assert!(result.output.contains("action budget exhausted"));
     }
 
     #[tokio::test]
