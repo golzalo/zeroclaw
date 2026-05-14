@@ -105,6 +105,82 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
         || lowered.starts_with("[heartbeat task")
         || lowered.starts_with("[distilled_")
         || lowered.contains("distilled_index_sig:")
+        || lowered.contains("[image:")
+        || lowered.contains("[image:data:")
+        || lowered.contains("[document:data:")
+        || lowered.contains("[video:data:")
+        || lowered.contains("[audio:data:")
+        || lowered.contains("[voice:data:")
+        || lowered.contains("data:image/")
+        || lowered.contains("data:audio/")
+        || lowered.contains("data:video/")
+        || lowered.contains("data:application/pdf")
+}
+
+/// Prepare recalled conversation memory for prompt injection.
+///
+/// Raw media payloads are useful in the original turn, but re-injecting them
+/// from memory can make later text or voice turns look like they contain an old
+/// attachment. Keep the textual hint and redact inline data URIs.
+pub fn sanitize_recalled_context_content(content: &str) -> Option<String> {
+    if should_skip_autosave_content(content) {
+        return None;
+    }
+
+    let redacted = redact_recalled_data_uri_markers(content);
+    let trimmed = redacted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(truncate_recalled_context(trimmed, 800))
+}
+
+fn redact_recalled_data_uri_markers(content: &str) -> String {
+    let mut output = content.to_string();
+    for (marker, replacement) in [
+        ("[IMAGE:data:", "[IMAGE:previous-media-redacted]"),
+        ("[DOCUMENT:data:", "[DOCUMENT:previous-media-redacted]"),
+        ("[VIDEO:data:", "[VIDEO:previous-media-redacted]"),
+        ("[AUDIO:data:", "[AUDIO:previous-media-redacted]"),
+        ("[VOICE:data:", "[VOICE:previous-media-redacted]"),
+    ] {
+        output = redact_marker_prefix(&output, marker, replacement);
+    }
+    output
+}
+
+fn redact_marker_prefix(content: &str, marker: &str, replacement: &str) -> String {
+    let mut result = String::new();
+    let mut rest = content;
+
+    while let Some(start) = rest.find(marker) {
+        result.push_str(&rest[..start]);
+        result.push_str(replacement);
+        let after_marker = &rest[start + marker.len()..];
+        match after_marker.find(']') {
+            Some(end) => {
+                rest = &after_marker[end + 1..];
+            }
+            None => {
+                rest = "";
+            }
+        }
+    }
+
+    result.push_str(rest);
+    result
+}
+
+fn truncate_recalled_context(value: &str, max_chars: usize) -> String {
+    let mut result = String::new();
+    for ch in value.chars().take(max_chars) {
+        result.push(ch);
+    }
+    if value.chars().count() > max_chars {
+        result.push_str("...");
+    }
+    result
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -479,9 +555,36 @@ mod tests {
         assert!(should_skip_autosave_content(
             "[Heartbeat Task | high] Execute scheduled patrol"
         ));
+        assert!(should_skip_autosave_content(
+            "Que ves?\n[IMAGE:data:image/jpeg;base64,abc]"
+        ));
+        assert!(should_skip_autosave_content(
+            "Que ves?\n[IMAGE:/zeroclaw-data/workspace/attachments/mobile/photo.jpg]"
+        ));
         assert!(!should_skip_autosave_content(
             "User prefers concise answers."
         ));
+    }
+
+    #[test]
+    fn recalled_context_sanitizer_redacts_inline_data_uri_media() {
+        let sanitized = redact_recalled_data_uri_markers(
+            "Que ves?\n[IMAGE:data:image/jpeg;base64,abcdef==]\nGracias",
+        );
+
+        assert!(sanitized.contains("Que ves?"));
+        assert!(sanitized.contains("[IMAGE:previous-media-redacted]"));
+        assert!(sanitized.contains("Gracias"));
+        assert!(!sanitized.contains("abcdef"));
+    }
+
+    #[test]
+    fn recalled_context_sanitizer_truncates_large_entries() {
+        let large = "a".repeat(900);
+        let sanitized = sanitize_recalled_context_content(&large).unwrap();
+
+        assert!(sanitized.chars().count() <= 803);
+        assert!(sanitized.ends_with("..."));
     }
 
     #[test]

@@ -4339,6 +4339,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             .then(|| pair_phone.trim().to_string()),
                         pair_code: (!pair_code.trim().is_empty())
                             .then(|| pair_code.trim().to_string()),
+                        pair_code_enabled: true,
                         allowed_numbers,
                         allow_self_chat: false,
                         allow_direct_messages: true,
@@ -4443,6 +4444,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     session_path: None,
                     pair_phone: None,
                     pair_code: None,
+                    pair_code_enabled: true,
                     allowed_numbers,
                     allow_self_chat: false,
                     allow_direct_messages: true,

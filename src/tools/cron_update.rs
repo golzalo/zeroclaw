@@ -151,7 +151,7 @@ impl Tool for CronUpdateTool {
                                 },
                                 "channel": {
                                     "type": "string",
-                                    "enum": ["telegram", "discord", "whatsapp", "slack", "mattermost", "matrix"],
+                                    "enum": ["telegram", "discord", "whatsapp", "slack", "mattermost", "matrix", "mobile"],
                                     "description": "Channel type to deliver output to"
                                 },
                                 "to": {

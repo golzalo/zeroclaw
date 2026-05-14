@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct RuntimeWebhookContext {
     #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub reply_target: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
     pub recent_inbound_messages: Vec<RuntimeContextMessage>,
 }
 

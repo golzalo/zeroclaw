@@ -249,6 +249,17 @@ async fn run_agent_job(
             Ok(prompt) => prompt,
             Err(error) => return (false, error),
         };
+
+    if let Some(output) = deterministic_announcement_output(job, &resolved_prompt) {
+        tracing::trace!(
+            job_id = %job.id,
+            job_name = %name,
+            output_len = output.len(),
+            "Cron reminder will be delivered without agent context"
+        );
+        return (true, output);
+    }
+
     let prompt = resolved_prompt.prompt.clone();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let selected_model = resolve_cron_model(config, job.model.as_deref());
@@ -432,6 +443,96 @@ async fn resolve_agent_job_prompt(
     Ok(ResolvedAgentJobPrompt {
         prompt: trimmed.to_string(),
         tenant_service,
+    })
+}
+
+fn deterministic_announcement_output(
+    job: &CronJob,
+    resolved_prompt: &ResolvedAgentJobPrompt,
+) -> Option<String> {
+    if !job.delivery.mode.eq_ignore_ascii_case("announce") {
+        return None;
+    }
+    if has_tenant_service_metadata(&resolved_prompt.tenant_service) {
+        return None;
+    }
+    normalize_plain_reminder_prompt(&resolved_prompt.prompt)
+}
+
+fn has_tenant_service_metadata(metadata: &TenantServiceCronMetadata) -> bool {
+    metadata.kind.is_some()
+        || metadata.prompt_file.is_some()
+        || metadata.run_command.is_some()
+        || metadata.delivery_command.is_some()
+}
+
+fn normalize_plain_reminder_prompt(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 500 {
+        return None;
+    }
+    if trimmed.lines().count() > 3 {
+        return None;
+    }
+
+    let lowered = trimmed.to_lowercase();
+    if lowered.contains("<tool")
+        || lowered.contains("@tenant-service")
+        || lowered.contains("@file")
+        || lowered.contains("http://")
+        || lowered.contains("https://")
+    {
+        return None;
+    }
+
+    let looks_like_reminder = [
+        "recordatorio",
+        "reminder",
+        "recuerda",
+        "recordame",
+        "acordame",
+        "avisame",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    if !looks_like_reminder {
+        return None;
+    }
+
+    let mut body = trimmed;
+    for prefix in [
+        WHATSAPP_REMINDER_PREFIX,
+        "*REMINDER:*",
+        "REMINDER:",
+        "Reminder:",
+        "reminder:",
+        "Recordatorio:",
+        "recordatorio:",
+        "Recordatorio -",
+        "recordatorio -",
+        "Recuerda que",
+        "recuerda que",
+        "Recordame que",
+        "recordame que",
+        "Acordame que",
+        "acordame que",
+        "Avisame que",
+        "avisame que",
+    ] {
+        if let Some(rest) = body.strip_prefix(prefix) {
+            body = rest.trim();
+            break;
+        }
+    }
+
+    let body = body
+        .trim_start_matches([':', '-', ' ', '\t'])
+        .trim()
+        .to_string();
+    Some(if body.is_empty() {
+        trimmed.to_string()
+    } else {
+        body
     })
 }
 
@@ -1116,6 +1217,9 @@ pub(crate) async fn deliver_announcement(
                 .send(&SendMessage::new(&delivered_output, target))
                 .await?;
         }
+        "mobile" => {
+            deliver_mobile_announcement(target, &delivered_output).await?;
+        }
         "mattermost" => {
             let mm = config
                 .channels_config
@@ -1183,6 +1287,55 @@ pub(crate) async fn deliver_announcement(
     }
 
     Ok(())
+}
+
+async fn deliver_mobile_announcement(target: &str, output: &str) -> Result<()> {
+    let api_base_url = std::env::var("AGENTS_API_BASE_URL")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if api_base_url.is_empty() {
+        anyhow::bail!("AGENTS_API_BASE_URL is required for mobile cron delivery");
+    }
+
+    let actor_id = std::env::var("OWNER_ACTOR_ID")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let instance_id = std::env::var("INSTANCE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let api_token = std::env::var("ZEROCLAW_REMOTE_BUDGET_API_TOKEN")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let url = format!(
+        "{}/internal/mobile/announcements",
+        api_base_url.trim_end_matches('/')
+    );
+    let mut request = reqwest::Client::new().post(url).json(&json!({
+        "to": target,
+        "conversationId": target,
+        "actorId": actor_id,
+        "instanceId": instance_id,
+        "text": output,
+    }));
+    if !api_token.is_empty() {
+        request = request.bearer_auth(api_token);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| anyhow::anyhow!("mobile delivery request failed: {err}"))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    anyhow::bail!("mobile delivery failed ({status}): {body}");
 }
 
 fn apply_reminder_prefix(output: &str) -> String {
@@ -1934,6 +2087,66 @@ mod tests {
         let resolved = resolve_cron_model(&config, Some("gpt-5.1"));
 
         assert_eq!(resolved.as_deref(), Some("gpt-5.1"));
+    }
+
+    #[test]
+    fn deterministic_announcement_output_extracts_plain_reminder_text() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("mobile".into()),
+            to: Some("mobile:mob-test".into()),
+            best_effort: true,
+        };
+        let resolved = ResolvedAgentJobPrompt {
+            prompt: "Recordatorio: ¡Es hora de tomar agua!".into(),
+            tenant_service: TenantServiceCronMetadata::default(),
+        };
+
+        assert_eq!(
+            deterministic_announcement_output(&job, &resolved).as_deref(),
+            Some("¡Es hora de tomar agua!")
+        );
+    }
+
+    #[test]
+    fn deterministic_announcement_output_keeps_tenant_service_on_agent_path() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("mobile".into()),
+            to: Some("mobile:mob-test".into()),
+            best_effort: true,
+        };
+        let resolved = ResolvedAgentJobPrompt {
+            prompt: "Recordatorio: revisar novedades".into(),
+            tenant_service: TenantServiceCronMetadata {
+                kind: Some(TenantServiceCronKind::Announce),
+                ..TenantServiceCronMetadata::default()
+            },
+        };
+
+        assert!(deterministic_announcement_output(&job, &resolved).is_none());
+    }
+
+    #[test]
+    fn deterministic_announcement_output_ignores_non_reminder_agent_jobs() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("mobile".into()),
+            to: Some("mobile:mob-test".into()),
+            best_effort: true,
+        };
+        let resolved = ResolvedAgentJobPrompt {
+            prompt: "Go to Infobae and scrape 3 headlines".into(),
+            tenant_service: TenantServiceCronMetadata::default(),
+        };
+
+        assert!(deterministic_announcement_output(&job, &resolved).is_none());
     }
 
     #[tokio::test]

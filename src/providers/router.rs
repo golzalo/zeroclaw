@@ -16,6 +16,7 @@ pub struct Route {
 /// The model parameter can be:
 /// - A regular model name (e.g. "anthropic/claude-sonnet-4") → uses default provider
 /// - A hint-prefixed string (e.g. "hint:reasoning") → resolves via route table
+/// - A preset alias (e.g. "@preset/main") → resolves via route table
 ///
 /// This wraps multiple pre-created providers and selects the right one per request.
 pub struct RouterProvider {
@@ -71,11 +72,11 @@ impl RouterProvider {
 
     /// Resolve a model parameter to a (provider, actual_model) pair.
     ///
-    /// If the model starts with "hint:", look up the hint in the route table.
+    /// If the model starts with "hint:" or "@preset/", look up the hint in the route table.
     /// Otherwise, use the default provider with the given model name.
     /// Resolve a model parameter to a (provider_index, actual_model) pair.
     fn resolve(&self, model: &str) -> (usize, String) {
-        if let Some(hint) = model.strip_prefix("hint:") {
+        if let Some(hint) = Self::route_hint(model) {
             if let Some((idx, resolved_model)) = self.routes.get(hint) {
                 return (*idx, resolved_model.clone());
             }
@@ -87,6 +88,11 @@ impl RouterProvider {
 
         // Not a hint or hint not found — use default provider with the model as-is
         (self.default_index, model.to_string())
+    }
+
+    fn route_hint(model: &str) -> Option<&str> {
+        model.strip_prefix("hint:")
+            .or_else(|| model.strip_prefix("@preset/"))
     }
 }
 
@@ -362,6 +368,40 @@ mod tests {
         let (idx, model) = router.resolve("hint:reasoning");
         assert_eq!(idx, 1);
         assert_eq!(model, "claude-opus");
+    }
+
+    #[test]
+    fn resolve_strips_preset_prefix() {
+        let (router, _) = make_router(
+            vec![("openrouter", "ok")],
+            vec![("main", "openrouter", "google/gemini-2.5-flash")],
+        );
+
+        let (idx, model) = router.resolve("@preset/main");
+        assert_eq!(idx, 0);
+        assert_eq!(model, "google/gemini-2.5-flash");
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_routes_preset_correctly() {
+        let (router, mocks) = make_router(
+            vec![("openrouter", "preset-tool")],
+            vec![("main", "openrouter", "google/gemini-2.5-flash")],
+        );
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "read this media".to_string(),
+        }];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "test"}})];
+
+        let result = router
+            .chat_with_tools(&messages, &tools, "@preset/main", 0.5)
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("preset-tool"));
+        assert_eq!(mocks[0].call_count(), 1);
+        assert_eq!(mocks[0].last_model(), "google/gemini-2.5-flash");
     }
 
     #[test]

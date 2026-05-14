@@ -968,7 +968,9 @@ fn strip_tool_call_tags(message: &str) -> String {
             continue;
         }
 
-        kept_segments.push(remaining[start..].to_string());
+        // A dangling tool-call opener is still protocol output, not user-facing
+        // text. Drop it so the delivery layer can fall back safely instead of
+        // leaking raw `<tool_call>` into chat channels.
         remaining = "";
         break;
     }
@@ -1014,7 +1016,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
-fn build_channel_system_prompt(
+pub(crate) fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
     reply_target: &str,
@@ -5624,6 +5626,7 @@ fn collect_configured_channels(
                                 wa.session_path.clone().unwrap_or_default(),
                                 wa.pair_phone.clone(),
                                 wa.pair_code.clone(),
+                                wa.pair_code_enabled,
                                 wa.allowed_numbers.clone(),
                                 wa.allow_self_chat,
                                 wa.allow_direct_messages,
@@ -10925,6 +10928,15 @@ This is an example JSON object for profile settings."#;
             r#"{"name":"mock_price","parameters":{"symbol":"BTC"}}"#,
             &tools,
         );
+
+        assert_eq!(result, MALFORMED_CHANNEL_REPLY_FALLBACK);
+    }
+
+    #[test]
+    fn prepare_channel_delivery_response_falls_back_for_dangling_tool_call_tag() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        let result = prepare_channel_delivery_response("<tool_call>", &tools);
 
         assert_eq!(result, MALFORMED_CHANNEL_REPLY_FALLBACK);
     }

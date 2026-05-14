@@ -488,6 +488,8 @@ pub struct WhatsAppWebChannel {
     pair_phone: Option<String>,
     /// Custom pair code (optional)
     pair_code: Option<String>,
+    /// Whether pair-code requests should be made when pair_phone is set.
+    pair_code_enabled: bool,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
     /// Whether the self chat / "Note to Self" thread is allowed.
@@ -548,6 +550,7 @@ impl WhatsAppWebChannel {
         session_path: String,
         pair_phone: Option<String>,
         pair_code: Option<String>,
+        pair_code_enabled: bool,
         allowed_numbers: Vec<String>,
         allow_self_chat: bool,
         allow_direct_messages: bool,
@@ -558,6 +561,7 @@ impl WhatsAppWebChannel {
             session_path,
             pair_phone,
             pair_code,
+            pair_code_enabled,
             allowed_numbers,
             allow_self_chat,
             allow_direct_messages,
@@ -4866,6 +4870,7 @@ impl Channel for WhatsAppWebChannel {
             let allow_direct_messages = self.allow_direct_messages;
             let allow_group_messages = self.allow_group_messages;
             let self_phone = self.self_phone.clone();
+            let pair_code_mode = self.pair_phone.is_some() && self.pair_code_enabled;
             let bootstrap_group_done = self.bootstrap_group_done.clone();
             let degraded_self_chat_mode = self.degraded_self_chat_mode.clone();
             let official_group_jid = self.official_group_jid.clone();
@@ -4902,6 +4907,7 @@ impl Channel for WhatsAppWebChannel {
                     let pairing_generation = pairing_generation_clone.clone();
                     let transcription_config = transcription_config.clone();
                     let self_phone = self_phone.clone();
+                    let pair_code_mode = pair_code_mode;
                     let bootstrap_group_done = bootstrap_group_done.clone();
                     let degraded_self_chat_mode = degraded_self_chat_mode.clone();
                     let official_group_jid = official_group_jid.clone();
@@ -5608,12 +5614,27 @@ impl Channel for WhatsAppWebChannel {
                                 eprintln!();
                                 eprintln!("WhatsApp Web pair code: {code}");
                                 eprintln!();
-                                WhatsAppWebChannel::schedule_pairing_watchdog(
-                                    logout_tx.clone(),
-                                    session_revoked.clone(),
-                                    currently_connected.clone(),
-                                    pairing_generation.clone(),
-                                    generation,
+                                if pair_code_mode {
+                                    tracing::info!(
+                                        "WhatsApp Web pair code received; skipping automatic watchdog restart in pair-code mode"
+                                    );
+                                } else {
+                                    WhatsAppWebChannel::schedule_pairing_watchdog(
+                                        logout_tx.clone(),
+                                        session_revoked.clone(),
+                                        currently_connected.clone(),
+                                        pairing_generation.clone(),
+                                        generation,
+                                    );
+                                }
+                            }
+                            Event::PairError(pair_error) => {
+                                currently_connected
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                tracing::warn!(
+                                    error = %pair_error.error,
+                                    platform = %pair_error.platform,
+                                    "WhatsApp Web pair-code request failed; QR remains available as fallback"
                                 );
                             }
                             Event::PairingQrCode { code, .. } => {
@@ -5633,6 +5654,7 @@ impl Channel for WhatsAppWebChannel {
                                             "WhatsApp Web QR code (scan in WhatsApp > Linked Devices):"
                                         );
                                         eprintln!("{rendered}");
+                                        eprintln!("WhatsApp Web QR payload: {code}");
                                         eprintln!();
                                     }
                                     Err(err) => {
@@ -5645,21 +5667,33 @@ impl Channel for WhatsAppWebChannel {
                                         eprintln!();
                                     }
                                 }
-                                WhatsAppWebChannel::schedule_pairing_watchdog(
-                                    logout_tx.clone(),
-                                    session_revoked.clone(),
-                                    currently_connected.clone(),
-                                    pairing_generation.clone(),
-                                    generation,
-                                );
+                                if pair_code_mode {
+                                    tracing::info!(
+                                        "WhatsApp Web QR fallback received while pair-code mode is active; skipping QR watchdog restart"
+                                    );
+                                } else {
+                                    WhatsAppWebChannel::schedule_pairing_watchdog(
+                                        logout_tx.clone(),
+                                        session_revoked.clone(),
+                                        currently_connected.clone(),
+                                        pairing_generation.clone(),
+                                        generation,
+                                    );
+                                }
                             }
                             _ => {}
                         }
                     }
                 });
 
-            // Configure pair-code flow when a phone number is provided.
+            // Configure pair-code flow before the bot starts so wa-rs requests
+            // the code as the primary pairing mode instead of rotating QR first.
             if let Some(ref phone) = self.pair_phone {
+                if !self.pair_code_enabled {
+                    tracing::info!(
+                        "WhatsApp Web: pair-code flow disabled for configured phone; QR pairing remains enabled"
+                    );
+                } else {
                 tracing::info!("WhatsApp Web: pair-code flow enabled for configured phone number");
                 builder = builder.with_pair_code(PairCodeOptions {
                     phone_number: phone.clone(),
@@ -5668,6 +5702,7 @@ impl Channel for WhatsAppWebChannel {
                     platform_display: "S86".to_string(),
                     ..Default::default()
                 });
+                }
             } else if self.pair_code.is_some() {
                 tracing::warn!(
                     "WhatsApp Web: pair_code is set but pair_phone is missing; pair code config is ignored"
@@ -5675,7 +5710,8 @@ impl Channel for WhatsAppWebChannel {
             }
 
             let mut bot = builder.build().await?;
-            *self.client.lock() = Some(bot.client());
+            let bot_client = bot.client();
+            *self.client.lock() = Some(bot_client.clone());
 
             // Run the bot
             let bot_handle = bot.run().await?;
@@ -5930,6 +5966,7 @@ mod tests {
             "/tmp/test-whatsapp.db".into(),
             Some("1234567890".into()),
             None,
+            true,
             vec!["+1234567890".into()],
             false,
             true,
@@ -5965,6 +6002,7 @@ mod tests {
             "/tmp/test.db".into(),
             None,
             None,
+            true,
             vec!["*".into()],
             false,
             true,
@@ -5978,7 +6016,7 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
         let ch =
-            WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![], false, true, true);
+            WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, true, vec![], false, true, true);
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }

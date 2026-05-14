@@ -58,7 +58,7 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, WhatsApp, Slack, Mattermost, Matrix), set \
+         To deliver output to a channel (Discord, Telegram, WhatsApp, Slack, Mattermost, Matrix, Mobile), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
@@ -146,7 +146,7 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "whatsapp", "slack", "mattermost", "matrix"],
+                            "enum": ["telegram", "discord", "whatsapp", "slack", "mattermost", "matrix", "mobile"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
@@ -183,7 +183,7 @@ impl Tool for CronAddTool {
         }
 
         let schedule = match args.get("schedule") {
-            Some(v) => match deserialize_maybe_stringified::<Schedule>(v) {
+            Some(v) => match parse_schedule_arg(v) {
                 Ok(schedule) => schedule,
                 Err(e) => {
                     return Ok(ToolResult {
@@ -399,12 +399,89 @@ impl Tool for CronAddTool {
     }
 }
 
+fn parse_schedule_arg(v: &serde_json::Value) -> Result<Schedule, serde_json::Error> {
+    if let Some(schedule) = v.as_str().and_then(parse_schedule_string) {
+        return Ok(schedule);
+    }
+    deserialize_maybe_stringified::<Schedule>(v)
+}
+
+fn parse_schedule_string(raw: &str) -> Option<Schedule> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return None;
+    }
+
+    if let Some(every_ms) = parse_every_schedule_ms(trimmed) {
+        return Some(Schedule::Every { every_ms });
+    }
+
+    if looks_like_cron_expression(trimmed) {
+        return Some(Schedule::Cron {
+            expr: trimmed.to_string(),
+            tz: None,
+        });
+    }
+
+    None
+}
+
+fn parse_every_schedule_ms(raw: &str) -> Option<u64> {
+    let normalized = raw.to_lowercase();
+    let tokens: Vec<&str> = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+    let quantity_index = tokens.iter().position(|part| part.parse::<u64>().is_ok())?;
+    let quantity = tokens[quantity_index].parse::<u64>().ok()?;
+    let unit = tokens.get(quantity_index + 1).copied().unwrap_or("");
+    let multiplier = match unit {
+        "ms" | "millisecond" | "milliseconds" | "milisegundo" | "milisegundos" => 1,
+        "s" | "sec" | "secs" | "second" | "seconds" | "segundo" | "segundos" => 1_000,
+        "m" | "min" | "mins" | "minute" | "minutes" | "minuto" | "minutos" => 60_000,
+        "h" | "hr" | "hrs" | "hour" | "hours" | "hora" | "horas" => 3_600_000,
+        "d" | "day" | "days" | "dia" | "dias" | "día" | "días" => 86_400_000,
+        _ => return None,
+    };
+    quantity.checked_mul(multiplier)
+}
+
+fn looks_like_cron_expression(raw: &str) -> bool {
+    let fields: Vec<&str> = raw.split_whitespace().collect();
+    fields.len() == 5
+        && fields.iter().all(|field| {
+            !field.is_empty()
+                && field.chars().all(|ch| {
+                    ch.is_ascii_digit()
+                        || matches!(ch, '*' | '/' | ',' | '-' | '?' | 'L' | 'W' | '#')
+                })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
+
+    #[test]
+    fn parse_schedule_arg_accepts_cron_string() {
+        let schedule = parse_schedule_arg(&serde_json::json!("*/4 * * * *")).unwrap();
+        assert!(matches!(schedule, Schedule::Cron { ref expr, .. } if expr == "*/4 * * * *"));
+    }
+
+    #[test]
+    fn parse_schedule_arg_accepts_every_string() {
+        let schedule = parse_schedule_arg(&serde_json::json!("every 5 minutes")).unwrap();
+        assert!(matches!(schedule, Schedule::Every { every_ms: 300_000 }));
+    }
+
+    #[test]
+    fn parse_schedule_arg_accepts_spanish_every_string() {
+        let schedule = parse_schedule_arg(&serde_json::json!("cada 2 horas")).unwrap();
+        assert!(matches!(schedule, Schedule::Every { every_ms: 7_200_000 }));
+    }
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {

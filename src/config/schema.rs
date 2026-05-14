@@ -5063,6 +5063,10 @@ pub struct WhatsAppConfig {
     /// Leave empty to let WhatsApp generate one
     #[serde(default)]
     pub pair_code: Option<String>,
+    /// Enable pair-code requests when pair_phone is set.
+    /// Disable to preserve phone identity while using QR-only pairing.
+    #[serde(default = "default_true")]
+    pub pair_code_enabled: bool,
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
@@ -10058,6 +10062,7 @@ channel_id = "C123"
             session_path: None,
             pair_phone: None,
             pair_code: None,
+            pair_code_enabled: true,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
             allow_self_chat: false,
             allow_direct_messages: true,
@@ -10081,6 +10086,7 @@ channel_id = "C123"
             session_path: None,
             pair_phone: None,
             pair_code: None,
+            pair_code_enabled: true,
             allowed_numbers: vec!["+1".into()],
             allow_self_chat: false,
             allow_direct_messages: true,
@@ -10112,6 +10118,7 @@ channel_id = "C123"
             session_path: None,
             pair_phone: None,
             pair_code: None,
+            pair_code_enabled: true,
             allowed_numbers: vec!["*".into()],
             allow_self_chat: false,
             allow_direct_messages: true,
@@ -10132,6 +10139,7 @@ channel_id = "C123"
             session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
             pair_phone: None,
             pair_code: None,
+            pair_code_enabled: true,
             allowed_numbers: vec!["+1".into()],
             allow_self_chat: false,
             allow_direct_messages: true,
@@ -10151,6 +10159,7 @@ channel_id = "C123"
             session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
             pair_phone: None,
             pair_code: None,
+            pair_code_enabled: true,
             allowed_numbers: vec![],
             allow_self_chat: false,
             allow_direct_messages: true,
@@ -10180,6 +10189,7 @@ channel_id = "C123"
                 session_path: None,
                 pair_phone: None,
                 pair_code: None,
+                pair_code_enabled: true,
                 allowed_numbers: vec!["+1".into()],
                 allow_self_chat: false,
                 allow_direct_messages: true,
@@ -10226,6 +10236,7 @@ channel_id = "C123"
             session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
             pair_phone: None,
             pair_code: None,
+            pair_code_enabled: true,
             allowed_numbers: vec!["+1".into()],
             allow_self_chat: true,
             allow_direct_messages: false,

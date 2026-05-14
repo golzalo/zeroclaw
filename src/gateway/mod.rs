@@ -1103,14 +1103,75 @@ async fn run_gateway_chat_with_tools(
     runtime_context: Option<&crate::channels::runtime_router::RuntimeWebhookContext>,
 ) -> anyhow::Result<crate::agent::loop_::ProcessMessageReport> {
     let config = state.config.lock().clone();
-    let _ = runtime_context;
-    Box::pin(crate::agent::process_message(
+    let channel_name = runtime_context
+        .and_then(|context| context.channel.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("daemon");
+    let channel_reply_target = runtime_context
+        .and_then(|context| context.reply_target.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let enriched_message = enrich_webhook_message_with_recent_context(message, runtime_context);
+    Box::pin(crate::agent::loop_::process_message_for_channel(
         config,
-        message,
+        &enriched_message,
         session_id,
         None,
+        channel_name,
+        channel_reply_target,
     ))
     .await
+}
+
+fn enrich_webhook_message_with_recent_context(
+    message: &str,
+    runtime_context: Option<&crate::channels::runtime_router::RuntimeWebhookContext>,
+) -> String {
+    let Some(context) = runtime_context else {
+        return message.to_string();
+    };
+
+    let recent = context
+        .recent_inbound_messages
+        .iter()
+        .filter_map(|item| {
+            let text = item.text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let ts = item.ts.as_deref().unwrap_or("").trim();
+            let sender = item.sender.as_deref().unwrap_or("").trim();
+            let prefix = match (ts.is_empty(), sender.is_empty()) {
+                (true, true) => "-".to_string(),
+                (false, true) => format!("- {ts}:"),
+                (true, false) => format!("- {sender}:"),
+                (false, false) => format!("- {ts} {sender}:"),
+            };
+            Some(format!("{prefix} {}", truncate_context_text(text, 500)))
+        })
+        .collect::<Vec<_>>();
+
+    if recent.is_empty() {
+        return message.to_string();
+    }
+
+    format!(
+        "[Recent messages in this same conversation, oldest first. Background only: use them only when the current message is a follow-up, clarification, or explicit continuation.]\n{}\n\n[Current message]\n{}",
+        recent.join("\n"),
+        message.trim()
+    )
+}
+
+fn truncate_context_text(value: &str, max_chars: usize) -> String {
+    let mut result = String::new();
+    for ch in value.chars().take(max_chars) {
+        result.push(ch);
+    }
+    if value.chars().count() > max_chars {
+        result.push_str("...");
+    }
+    result
 }
 
 fn effective_webhook_agentic(webhook_body: &WebhookBody) -> bool {
@@ -2394,6 +2455,36 @@ mod tests {
         assert_eq!(
             runtime_context.recent_inbound_messages[0].text,
             "quiero una web inspirada en www.super86.app"
+        );
+    }
+
+    #[test]
+    fn webhook_recent_context_enriches_message() {
+        let context = crate::channels::runtime_router::RuntimeWebhookContext {
+            recent_inbound_messages: vec![crate::channels::runtime_router::RuntimeContextMessage {
+                ts: Some("2026-05-13T01:20:51Z".to_string()),
+                text: "Sabes como le fue a Medvedev ayer? en ATP Roma!".to_string(),
+                from: Some("mobile:owner:space:tenis".to_string()),
+                sender: Some("mob_123".to_string()),
+            }],
+            ..Default::default()
+        };
+
+        let enriched = enrich_webhook_message_with_recent_context("10x", Some(&context));
+
+        assert!(enriched.contains("Recent messages in this same conversation"));
+        assert!(enriched.contains("Background only"));
+        assert!(enriched.contains("Medvedev"));
+        assert!(enriched.contains("[Current message]\n10x"));
+    }
+
+    #[test]
+    fn webhook_recent_context_keeps_message_when_empty() {
+        let context = crate::channels::runtime_router::RuntimeWebhookContext::default();
+
+        assert_eq!(
+            enrich_webhook_message_with_recent_context("hola", Some(&context)),
+            "hola"
         );
     }
 

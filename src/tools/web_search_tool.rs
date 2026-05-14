@@ -134,7 +134,34 @@ impl WebSearchTool {
         }
 
         let html = response.text().await?;
-        self.parse_duckduckgo_results(&html, query)
+        let parsed = self.parse_duckduckgo_results(&html, query)?;
+        if parsed.starts_with("No results found for:") {
+            return self.search_duckduckgo_lite(query).await;
+        }
+
+        Ok(parsed)
+    }
+
+    async fn search_duckduckgo_lite(&self, query: &str) -> anyhow::Result<String> {
+        let encoded_query = urlencoding::encode(query);
+        let search_url = format!("https://lite.duckduckgo.com/lite/?q={}", encoded_query);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()?;
+
+        let response = client.get(&search_url).send().await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "DuckDuckGo Lite search failed with status: {}",
+                response.status()
+            );
+        }
+
+        let html = response.text().await?;
+        self.parse_duckduckgo_lite_results(&html, query)
     }
 
     fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
@@ -173,6 +200,49 @@ impl WebSearchTool {
             lines.push(format!("   {}", url_str.trim()));
 
             // Add snippet if available
+            if i < snippet_matches.len() {
+                let snippet = strip_tags(&snippet_matches[i][1]);
+                let snippet = snippet.trim();
+                if !snippet.is_empty() {
+                    lines.push(format!("   {}", snippet));
+                }
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    fn parse_duckduckgo_lite_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
+        let link_regex = Regex::new(
+            r#"<a[^>]*class=['"][^'"]*result-link[^'"]*['"][^>]*href=['"]([^'"]+)['"][^>]*>([\s\S]*?)</a>"#,
+        )?;
+        let snippet_regex =
+            Regex::new(r#"<td[^>]*class=['"][^'"]*result-snippet[^'"]*['"][^>]*>([\s\S]*?)</td>"#)?;
+
+        let link_matches: Vec<_> = link_regex
+            .captures_iter(html)
+            .take(self.max_results + 2)
+            .collect();
+        let snippet_matches: Vec<_> = snippet_regex
+            .captures_iter(html)
+            .take(self.max_results + 2)
+            .collect();
+
+        if link_matches.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via DuckDuckGo Lite)", query)];
+        let count = link_matches.len().min(self.max_results);
+
+        for i in 0..count {
+            let caps = &link_matches[i];
+            let url_str = decode_ddg_redirect_url(&caps[1]);
+            let title = strip_tags(&caps[2]);
+
+            lines.push(format!("{}. {}", i + 1, title.trim()));
+            lines.push(format!("   {}", url_str.trim()));
+
             if i < snippet_matches.len() {
                 let snippet = strip_tags(&snippet_matches[i][1]);
                 let snippet = snippet.trim();
@@ -262,7 +332,17 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
 
 fn strip_tags(content: &str) -> String {
     let re = Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(content, "").to_string()
+    decode_basic_html_entities(&re.replace_all(content, ""))
+}
+
+fn decode_basic_html_entities(content: &str) -> String {
+    content
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 #[async_trait]
@@ -366,6 +446,21 @@ mod tests {
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("Example Title"));
         assert!(result.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_parse_duckduckgo_lite_results_with_data() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let html = r#"
+            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.atptour.com%2Fen%2Ftournaments%2Frome%2F416%2Foverview&amp;rut=abc" class='result-link'>ATP Masters 1000 Rome | Overview | ATP Tour | Tennis</a>
+            <td class='result-snippet'>Official tennis tournament profile of <b>ATP</b> Masters 1000 Rome.</td>
+        "#;
+        let result = tool.parse_duckduckgo_lite_results(html, "ATP Roma 2026").unwrap();
+        assert!(result.contains("DuckDuckGo Lite"));
+        assert!(result.contains("ATP Masters 1000 Rome"));
+        assert!(result.contains("https://www.atptour.com/en/tournaments/rome/416/overview"));
+        assert!(result.contains("Official tennis tournament profile"));
+        assert!(!result.contains("rut=abc"));
     }
 
     #[test]

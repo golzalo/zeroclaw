@@ -794,11 +794,15 @@ pub fn all_tools_with_runtime(
         api_path: root_config.api_path.clone(),
     };
 
-    let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
+    let delegate_handle: Option<DelegateParentToolsHandle> = if agents
+        .iter()
+        .all(|(name, _)| is_internal_runtime_agent(name))
+    {
         None
     } else {
         let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
             .iter()
+            .filter(|(name, _)| !is_internal_runtime_agent(name))
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
         let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
@@ -900,6 +904,10 @@ pub fn all_tools_with_runtime(
     }
 
     (boxed_registry_from_arcs(tool_arcs), delegate_handle)
+}
+
+fn is_internal_runtime_agent(name: &str) -> bool {
+    matches!(name.trim(), "whatsapp_third_party")
 }
 
 #[cfg(test)]
@@ -1181,6 +1189,59 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
+    }
+
+    #[test]
+    fn all_tools_excludes_delegate_when_only_internal_runtime_agents_are_configured() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "whatsapp_third_party".to_string(),
+            DelegateAgentConfig {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills: Vec::new(),
+                context_files: Vec::new(),
+            },
+        );
+
+        let (tools, _) = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &agents,
+            Some("delegate-test-credential"),
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"delegate"));
     }
 
     #[test]
