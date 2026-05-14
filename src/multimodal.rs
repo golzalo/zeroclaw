@@ -3,11 +3,13 @@ use crate::providers::{self, ChatMessage, ChatRequest};
 use crate::remote_budget::RemoteBudgetClient;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
+use serde_json::{json, Map, Value};
 use std::path::Path;
 use std::time::Instant;
 use uuid::Uuid;
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
+const VISUAL_ANALYSIS_SCHEMA_VERSION: &str = "visual_analysis.v1";
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -110,21 +112,6 @@ pub async fn preprocess_images_to_text_context(
         return Ok(false);
     }
 
-    let provider = providers::create_resilient_provider(
-        config.processor.provider.trim(),
-        None,
-        None,
-        reliability,
-    )?;
-    if !provider.supports_vision() {
-        anyhow::bail!(
-            "multimodal processor provider '{}' does not support vision input",
-            config.processor.provider
-        );
-    }
-
-    let processor_system = load_processor_prompt(config, workspace_dir);
-
     let mut changed = false;
     let mut next_messages = Vec::with_capacity(messages.len());
 
@@ -145,106 +132,13 @@ pub async fn preprocess_images_to_text_context(
         } else {
             cleaned_text.trim()
         };
-        let vision_prompt = format!(
-            "User request:\n{request_text}\n\nImage attachment(s):\n{}",
-            image_refs
-                .iter()
-                .map(|reference| format!("[IMAGE:{reference}]"))
-                .collect::<Vec<_>>()
-                .join("\n")
+        let analysis = analyze_image_refs_to_visual_analysis(
+            request_text,
+            &image_refs,
+            config,
+            reliability,
+            workspace_dir,
         );
-        let vision_messages = vec![
-            ChatMessage::system(processor_system.clone()),
-            ChatMessage::user(vision_prompt),
-        ];
-        let prepared = prepare_messages_for_provider(&vision_messages, config).await?;
-        let estimated_input_tokens = prepared
-            .messages
-            .iter()
-            .map(|message| message.content.chars().count())
-            .sum::<usize>()
-            .div_ceil(4) as u64;
-        let estimated_output_tokens = 1024;
-        let budget_client = RemoteBudgetClient::from_env();
-        let budget_quote_id = if let Some(remote_budget) = budget_client.as_ref() {
-            let check = remote_budget
-                .check_text_quote(
-                    None,
-                    "multimodal_processor",
-                    config.processor.provider.trim(),
-                    config.processor.model.trim(),
-                    estimated_input_tokens,
-                    estimated_output_tokens,
-                    serde_json::json!({
-                        "component": "multimodal_processor",
-                        "mode": config.processor.mode.trim(),
-                        "imageCount": image_refs.len(),
-                    }),
-                )
-                .await?;
-            if !check.allowed {
-                anyhow::bail!(
-                    "multimodal processor budget check denied: {}",
-                    check.reason.unwrap_or_else(|| "budget exhausted".to_string())
-                );
-            }
-            check.quote_id
-        } else {
-            None
-        };
-
-        let started_at = Instant::now();
-        let response = provider
-            .chat(
-                ChatRequest {
-                    messages: &prepared.messages,
-                    tools: None,
-                },
-                config.processor.model.trim(),
-                config.processor.temperature,
-            )
-            .await?;
-        if let Some(remote_budget) = budget_client.as_ref() {
-            let input_tokens = response
-                .usage
-                .as_ref()
-                .and_then(|usage| usage.input_tokens)
-                .unwrap_or(estimated_input_tokens);
-            let output_tokens = response
-                .usage
-                .as_ref()
-                .and_then(|usage| usage.output_tokens)
-                .unwrap_or_else(|| response.text_or_empty().chars().count().div_ceil(4) as u64);
-            let cached_input_tokens = response
-                .usage
-                .as_ref()
-                .and_then(|usage| usage.cached_input_tokens)
-                .unwrap_or(0);
-            #[allow(clippy::cast_possible_truncation)]
-            if let Err(error) = remote_budget
-                .consume_text_quote(
-                    None,
-                    &format!("multimodal-processor-{}", Uuid::new_v4()),
-                    budget_quote_id.as_deref(),
-                    "multimodal_processor",
-                    config.processor.provider.trim(),
-                    config.processor.model.trim(),
-                    input_tokens,
-                    output_tokens,
-                    cached_input_tokens,
-                    started_at.elapsed().as_millis() as u64,
-                    serde_json::json!({
-                        "component": "multimodal_processor",
-                        "mode": config.processor.mode.trim(),
-                        "imageCount": image_refs.len(),
-                    }),
-                )
-                .await
-            {
-                tracing::warn!("failed to consume multimodal processor budget: {error}");
-            }
-        }
-        let analysis = response.text_or_empty().trim();
         let sources = if config.processor.include_image_paths {
             format!(
                 "\nSources:\n{}",
@@ -257,11 +151,7 @@ pub async fn preprocess_images_to_text_context(
         } else {
             String::new()
         };
-        let analysis = if analysis.is_empty() {
-            r#"{"schema_version":"visual_analysis.v1","visual_summary":"","extracted_text":"","structured_data":{"document_type":"unknown","fields":{},"tables":[],"line_items":[],"entities":[],"totals":{},"dates":[],"identifiers":[]},"uncertainties":["The visual processor returned no analysis."],"action_context":"","images":[]}"#.to_string()
-        } else {
-            analysis.to_string()
-        };
+        let analysis = analysis.await?;
 
         next_messages.push(ChatMessage {
             role: message.role.clone(),
@@ -280,6 +170,470 @@ pub async fn preprocess_images_to_text_context(
     }
 
     Ok(changed)
+}
+
+pub async fn analyze_image_refs_to_visual_analysis(
+    request_text: &str,
+    image_refs: &[String],
+    config: &MultimodalConfig,
+    reliability: &ReliabilityConfig,
+    workspace_dir: Option<&Path>,
+) -> anyhow::Result<String> {
+    if !config.processor.enabled {
+        anyhow::bail!("multimodal processor is disabled");
+    }
+    if image_refs.is_empty() {
+        anyhow::bail!("no image refs provided for visual_analysis.v1");
+    }
+
+    let provider = providers::create_resilient_provider(
+        config.processor.provider.trim(),
+        None,
+        None,
+        reliability,
+    )?;
+    if !provider.supports_vision() {
+        anyhow::bail!(
+            "multimodal processor provider '{}' does not support vision input",
+            config.processor.provider
+        );
+    }
+
+    let processor_system = load_processor_prompt(config, workspace_dir);
+    let resolved_refs = image_refs
+        .iter()
+        .map(|reference| resolve_workspace_image_ref(reference, workspace_dir))
+        .collect::<Vec<_>>();
+    let request_text = if request_text.trim().is_empty() {
+        "The user sent image attachment(s) without additional text."
+    } else {
+        request_text.trim()
+    };
+    let vision_prompt = format!(
+        "User request:\n{request_text}\n\nImage attachment(s):\n{}",
+        resolved_refs
+            .iter()
+            .map(|reference| format!("[IMAGE:{reference}]"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let vision_messages = vec![
+        ChatMessage::system(processor_system),
+        ChatMessage::user(vision_prompt),
+    ];
+    let prepared = prepare_messages_for_provider(&vision_messages, config).await?;
+    let estimated_input_tokens = prepared
+        .messages
+        .iter()
+        .map(|message| message.content.chars().count())
+        .sum::<usize>()
+        .div_ceil(4) as u64;
+    let estimated_output_tokens = 1024;
+    let budget_metadata = serde_json::json!({
+        "component": "multimodal_processor",
+        "mode": config.processor.mode.trim(),
+        "imageCount": image_refs.len(),
+        "schemaVersion": VISUAL_ANALYSIS_SCHEMA_VERSION,
+    });
+    let budget_client = RemoteBudgetClient::from_env();
+    let budget_quote_id = if let Some(remote_budget) = budget_client.as_ref() {
+        let check = remote_budget
+            .check_text_quote(
+                None,
+                "multimodal_processor",
+                config.processor.provider.trim(),
+                config.processor.model.trim(),
+                estimated_input_tokens,
+                estimated_output_tokens,
+                budget_metadata.clone(),
+            )
+            .await?;
+        if !check.allowed {
+            anyhow::bail!(
+                "multimodal processor budget check denied: {}",
+                check.reason.unwrap_or_else(|| "budget exhausted".to_string())
+            );
+        }
+        check.quote_id
+    } else {
+        None
+    };
+
+    let started_at = Instant::now();
+    let response = provider
+        .chat(
+            ChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+            },
+            config.processor.model.trim(),
+            config.processor.temperature,
+        )
+        .await?;
+    if let Some(remote_budget) = budget_client.as_ref() {
+        let input_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.input_tokens)
+            .unwrap_or(estimated_input_tokens);
+        let output_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.output_tokens)
+            .unwrap_or_else(|| response.text_or_empty().chars().count().div_ceil(4) as u64);
+        let cached_input_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cached_input_tokens)
+            .unwrap_or(0);
+        #[allow(clippy::cast_possible_truncation)]
+        if let Err(error) = remote_budget
+            .consume_text_quote(
+                None,
+                &format!("multimodal-processor-{}", Uuid::new_v4()),
+                budget_quote_id.as_deref(),
+                "multimodal_processor",
+                config.processor.provider.trim(),
+                config.processor.model.trim(),
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                started_at.elapsed().as_millis() as u64,
+                budget_metadata,
+            )
+            .await
+        {
+            tracing::warn!("failed to consume multimodal processor budget: {error}");
+        }
+    }
+
+    Ok(normalize_visual_analysis_response(
+        response.text_or_empty().trim(),
+        image_refs,
+        request_text,
+    ))
+}
+
+fn resolve_workspace_image_ref(reference: &str, workspace_dir: Option<&Path>) -> String {
+    let trimmed = reference.trim();
+    if trimmed.starts_with("data:")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || Path::new(trimmed).is_absolute()
+    {
+        return trimmed.to_string();
+    }
+
+    workspace_dir
+        .map(|workspace| workspace.join(trimmed).to_string_lossy().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+pub fn normalize_visual_analysis_response(
+    raw_analysis: &str,
+    image_refs: &[String],
+    request_text: &str,
+) -> String {
+    let value = visual_analysis_value_from_response(raw_analysis, image_refs, request_text);
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| {
+        fallback_visual_analysis(raw_analysis, image_refs, request_text).to_string()
+    })
+}
+
+fn visual_analysis_value_from_response(
+    raw_analysis: &str,
+    image_refs: &[String],
+    request_text: &str,
+) -> Value {
+    let Some(mut value) = extract_json_object(raw_analysis) else {
+        return fallback_visual_analysis(raw_analysis, image_refs, request_text);
+    };
+
+    let Some(object) = value.as_object_mut() else {
+        return fallback_visual_analysis(raw_analysis, image_refs, request_text);
+    };
+
+    normalize_visual_analysis_object(object, image_refs);
+    value
+}
+
+fn extract_json_object(raw_analysis: &str) -> Option<Value> {
+    let trimmed = raw_analysis.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return value.as_object().is_some().then_some(value);
+    }
+
+    if let Some(unfenced) = strip_markdown_json_fence(trimmed) {
+        if let Ok(value) = serde_json::from_str::<Value>(unfenced.trim()) {
+            return value.as_object().is_some().then_some(value);
+        }
+    }
+
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+
+    let candidate = &trimmed[start..=end];
+    serde_json::from_str::<Value>(candidate)
+        .ok()
+        .filter(Value::is_object)
+}
+
+fn strip_markdown_json_fence(input: &str) -> Option<&str> {
+    let rest = input.strip_prefix("```")?;
+    let newline = rest.find('\n')?;
+    let body = &rest[newline + 1..];
+    if let Some(end) = body.rfind("```") {
+        Some(&body[..end])
+    } else {
+        Some(body)
+    }
+}
+
+fn normalize_visual_analysis_object(object: &mut Map<String, Value>, image_refs: &[String]) {
+    let mut warnings = Vec::new();
+
+    match object.get("schema_version").and_then(Value::as_str) {
+        Some(VISUAL_ANALYSIS_SCHEMA_VERSION) => {}
+        Some(other) => warnings.push(format!(
+            "Processor returned schema_version '{other}', coerced to {VISUAL_ANALYSIS_SCHEMA_VERSION}."
+        )),
+        None => warnings.push(format!(
+            "Processor omitted schema_version, set to {VISUAL_ANALYSIS_SCHEMA_VERSION}."
+        )),
+    }
+    object.insert(
+        "schema_version".to_string(),
+        Value::String(VISUAL_ANALYSIS_SCHEMA_VERSION.to_string()),
+    );
+
+    ensure_string_field(object, "visual_summary", &mut warnings);
+    ensure_string_field(object, "extracted_text", &mut warnings);
+    ensure_string_field(object, "action_context", &mut warnings);
+    ensure_structured_data(object, &mut warnings);
+    ensure_string_array_field(object, "uncertainties", &mut warnings);
+    ensure_images_array(object, image_refs, &mut warnings);
+    append_uncertainties(object, warnings);
+}
+
+fn ensure_string_field(
+    object: &mut Map<String, Value>,
+    key: &'static str,
+    warnings: &mut Vec<String>,
+) {
+    match object.get(key) {
+        Some(Value::String(_)) => {}
+        Some(Value::Null) | None => {
+            object.insert(key.to_string(), Value::String(String::new()));
+        }
+        Some(_) => {
+            warnings.push(format!("Processor returned non-string {key}; reset to empty string."));
+            object.insert(key.to_string(), Value::String(String::new()));
+        }
+    }
+}
+
+fn ensure_structured_data(object: &mut Map<String, Value>, warnings: &mut Vec<String>) {
+    if !object.get("structured_data").is_some_and(Value::is_object) {
+        if object.contains_key("structured_data") {
+            warnings.push("Processor returned non-object structured_data; reset to defaults.".into());
+        }
+        object.insert("structured_data".to_string(), default_structured_data());
+        return;
+    }
+
+    let structured = object
+        .get_mut("structured_data")
+        .and_then(Value::as_object_mut)
+        .expect("structured_data was checked as object");
+
+    if !structured
+        .get("document_type")
+        .is_some_and(|value| value.as_str().is_some())
+    {
+        structured.insert("document_type".to_string(), Value::String("unknown".into()));
+    }
+    ensure_object_child(structured, "fields");
+    ensure_array_child(structured, "tables");
+    ensure_array_child(structured, "line_items");
+    ensure_array_child(structured, "entities");
+    ensure_object_child(structured, "totals");
+    ensure_array_child(structured, "dates");
+    ensure_array_child(structured, "identifiers");
+}
+
+fn ensure_object_child(object: &mut Map<String, Value>, key: &'static str) {
+    if !object.get(key).is_some_and(Value::is_object) {
+        object.insert(key.to_string(), json!({}));
+    }
+}
+
+fn ensure_array_child(object: &mut Map<String, Value>, key: &'static str) {
+    if !object.get(key).is_some_and(Value::is_array) {
+        object.insert(key.to_string(), json!([]));
+    }
+}
+
+fn ensure_string_array_field(
+    object: &mut Map<String, Value>,
+    key: &'static str,
+    warnings: &mut Vec<String>,
+) {
+    match object.get_mut(key) {
+        Some(Value::Array(items)) => {
+            let normalized = items
+                .iter()
+                .filter_map(|item| item.as_str().map(|value| Value::String(value.to_string())))
+                .collect::<Vec<_>>();
+            *items = normalized;
+        }
+        Some(Value::Null) | None => {
+            object.insert(key.to_string(), json!([]));
+        }
+        Some(_) => {
+            warnings.push(format!("Processor returned non-array {key}; reset to empty array."));
+            object.insert(key.to_string(), json!([]));
+        }
+    }
+}
+
+fn ensure_images_array(
+    object: &mut Map<String, Value>,
+    image_refs: &[String],
+    warnings: &mut Vec<String>,
+) {
+    let image_count = image_refs.len();
+    let mut reset_to_default = false;
+
+    match object.get_mut("images") {
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                if !item.is_object() {
+                    *item = default_image_entry(index + 1);
+                    warnings.push("Processor returned a non-object images[] item; reset it.".into());
+                    continue;
+                }
+                let image = item.as_object_mut().expect("image item was checked as object");
+                if !image.get("index").is_some_and(Value::is_number) {
+                    image.insert("index".to_string(), json!(index + 1));
+                }
+                if !image.get("document_type").is_some_and(Value::is_string) {
+                    image.insert("document_type".to_string(), Value::String("unknown".into()));
+                }
+                if !image.get("confidence").is_some_and(Value::is_string) {
+                    image.insert("confidence".to_string(), Value::String("low".into()));
+                }
+                if !image.get("visible_text").is_some_and(Value::is_string) {
+                    image.insert("visible_text".to_string(), Value::String(String::new()));
+                }
+                ensure_object_child(image, "fields");
+                ensure_array_child(image, "warnings");
+            }
+            if items.is_empty() && image_count > 0 {
+                reset_to_default = true;
+            }
+        }
+        Some(Value::Null) | None => {
+            reset_to_default = true;
+        }
+        Some(_) => {
+            warnings.push("Processor returned non-array images; reset to defaults.".into());
+            reset_to_default = true;
+        }
+    }
+
+    if reset_to_default {
+        object.insert(
+            "images".to_string(),
+            Value::Array(
+                image_refs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| default_image_entry(index + 1))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+fn append_uncertainties(object: &mut Map<String, Value>, warnings: Vec<String>) {
+    if warnings.is_empty() {
+        return;
+    }
+    let uncertainties = object
+        .entry("uncertainties")
+        .or_insert_with(|| json!([]))
+        .as_array_mut();
+    if let Some(items) = uncertainties {
+        for warning in warnings {
+            if !items.iter().any(|item| item.as_str() == Some(&warning)) {
+                items.push(Value::String(warning));
+            }
+        }
+    }
+}
+
+fn fallback_visual_analysis(raw_analysis: &str, image_refs: &[String], request_text: &str) -> Value {
+    let trimmed = raw_analysis.trim();
+    let uncertainty = if trimmed.is_empty() {
+        "The visual processor returned no analysis."
+    } else {
+        "The visual processor returned invalid visual_analysis.v1 JSON; raw output was preserved in extracted_text."
+    };
+
+    json!({
+        "schema_version": VISUAL_ANALYSIS_SCHEMA_VERSION,
+        "visual_summary": "",
+        "extracted_text": truncate_chars(trimmed, 8000),
+        "structured_data": default_structured_data(),
+        "uncertainties": [uncertainty],
+        "action_context": if request_text.trim().is_empty() { "" } else { request_text.trim() },
+        "images": image_refs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| default_image_entry(index + 1))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn default_structured_data() -> Value {
+    json!({
+        "document_type": "unknown",
+        "fields": {},
+        "tables": [],
+        "line_items": [],
+        "entities": [],
+        "totals": {},
+        "dates": [],
+        "identifiers": [],
+    })
+}
+
+fn default_image_entry(index: usize) -> Value {
+    json!({
+        "index": index,
+        "document_type": "unknown",
+        "confidence": "low",
+        "visible_text": "",
+        "fields": {},
+        "warnings": [],
+    })
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn load_processor_prompt(config: &MultimodalConfig, workspace_dir: Option<&Path>) -> String {
@@ -667,6 +1021,62 @@ mod tests {
 
         assert_eq!(cleaned, "hello [IMAGE:] world");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn normalize_visual_analysis_accepts_fenced_json_and_fills_defaults() {
+        let refs = vec!["/tmp/invoice.png".to_string()];
+        let normalized = normalize_visual_analysis_response(
+            r#"```json
+{"schema_version":"visual_analysis.v1","visual_summary":"Factura visible","structured_data":{"fields":{"total":"$ 123"}}}
+```"#,
+            &refs,
+            "cargá esta factura",
+        );
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(value["schema_version"], "visual_analysis.v1");
+        assert_eq!(value["visual_summary"], "Factura visible");
+        assert_eq!(value["extracted_text"], "");
+        assert_eq!(value["structured_data"]["document_type"], "unknown");
+        assert_eq!(value["structured_data"]["fields"]["total"], "$ 123");
+        assert_eq!(value["images"][0]["index"], 1);
+    }
+
+    #[test]
+    fn normalize_visual_analysis_wraps_invalid_provider_output() {
+        let refs = vec!["/tmp/screenshot.png".to_string()];
+        let normalized =
+            normalize_visual_analysis_response("I can see a receipt but not JSON", &refs, "");
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(value["schema_version"], "visual_analysis.v1");
+        assert_eq!(value["extracted_text"], "I can see a receipt but not JSON");
+        assert!(value["uncertainties"][0]
+            .as_str()
+            .unwrap()
+            .contains("invalid visual_analysis.v1 JSON"));
+        assert_eq!(value["images"][0]["index"], 1);
+    }
+
+    #[test]
+    fn normalize_visual_analysis_coerces_wrong_schema_version() {
+        let normalized = normalize_visual_analysis_response(
+            r#"{"schema_version":"other","visual_summary":"x","extracted_text":"","structured_data":{},"uncertainties":[],"action_context":"","images":[]}"#,
+            &[],
+            "",
+        );
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(value["schema_version"], "visual_analysis.v1");
+        assert!(value["uncertainties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                .as_str()
+                .is_some_and(|text| text.contains("coerced to visual_analysis.v1"))));
+        assert_eq!(value["structured_data"]["document_type"], "unknown");
     }
 
     #[tokio::test]

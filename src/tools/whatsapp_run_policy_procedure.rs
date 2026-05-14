@@ -100,7 +100,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
     }
 
     fn description(&self) -> &str {
-        "Run the tenant job bound to the current WhatsApp conversation policy. The caller cannot choose an arbitrary job; the job is resolved from the provided chat_jid policy."
+        "Run the tenant job bound to the current WhatsApp conversation policy. The caller cannot choose an arbitrary job; in WhatsApp channel turns the runtime binds the current chat automatically."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -109,7 +109,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
             "properties": {
                 "chat_jid": {
                     "type": "string",
-                    "description": "Current WhatsApp group or direct chat JID. Use the current reply_target for the conversation."
+                    "description": "Optional current WhatsApp group or direct chat JID. In WhatsApp channel turns, omit this; the runtime binds the current reply_target automatically. Direct/manual calls must provide it."
                 },
                 "input": {
                     "type": "object",
@@ -120,7 +120,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
                     "description": "Optional timeout for the bound procedure run. Defaults to 60000 and is capped at 180000."
                 }
             },
-            "required": ["chat_jid", "input"],
+            "required": ["input"],
             "additionalProperties": false
         })
     }

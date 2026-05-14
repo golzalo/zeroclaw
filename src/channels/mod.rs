@@ -1162,7 +1162,7 @@ fn build_channel_system_prompt(
                         .filter(|value| !value.is_empty())
                     {
                         let mut procedure_context = format!(
-                            "\n\nConversation policy procedure: This {policy_channel} conversation has a bound on-demand tenant job `{procedure_job_slug}` scoped only to this {} chat. Before your final reply for a message that requires this policy's procedural check, call the channel-specific policy procedure tool. For WhatsApp today, call `whatsapp_run_policy_procedure` with `chat_jid` set to the current reply_target and `input` shaped by the policy SOP. Do not invent or request another job name, do not use shell, and do not delegate. After the procedure returns, always send a final user-facing reply based on its result.",
+                            "\n\nConversation policy procedure: This {policy_channel} conversation has a bound on-demand tenant job `{procedure_job_slug}` scoped only to this {} chat. Before your final reply for a message that requires this policy's procedural check, call the channel-specific policy procedure tool. For WhatsApp today, call `whatsapp_run_policy_procedure` with exactly one structured `input` object shaped by the policy SOP; the runtime binds the current reply_target as `chat_jid`. Do not copy chat ids, do not put sender/message/visual_analysis as top-level arguments, do not invent or request another job name, do not use shell, and do not delegate. After the procedure returns, always send a final user-facing reply based on its result.",
                             policy.chat_kind.as_str()
                         );
                         if let Some(summary) = policy

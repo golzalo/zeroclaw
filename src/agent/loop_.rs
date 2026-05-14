@@ -399,6 +399,27 @@ const SCHEDULING_FAILURE_HINTS: &[&str] = &[
     "unable",
 ];
 
+const SERVICE_BUILDER_COMPLETION_HINTS: &[&str] = &[
+    "cada 5 minutos",
+    "corriendo",
+    "funcionando",
+    "implementado",
+    "implemento todo",
+    "implementó todo",
+    "job programado",
+    "listo",
+    "proceso listo",
+    "programado",
+    "scheduled",
+    "servicio listo",
+    "ya esta activo",
+    "ya esta corriendo",
+    "ya esta listo",
+    "ya está activo",
+    "ya está corriendo",
+    "ya está listo",
+];
+
 const CONTINUATION_CHECKPOINT_OPEN_TAG: &str = "<continuation_checkpoint>";
 const CONTINUATION_CHECKPOINT_CLOSE_TAG: &str = "</continuation_checkpoint>";
 const CONTINUATION_CHECKPOINT_REF_OPEN_TAG: &str = "<continuation_checkpoint_ref>";
@@ -722,6 +743,139 @@ fn response_claims_schedule_success(display_text: &str) -> bool {
         && !SCHEDULING_FAILURE_HINTS
             .iter()
             .any(|hint| lowered.contains(hint))
+}
+
+fn response_claims_service_builder_completion(display_text: &str) -> bool {
+    let lowered = display_text.to_ascii_lowercase();
+    (response_claims_schedule_success(display_text)
+        || SERVICE_BUILDER_COMPLETION_HINTS
+            .iter()
+            .any(|hint| lowered.contains(hint)))
+        && !SCHEDULING_FAILURE_HINTS
+            .iter()
+            .any(|hint| lowered.contains(hint))
+}
+
+fn looks_like_service_contract_confirmation(content: &str) -> bool {
+    let normalized = normalize_resume_instruction_for_comparison(content);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        ch.is_ascii_punctuation() || ch == '¡' || ch == '¿'
+    });
+
+    matches!(
+        trimmed,
+        "yes"
+            | "y"
+            | "si"
+            | "sí"
+            | "dale"
+            | "ok"
+            | "okay"
+            | "listo"
+            | "confirmo"
+            | "confirmado"
+            | "adelante"
+    ) || trimmed.starts_with("yes ")
+        || trimmed.starts_with("si ")
+        || trimmed.starts_with("sí ")
+        || trimmed.starts_with("dale ")
+        || trimmed.starts_with("ok ")
+        || trimmed.starts_with("confirmo ")
+}
+
+fn is_service_builder_pending_contract_message(message: &ChatMessage) -> bool {
+    if message.role != "tool" && message.role != "assistant" {
+        return false;
+    }
+    let lowered = message.content.to_ascii_lowercase();
+    lowered.contains("service_builder")
+        && (lowered.contains("status: awaiting_confirmation")
+            || lowered.contains("verification_status: pending_user_confirmation")
+            || lowered.contains("step: propose_contract"))
+}
+
+fn is_service_builder_done_message(message: &ChatMessage) -> bool {
+    if message.role != "tool" && message.role != "assistant" {
+        return false;
+    }
+    let lowered = message.content.to_ascii_lowercase();
+    lowered.contains("service_builder")
+        && lowered.contains("step: done")
+        && (lowered.contains("status: scheduled") || lowered.contains("status: verified"))
+}
+
+fn latest_user_confirmed_pending_service_contract(history: &[ChatMessage]) -> bool {
+    let Some((latest_user_index, latest_user)) = history
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| {
+            message.role == "user" && !is_runtime_user_message(&message.content)
+        })
+    else {
+        return false;
+    };
+
+    if !looks_like_service_contract_confirmation(&latest_user.content) {
+        return false;
+    }
+
+    let mut pending_contract = false;
+    for message in &history[..latest_user_index] {
+        if is_service_builder_pending_contract_message(message) {
+            pending_contract = true;
+        } else if is_service_builder_done_message(message) {
+            pending_contract = false;
+        }
+    }
+
+    pending_contract
+}
+
+fn recent_service_builder_context(history: &[ChatMessage]) -> bool {
+    history.iter().rev().take(12).any(|message| {
+        let lowered = message.content.to_ascii_lowercase();
+        lowered.contains("service_builder")
+            || lowered.contains("tenant-app/server/jobs")
+            || lowered.contains("step: done")
+            || lowered.contains("status: awaiting_confirmation")
+            || lowered.contains("user_confirmed_processing_contract")
+    })
+}
+
+fn response_is_semantically_empty(display_text: &str) -> bool {
+    let trimmed = display_text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let meaningful_chars = trimmed
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .collect::<String>();
+
+    meaningful_chars.chars().count() <= 1
+}
+
+fn clear_assistant_history_content_if_semantically_empty(history_content: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(history_content) else {
+        return history_content.to_string();
+    };
+
+    let Some(object) = value.as_object_mut() else {
+        return history_content.to_string();
+    };
+
+    let Some(content) = object.get("content").and_then(|value| value.as_str()) else {
+        return history_content.to_string();
+    };
+
+    if response_is_semantically_empty(content) {
+        object.insert("content".to_string(), serde_json::Value::Null);
+        value.to_string()
+    } else {
+        history_content.to_string()
+    }
 }
 
 fn latest_user_message(history: &[ChatMessage]) -> Option<&str> {
@@ -4827,6 +4981,95 @@ fn maybe_inject_channel_delivery_defaults(
     }
 }
 
+fn maybe_normalize_whatsapp_policy_procedure_call(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+) {
+    if tool_name != "whatsapp_run_policy_procedure" {
+        return;
+    }
+
+    let Some(args) = tool_args.as_object_mut() else {
+        return;
+    };
+
+    if channel_name == "whatsapp" {
+        if let Some(reply_target) = channel_reply_target
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let previous = args
+                .get("chat_jid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if previous != reply_target {
+                tracing::debug!(
+                    tool = "whatsapp_run_policy_procedure",
+                    previous_chat_jid = previous,
+                    chat_jid = reply_target,
+                    "Bound WhatsApp policy procedure call to current reply target"
+                );
+            }
+            args.insert(
+                "chat_jid".to_string(),
+                serde_json::Value::String(reply_target.to_string()),
+            );
+        }
+    }
+
+    let mut lifted = serde_json::Map::new();
+    for key in [
+        "sender",
+        "message",
+        "visual_analysis",
+        "normalized_document",
+        "attachments",
+        "image",
+        "images",
+    ] {
+        if let Some(value) = args.remove(key) {
+            lifted.insert(key.to_string(), value);
+        }
+    }
+
+    if lifted.is_empty() {
+        if !args.contains_key("input") {
+            args.insert("input".to_string(), serde_json::json!({}));
+        }
+        return;
+    }
+
+    let existing_input = args.remove("input");
+    let mut input = match existing_input {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(other) => {
+            let input_type = match &other {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+            };
+            tracing::warn!(
+                tool = "whatsapp_run_policy_procedure",
+                input_type = input_type,
+                "Replacing malformed policy procedure input with lifted current-turn fields"
+            );
+            serde_json::Map::new()
+        }
+        None => serde_json::Map::new(),
+    };
+
+    for (key, value) in lifted {
+        input.entry(key).or_insert(value);
+    }
+    args.insert("input".to_string(), serde_json::Value::Object(input));
+}
+
 fn maybe_normalize_tenant_service_announce_cron_prompt(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
@@ -4838,7 +5081,11 @@ fn maybe_normalize_tenant_service_announce_cron_prompt(
     let Some(args) = tool_args.as_object_mut() else {
         return;
     };
-    let Some(raw_prompt) = args.get("prompt").and_then(|v| v.as_str()) else {
+    let Some(raw_prompt) = args
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+    else {
         return;
     };
     let trimmed = raw_prompt.trim();
@@ -4853,6 +5100,16 @@ fn maybe_normalize_tenant_service_announce_cron_prompt(
     else {
         return;
     };
+    if tool_name == "cron_add" && !args.contains_key("allowed_tools") {
+        args.insert(
+            "allowed_tools".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("http_request".to_string())]),
+        );
+        tracing::debug!(
+            tool = tool_name,
+            "Injected http_request allowlist for tenant service announce cron"
+        );
+    }
 
     if resolved.file_name().and_then(|name| name.to_str()) == Some("announce_prompt.txt") {
         let new_prompt = format!("@tenant-service-announce {}", resolved.display());
@@ -4885,6 +5142,49 @@ fn maybe_normalize_tenant_service_announce_cron_prompt(
         }
         dir = d.parent();
     }
+}
+
+fn blocked_tenant_service_execution_cron_add(
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+) -> Option<String> {
+    if tool_name != "cron_add" {
+        return None;
+    }
+
+    let args = tool_args.as_object()?;
+    let prompt = args
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let name = args
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+
+    if prompt.starts_with("@tenant-service-announce") {
+        return None;
+    }
+
+    let lowered_prompt = prompt.to_ascii_lowercase();
+    let lowered_name = name.to_ascii_lowercase();
+    let is_tenant_service_execution = lowered_name.ends_with("__execution")
+        || lowered_prompt.starts_with("@tenant-service-execution")
+        || lowered_prompt.contains("tenant_job_runner")
+        || lowered_prompt.contains("tenant_job_delivery")
+        || lowered_prompt.contains("/api/jobs/")
+        || lowered_prompt.contains("tenant-app/server/jobs")
+        || lowered_prompt.contains("output/latest.json");
+
+    if !is_tenant_service_execution {
+        return None;
+    }
+
+    Some(
+        "Blocked tenant service execution cron_add. Tenant service execution must be scheduled through service_builder/supercronic; cron_add is only allowed for the canonical @tenant-service-announce delivery cron after service_builder returns ANNOUNCE_CRON.".to_string(),
+    )
 }
 
 fn resolve_tenant_service_announce_prompt_candidate(
@@ -5588,7 +5888,7 @@ pub(crate) async fn run_tool_call_loop(
             chat_future.await
         };
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
+        let (response_text, parsed_text, tool_calls, mut assistant_history_content, native_tool_calls) =
             match chat_result {
                 Ok(resp) => {
                     let (resp_input_tokens, resp_output_tokens) = resp
@@ -5749,7 +6049,30 @@ pub(crate) async fn run_tool_call_loop(
             !tool_calls.is_empty(),
             !native_tool_calls.is_empty(),
         );
-        let display_text = strip_tool_result_blocks(&display_text);
+        let mut display_text = strip_tool_result_blocks(&display_text);
+
+        if !tool_calls.is_empty()
+            && response_is_semantically_empty(&display_text)
+            && (recent_service_builder_context(history) || user_requested_scheduling(history))
+        {
+            runtime_trace::record_event(
+                "tool_call_response_semantically_empty_text",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(&turn_id),
+                Some(false),
+                Some("assistant attached placeholder text to a service/tool-call response"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "text": scrub_credentials(&display_text),
+                    "tool_calls": tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+                }),
+            );
+            display_text.clear();
+            assistant_history_content =
+                clear_assistant_history_content_if_semantically_empty(&assistant_history_content);
+        }
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -5765,6 +6088,30 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            if response_is_semantically_empty(&display_text)
+                && (recent_service_builder_context(history) || user_requested_scheduling(history))
+            {
+                runtime_trace::record_event(
+                    "final_response_semantically_empty",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("assistant attempted to send an empty or one-character service response"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "text": scrub_credentials(&display_text),
+                    }),
+                );
+
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(internal_repair_message(
+                    "Your last response was empty or a single character in a service/job flow. Do not send placeholder letters. Inspect the latest service_builder result, continue or re-delegate if needed, and reply only with a meaningful status, a concrete blocker, or the verified STEP: done summary.",
+                ));
+                continue;
+            }
+
             if latest_user_message_requests_tool_first_execution(history) {
                 runtime_trace::record_event(
                     "final_response_missing_required_tool_execution",
@@ -5783,6 +6130,33 @@ pub(crate) async fn run_tool_call_loop(
                 history.push(ChatMessage::assistant(response_text.clone()));
                 history.push(internal_repair_message(
                     "This turn is under an implementation/service directive that requires concrete tool execution before replying. Do not answer with consultation, scripts for the user to run elsewhere, or setup instructions. Use tools now, or if a concrete blocker prevents tool execution in this runtime, reply briefly with that blocker only.",
+                ));
+                continue;
+            }
+
+            if latest_user_confirmed_pending_service_contract(history)
+                && response_claims_service_builder_completion(&display_text)
+                && tools_registry.iter().any(|t| t.name() == "delegate")
+            {
+                runtime_trace::record_event(
+                    "final_response_unverified_service_builder_completion",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(
+                        "assistant claimed a service_builder job was ready before STEP: done",
+                    ),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "text": scrub_credentials(&display_text),
+                    }),
+                );
+
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(internal_repair_message(
+                    "The user just confirmed a pending service_builder processing contract. Do not claim the service is implemented, ready, scheduled, active, or running yet. Re-delegate to service_builder with USER_CONFIRMED_PROCESSING_CONTRACT: true, preserve the same job identity from the proposal (NEW_JOB/PROPOSED_SLUG or EXISTING_JOB), include the confirmed contract text, and wait for a real STEP: done response with STATUS: verified or STATUS: scheduled before confirming success to the user.",
                 ));
                 continue;
             }
@@ -6041,11 +6415,55 @@ pub(crate) async fn run_tool_call_loop(
                 channel_name,
                 channel_reply_target,
             );
+            maybe_normalize_whatsapp_policy_procedure_call(
+                &tool_name,
+                &mut tool_args,
+                channel_name,
+                channel_reply_target,
+            );
             maybe_normalize_tenant_service_announce_cron_prompt(
                 &tool_name,
                 &mut tool_args,
                 workspace_dir,
             );
+            if let Some(blocked) =
+                blocked_tenant_service_execution_cron_add(&tool_name, &tool_args)
+            {
+                runtime_trace::record_event(
+                    "tool_call_result",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(&blocked),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "tool": tool_name.clone(),
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                    }),
+                );
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(format!(
+                            "\u{274c} {}: {}\n",
+                            tool_name,
+                            truncate_with_ellipsis(&scrub_credentials(&blocked), 200)
+                        ))
+                        .await;
+                }
+                ordered_results[idx] = Some((
+                    tool_name.clone(),
+                    call.tool_call_id.clone(),
+                    ToolExecutionOutcome {
+                        output: blocked.clone(),
+                        success: false,
+                        error_reason: Some(blocked),
+                        duration: Duration::ZERO,
+                    },
+                ));
+                continue;
+            }
             maybe_inject_delegate_resume_metadata(
                 history,
                 &tool_name,
@@ -8379,6 +8797,55 @@ Encontré estos 5 archivos en Google Drive:
         );
     }
 
+    #[test]
+    fn maybe_normalize_whatsapp_policy_procedure_binds_current_chat_and_lifts_payload() {
+        let mut args = serde_json::json!({
+            "chat_jid": "5491167625318\">5491167625318@s.whatsapp.net",
+            "input": "<DSML parameter name=\"sender\">",
+            "sender": { "phone": "+5491167625318" },
+            "message": { "text": "@s86 aca tenes otra factura" },
+            "visual_analysis": { "schema_version": "visual_analysis.v1" },
+            "timeout_ms": 60000
+        });
+
+        maybe_normalize_whatsapp_policy_procedure_call(
+            "whatsapp_run_policy_procedure",
+            &mut args,
+            "whatsapp",
+            Some("5491167625318@s.whatsapp.net"),
+        );
+
+        assert_eq!(args["chat_jid"], "5491167625318@s.whatsapp.net");
+        assert_eq!(args["timeout_ms"], 60000);
+        assert!(args.get("sender").is_none());
+        assert!(args.get("message").is_none());
+        assert!(args.get("visual_analysis").is_none());
+        assert_eq!(args["input"]["sender"]["phone"], "+5491167625318");
+        assert_eq!(
+            args["input"]["message"]["text"],
+            "@s86 aca tenes otra factura"
+        );
+        assert_eq!(
+            args["input"]["visual_analysis"]["schema_version"],
+            "visual_analysis.v1"
+        );
+    }
+
+    #[test]
+    fn maybe_normalize_whatsapp_policy_procedure_creates_empty_input_for_channel_call() {
+        let mut args = serde_json::json!({});
+
+        maybe_normalize_whatsapp_policy_procedure_call(
+            "whatsapp_run_policy_procedure",
+            &mut args,
+            "whatsapp",
+            Some("120363025123456789@g.us"),
+        );
+
+        assert_eq!(args["chat_jid"], "120363025123456789@g.us");
+        assert!(args["input"].as_object().is_some_and(|input| input.is_empty()));
+    }
+
     #[tokio::test]
     async fn execute_one_tool_does_not_panic_on_utf8_boundary() {
         let call_arguments = (0..600)
@@ -9382,10 +9849,10 @@ Encontré estos 5 archivos en Google Drive:
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_allows_noncanonical_cron_add_in_tenant_service_flow() {
+    async fn run_tool_call_loop_blocks_tenant_service_execution_cron_add() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
-{"name":"cron_add","arguments":{"job_type":"agent","prompt":"Go to https://www.infobae.com/ and scrape 3 headlines","schedule":{"kind":"cron","expr":"*/2 * * * *"},"delivery":{"mode":"announce","channel":"whatsapp","to":"120363409640193279@g.us"}}}
+{"name":"cron_add","arguments":{"job_type":"agent","name":"infobae-news-csv__execution","prompt":"Run the infobae-news-csv job by executing node tools/tenant_job_runner.mjs invoke --job infobae-news-csv","schedule":{"kind":"cron","expr":"*/2 * * * *"},"delivery":{"mode":"announce","channel":"whatsapp","to":"120363409640193279@g.us"}}}
 </tool_call>"#,
             "done",
         ]);
@@ -9453,17 +9920,18 @@ Encontré estos 5 archivos en Google Drive:
             None,
         )
         .await
-        .expect("noncanonical tenant-service cron_add should reach tool execution");
+        .expect("blocked tenant-service execution cron_add should repair cleanly");
 
         assert_eq!(result, "done");
         let recorded = recorded_args
             .lock()
             .expect("recorded args lock should be valid");
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(
-            recorded[0]["prompt"],
-            "Go to https://www.infobae.com/ and scrape 3 headlines"
-        );
+        assert_eq!(recorded.len(), 0);
+        assert!(history.iter().any(|message| {
+            message
+                .content
+                .contains("Blocked tenant service execution cron_add")
+        }));
     }
 
     #[tokio::test]
@@ -9548,6 +10016,10 @@ Encontré estos 5 archivos en Google Drive:
         assert_eq!(
             recorded[0]["prompt"],
             "@tenant-service-announce /zeroclaw-data/workspace/tenant-app/server/jobs/infobae-news-csv/announce_prompt.txt"
+        );
+        assert_eq!(
+            recorded[0]["allowed_tools"],
+            serde_json::json!(["http_request"])
         );
     }
 
@@ -11058,6 +11530,95 @@ Tail"#;
         let response = "El proceso ya quedó configurado y funcionando cada 2 minutos.";
 
         assert!(response_claims_schedule_success(response));
+    }
+
+    #[test]
+    fn detects_user_confirmation_after_pending_service_builder_contract() {
+        let history = vec![
+            ChatMessage::user("crear proceso cada 5 minutos"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTATUS: awaiting_confirmation\nTARGET_ID: procesar-comprobantes-drive\nCONTRACT:\n  trigger: */5 * * * *",
+            ),
+            ChatMessage::assistant("Contrato propuesto. Responde YES para confirmar."),
+            ChatMessage::user("YES"),
+        ];
+
+        assert!(latest_user_confirmed_pending_service_contract(&history));
+    }
+
+    #[test]
+    fn pending_service_builder_contract_is_cleared_after_done() {
+        let history = vec![
+            ChatMessage::user("crear proceso cada 5 minutos"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTATUS: awaiting_confirmation\nTARGET_ID: procesar-comprobantes-drive",
+            ),
+            ChatMessage::assistant("Contrato propuesto. Responde YES para confirmar."),
+            ChatMessage::user("YES"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTEP: done\nTARGET_ID: procesar-comprobantes-drive\nSTATUS: scheduled",
+            ),
+            ChatMessage::assistant("Servicio listo."),
+            ChatMessage::user("ok"),
+        ];
+
+        assert!(!latest_user_confirmed_pending_service_contract(&history));
+    }
+
+    #[test]
+    fn service_builder_completion_claim_detects_ready_language() {
+        assert!(response_claims_service_builder_completion(
+            "El service_builder implementó todo. Ya está corriendo cada 5 minutos."
+        ));
+        assert!(!response_claims_service_builder_completion(
+            "No pude programarlo porque falta autorización."
+        ));
+    }
+
+    #[test]
+    fn semantically_empty_response_detects_single_letter_noise() {
+        assert!(response_is_semantically_empty("J"));
+        assert!(response_is_semantically_empty("C"));
+        assert!(response_is_semantically_empty(" . "));
+        assert!(!response_is_semantically_empty("OK"));
+        assert!(!response_is_semantically_empty("Listo, quedó verificado."));
+    }
+
+    #[test]
+    fn clears_semantically_empty_native_tool_call_content() {
+        let history_content = serde_json::json!({
+            "content": "C",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "name": "delegate",
+                    "arguments": "{}"
+                }
+            ]
+        })
+        .to_string();
+
+        let cleared = clear_assistant_history_content_if_semantically_empty(&history_content);
+        let parsed: serde_json::Value = serde_json::from_str(&cleared).unwrap();
+
+        assert!(parsed.get("content").is_some_and(serde_json::Value::is_null));
+        assert_eq!(
+            parsed
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn recent_service_builder_context_detects_job_flow() {
+        let history = vec![
+            ChatMessage::user("crear proceso"),
+            ChatMessage::tool("[Agent 'service_builder' (mock)]\nSTATUS: awaiting_confirmation"),
+        ];
+
+        assert!(recent_service_builder_context(&history));
     }
 
     #[test]
