@@ -188,6 +188,8 @@ pub struct DelegateTool {
     parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// Inherited provider reliability config for sub-agent loops.
+    reliability_config: crate::config::ReliabilityConfig,
     /// Global delegate tool config providing default timeout values.
     delegate_config: DelegateToolConfig,
     /// Workspace directory for pre-loading skills and context files.
@@ -225,6 +227,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            reliability_config: crate::config::ReliabilityConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: None,
             open_skills_enabled: false,
@@ -265,6 +268,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            reliability_config: crate::config::ReliabilityConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: None,
             open_skills_enabled: false,
@@ -281,6 +285,12 @@ impl DelegateTool {
     /// Attach multimodal configuration for sub-agent tool loops.
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// Attach provider reliability configuration for sub-agent tool loops.
+    pub fn with_reliability_config(mut self, config: crate::config::ReliabilityConfig) -> Self {
+        self.reliability_config = config;
         self
     }
 
@@ -856,6 +866,7 @@ impl DelegateTool {
                     "delegate",
                     None,
                     &self.multimodal_config,
+                    &self.reliability_config,
                     effective_max_iterations,
                     None,
                     None,

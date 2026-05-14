@@ -814,6 +814,7 @@ pub fn all_tools_with_runtime(
         )
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone())
+        .with_reliability_config(root_config.reliability.clone())
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace(
             workspace_dir.to_path_buf(),

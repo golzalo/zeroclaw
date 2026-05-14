@@ -66,8 +66,8 @@ impl WhatsAppConfigureConversationPolicyTool {
             .map(str::to_string)
     }
 
-    fn normalize_optional_schema_arg(args: &serde_json::Value) -> Option<String> {
-        let value = args.get("procedure_input_schema")?;
+    fn normalize_optional_json_or_text_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+        let value = args.get(key)?;
         if let Some(text) = value.as_str().map(str::trim).filter(|text| !text.is_empty()) {
             return Some(text.to_string());
         }
@@ -88,7 +88,10 @@ impl WhatsAppConfigureConversationPolicyTool {
         let goal = Self::normalize_optional_text_arg(args, "goal");
         let procedure_job_slug = Self::normalize_optional_text_arg(args, "procedure_job_slug");
         let procedure_summary = Self::normalize_optional_text_arg(args, "procedure_summary");
-        let procedure_input_schema = Self::normalize_optional_schema_arg(args);
+        let procedure_input_schema =
+            Self::normalize_optional_json_or_text_arg(args, "procedure_input_schema");
+        let procedure_input_contract =
+            Self::normalize_optional_json_or_text_arg(args, "procedure_input_contract");
         let procedure_sop = Self::normalize_optional_text_arg(args, "procedure_sop");
 
         let has_metadata = clear_procedure
@@ -96,6 +99,7 @@ impl WhatsAppConfigureConversationPolicyTool {
             || procedure_job_slug.is_some()
             || procedure_summary.is_some()
             || procedure_input_schema.is_some()
+            || procedure_input_contract.is_some()
             || procedure_sop.is_some();
         if !has_metadata {
             return Ok(None);
@@ -111,6 +115,7 @@ impl WhatsAppConfigureConversationPolicyTool {
         if procedure_job_slug.is_none()
             && (procedure_summary.is_some()
                 || procedure_input_schema.is_some()
+                || procedure_input_contract.is_some()
                 || procedure_sop.is_some())
         {
             anyhow::bail!(
@@ -127,11 +132,16 @@ impl WhatsAppConfigureConversationPolicyTool {
             anyhow::bail!("Missing 'procedure_input_schema' for a procedure-backed policy");
         }
 
+        if procedure_job_slug.is_some() && procedure_input_contract.is_none() {
+            anyhow::bail!("Missing 'procedure_input_contract' for a procedure-backed policy");
+        }
+
         Ok(Some(ConversationProcedureMetadata {
             goal,
             procedure_job_slug,
             procedure_summary,
             procedure_input_schema,
+            procedure_input_contract,
             procedure_sop,
             clear_procedure,
         }))
@@ -304,6 +314,9 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                 },
                 "procedure_input_schema": {
                     "description": "Expected structured input for the bound procedure. May be a JSON schema object or a compact textual schema."
+                },
+                "procedure_input_contract": {
+                    "description": "User-facing input/output contract for the restricted worker. Define required current-turn inputs, valid/invalid cases, how to respond when input is missing, and the expected procedure result shape. May be a JSON object or compact textual contract."
                 },
                 "procedure_sop": {
                     "type": "string",
@@ -663,6 +676,10 @@ mod tests {
                 "procedure_job_slug": "spend-guard",
                 "procedure_summary": "Validates and records spend messages.",
                 "procedure_input_schema": { "type": "object" },
+                "procedure_input_contract": {
+                    "required_current_turn_inputs": ["spend message"],
+                    "on_invalid_input": "Ask for the missing spend details."
+                },
                 "procedure_sop": "Extract valid input, run the procedure, and reply from the result."
             }))
             .await
@@ -678,6 +695,10 @@ mod tests {
             .procedure_input_schema
             .as_deref()
             .is_some_and(|schema| schema.contains("\"type\"")));
+        assert!(observed
+            .procedure_input_contract
+            .as_deref()
+            .is_some_and(|contract| contract.contains("required_current_turn_inputs")));
         assert!(result.output.contains("Procedure: spend-guard"));
     }
 
@@ -708,6 +729,7 @@ mod tests {
                 "delivery_chat_jid": "120363408016257691@g.us",
                 "procedure_job_slug": "spend-guard",
                 "procedure_input_schema": { "type": "object" },
+                "procedure_input_contract": "Require valid input before calling.",
                 "procedure_sop": "Run the procedure."
             }))
             .await
@@ -831,6 +853,7 @@ mod tests {
                 "delivery_chat_jid": "120363408016257691@g.us",
                 "goal": "Validate messages.",
                 "procedure_job_slug": "spend-guard",
+                "procedure_input_contract": "Require valid input before calling.",
                 "procedure_sop": "Run the procedure."
             }))
             .await
@@ -838,6 +861,43 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("procedure_input_schema"));
+    }
+
+    #[tokio::test]
+    async fn configure_rejects_procedure_job_without_input_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363025123456789@g.us".into(),
+                group_name: "Los Pibes".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let tool = WhatsAppConfigureConversationPolicyTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "goal": "Validate messages.",
+                "procedure_job_slug": "spend-guard",
+                "procedure_input_schema": { "type": "object" },
+                "procedure_sop": "Run the procedure."
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("procedure_input_contract"));
     }
 
     #[tokio::test]

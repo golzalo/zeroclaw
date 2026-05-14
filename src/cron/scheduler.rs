@@ -250,14 +250,18 @@ async fn run_agent_job(
             Err(error) => return (false, error),
         };
 
-    if let Some(output) = deterministic_announcement_output(job, &resolved_prompt) {
-        tracing::trace!(
-            job_id = %job.id,
-            job_name = %name,
-            output_len = output.len(),
-            "Cron reminder will be delivered without agent context"
-        );
-        return (true, output);
+    if resolved_prompt.tenant_service.kind == Some(TenantServiceCronKind::Announce) {
+        if let Some(command) = resolved_prompt.tenant_service.delivery_command.as_deref() {
+            tracing::info!(
+                job_id = %job.id,
+                job_name = job.name.as_deref().unwrap_or(""),
+                "Running tenant service announce helper directly"
+            );
+            return match run_tenant_service_helper_command(config, command).await {
+                Ok(output) => (true, normalize_tenant_service_delivery_output(&output)),
+                Err(error) => (false, format!("agent job failed: {error}")),
+            };
+        }
     }
 
     let prompt = resolved_prompt.prompt.clone();
@@ -785,6 +789,17 @@ fn output_requests_no_delivery(output: &str) -> bool {
                     .is_some_and(|marker| marker.trim().is_empty())
         })
         .unwrap_or(false)
+}
+
+fn normalize_tenant_service_delivery_output(output: &str) -> String {
+    let trimmed = output.trim();
+    if output_requests_no_delivery(trimmed) {
+        return String::new();
+    }
+    if let Some(marker) = extract_delivery_marker(trimmed) {
+        return marker;
+    }
+    trimmed.to_string()
 }
 
 async fn tenant_service_latest_is_recent_success(
@@ -1811,6 +1826,68 @@ mod tests {
         .unwrap();
 
         assert_eq!(normalized, "");
+    }
+
+    #[tokio::test]
+    async fn tenant_service_announce_cron_uses_delivery_helper_without_provider() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let prompt_path = config
+            .workspace_dir
+            .join("tenant-app/server/jobs/sample/announce_prompt.txt");
+        tokio::fs::create_dir_all(prompt_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &prompt_path,
+            "Use only http_request.\nThis prompt should not reach the model.\n",
+        )
+        .await
+        .unwrap();
+
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some(format!(
+            "TENANT_SERVICE_ANNOUNCE_PROMPT_FILE={}\nTENANT_SERVICE_DELIVERY_COMMAND=printf 'Drive tracker: 2 pending'",
+            prompt_path.display()
+        ));
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+
+        assert!(success);
+        assert_eq!(output, "Drive tracker: 2 pending");
+    }
+
+    #[tokio::test]
+    async fn tenant_service_announce_cron_no_delivery_stays_silent_without_provider() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let prompt_path = config
+            .workspace_dir
+            .join("tenant-app/server/jobs/sample/announce_prompt.txt");
+        tokio::fs::create_dir_all(prompt_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &prompt_path,
+            "Use only http_request.\nThis prompt should not reach the model.\n",
+        )
+        .await
+        .unwrap();
+
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some(format!(
+            "TENANT_SERVICE_ANNOUNCE_PROMPT_FILE={}\nTENANT_SERVICE_DELIVERY_COMMAND=printf NO_DELIVERY",
+            prompt_path.display()
+        ));
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+
+        assert!(success);
+        assert_eq!(output, "");
     }
 
     #[tokio::test]

@@ -1164,7 +1164,7 @@ pub(crate) fn build_channel_system_prompt(
                         .filter(|value| !value.is_empty())
                     {
                         let mut procedure_context = format!(
-                            "\n\nConversation policy procedure: This {policy_channel} conversation has a bound on-demand tenant job `{procedure_job_slug}` scoped only to this {} chat. Before your final reply for a message that requires this policy's procedural check, call the channel-specific policy procedure tool. For WhatsApp today, call `whatsapp_run_policy_procedure` with `chat_jid` set to the current reply_target and `input` shaped by the policy SOP. Do not invent or request another job name, do not use shell, and do not delegate. After the procedure returns, always send a final user-facing reply based on its result.",
+                            "\n\nConversation policy procedure: This {policy_channel} conversation has a bound on-demand tenant job `{procedure_job_slug}` scoped only to this {} chat. Before your final reply for a message that requires this policy's procedural check, call the channel-specific policy procedure tool. For WhatsApp today, call `whatsapp_run_policy_procedure` with exactly one structured `input` object shaped by the policy SOP; the runtime binds the current reply_target as `chat_jid`. Do not copy chat ids, do not put sender/message/visual_analysis as top-level arguments, do not invent or request another job name, do not use shell, and do not delegate. After the procedure returns, always send a final user-facing reply based on its result.",
                             policy.chat_kind.as_str()
                         );
                         if let Some(summary) = policy
@@ -1186,6 +1186,19 @@ pub(crate) fn build_channel_system_prompt(
                             procedure_context.push_str(&format!(
                                 "\n\nProcedure input schema:\n{input_schema}"
                             ));
+                        }
+                        if let Some(input_contract) = policy
+                            .procedure_input_contract
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            procedure_context.push_str(&format!(
+                                "\n\nProcedure input/output contract:\n{input_contract}"
+                            ));
+                            procedure_context.push_str(
+                                "\n\nBefore calling the procedure, validate the current turn against this contract. If required current-turn inputs are missing or invalid, do not call the procedure; reply with the contract's requested correction or missing-input message.",
+                            );
                         }
                         if let Some(sop) = policy
                             .procedure_sop
@@ -4185,6 +4198,7 @@ async fn process_channel_message(
                 msg.channel.as_str(),
                 Some(msg.reply_target.as_str()),
                 &ctx.multimodal,
+                ctx.reliability.as_ref(),
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx.clone(),
@@ -9537,6 +9551,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     procedure_input_schema: Some(
                         "{\"type\":\"object\",\"additionalProperties\":true}".to_string(),
                     ),
+                    procedure_input_contract: Some(
+                        "Only call the procedure when the current turn contains valid spend data; otherwise ask for the missing spend details.".to_string(),
+                    ),
                     procedure_sop: Some(
                         "Extract only valid spend data and call the bound procedure.".to_string(),
                     ),
@@ -9558,6 +9575,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("bound on-demand tenant job `spend-guard`"));
         assert!(prompt.contains("whatsapp_run_policy_procedure"));
         assert!(prompt.contains("Procedure input schema:"));
+        assert!(prompt.contains("Procedure input/output contract:"));
+        assert!(prompt.contains("validate the current turn against this contract"));
         assert!(prompt.contains("Procedure SOP:"));
         assert!(!prompt.contains("Conversation skill instructions:"));
     }
@@ -9579,6 +9598,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     procedure_summary: Some("Validates spend messages".to_string()),
                     procedure_input_schema: Some(
                         "{\"type\":\"object\",\"additionalProperties\":true}".to_string(),
+                    ),
+                    procedure_input_contract: Some(
+                        "Only call the procedure when the current turn contains valid spend data; otherwise ask for the missing spend details.".to_string(),
                     ),
                     procedure_sop: Some(
                         "Extract valid data and call the bound procedure.".to_string(),

@@ -754,6 +754,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
+        .route("/internal/visual-analysis", post(handle_internal_visual_analysis))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
@@ -1555,6 +1556,134 @@ pub struct WebhookBody {
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub runtime_context: Option<crate::channels::runtime_router::RuntimeWebhookContext>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualAnalysisBody {
+    #[serde(default, alias = "request_text")]
+    pub request_text: String,
+    #[serde(default, alias = "image_refs")]
+    pub image_refs: Vec<String>,
+    #[serde(default)]
+    pub source: Option<serde_json::Value>,
+}
+
+/// POST /internal/visual-analysis — internal runtime visual processor endpoint.
+///
+/// Tenant services can call this only through the runner gateway token. The
+/// actual model call stays inside ZeroClaw's dedicated multimodal processor so
+/// model routing, fallback, and remote budget accounting remain centralized.
+async fn handle_internal_visual_analysis(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<VisualAnalysisBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if !is_internal_visual_analysis_authorized(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Unauthorized internal visual analysis request"
+            })),
+        )
+            .into_response();
+    }
+
+    let Json(body) = match body {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("Invalid JSON body: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let image_refs = body
+        .image_refs
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if image_refs.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "image_refs must contain at least one image reference"
+            })),
+        )
+            .into_response();
+    }
+
+    let config = state.config.lock().clone();
+    match crate::multimodal::analyze_image_refs_to_visual_analysis(
+        &body.request_text,
+        &image_refs,
+        &config.multimodal,
+        &config.reliability,
+        Some(config.workspace_dir.as_path()),
+    )
+    .await
+    {
+        Ok(analysis) => {
+            let parsed = serde_json::from_str::<serde_json::Value>(&analysis)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": analysis }));
+            Json(serde_json::json!({
+                "ok": true,
+                "schema_version": "visual_analysis.v1",
+                "analysis": parsed,
+                "processor": {
+                    "provider": config.multimodal.processor.provider,
+                    "model": config.multimodal.processor.model,
+                    "mode": config.multimodal.processor.mode,
+                    "budget_component": "multimodal_processor"
+                },
+                "source": body.source,
+            }))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": error.to_string(),
+                "schema_version": "visual_analysis.v1"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn is_internal_visual_analysis_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if bearer.is_some_and(|token| state.pairing.is_authenticated(token)) {
+        return true;
+    }
+
+    let expected = std::env::var("RUNNER_GATEWAY_API_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let provided = headers
+        .get("x-runner-gateway-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (expected.as_deref(), provided) {
+        (Some(expected), Some(provided)) => constant_time_eq(expected, provided),
+        _ => false,
+    }
 }
 
 /// POST /webhook — main webhook endpoint
