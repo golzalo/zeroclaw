@@ -2003,6 +2003,9 @@ fn extract_artifact_references(text: &str) -> Vec<String> {
     .unwrap()
     .captures_iter(text)
     {
+        if marker_looks_like_json_string_value(text, capture.get(0).map_or(0, |m| m.start())) {
+            continue;
+        }
         let Some(path) = capture.get(1).map(|m| m.as_str().trim()) else {
             continue;
         };
@@ -2028,6 +2031,9 @@ fn extract_artifact_references(text: &str) -> Vec<String> {
         if normalized_candidate.is_empty() {
             continue;
         }
+        if artifact_candidate_contains_json_syntax(normalized_candidate) {
+            continue;
+        }
         if !looks_like_artifact_path_reference(normalized_candidate) {
             continue;
         }
@@ -2041,6 +2047,23 @@ fn extract_artifact_references(text: &str) -> Vec<String> {
     }
 
     found
+}
+
+fn marker_looks_like_json_string_value(text: &str, marker_start: usize) -> bool {
+    let Some(prefix) = text.get(..marker_start) else {
+        return false;
+    };
+    let prefix = prefix.trim_end();
+    if !prefix.ends_with('"') {
+        return false;
+    }
+
+    let before_value_quote = prefix[..prefix.len().saturating_sub(1)].trim_end();
+    before_value_quote.ends_with(':')
+}
+
+fn artifact_candidate_contains_json_syntax(candidate: &str) -> bool {
+    candidate.contains('"') || candidate.contains('\'') || candidate.contains("\":")
 }
 
 fn strip_artifact_marker_prefix(candidate: &str) -> &str {
@@ -8245,6 +8268,30 @@ Encontré estos 5 archivos en Google Drive:
                 "/tmp/report.pdf".to_string(),
                 "outbox/documents/data.csv".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn artifact_reference_extraction_ignores_json_path_fields() {
+        let output = r#"{"artifactPath":"output/artifact.csv","csvPath":"output/artifact.csv","artifact":{"path":"output/artifact.csv","relativePath":"output/artifact.csv"}}"#;
+
+        assert!(extract_artifact_references(output).is_empty());
+    }
+
+    #[test]
+    fn artifact_reference_extraction_ignores_json_marker_fields() {
+        let output = r#"{"marker":"[DOCUMENT:/zeroclaw-data/workspace/outbox/documents/report.csv]"}"#;
+
+        assert!(extract_artifact_references(output).is_empty());
+    }
+
+    #[test]
+    fn artifact_reference_extraction_keeps_user_visible_marker_after_label() {
+        let output = "Adjunto: [DOCUMENT:/zeroclaw-data/workspace/outbox/documents/report.csv]";
+
+        assert_eq!(
+            extract_artifact_references(output),
+            vec!["/zeroclaw-data/workspace/outbox/documents/report.csv".to_string()]
         );
     }
 
