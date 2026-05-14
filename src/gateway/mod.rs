@@ -1174,6 +1174,44 @@ fn truncate_context_text(value: &str, max_chars: usize) -> String {
     result
 }
 
+fn mobile_openrouter_preset_text_only_image_message(
+    message: &str,
+    runtime_context: Option<&crate::channels::runtime_router::RuntimeWebhookContext>,
+    provider: &str,
+    model: &str,
+) -> Option<String> {
+    if !provider.eq_ignore_ascii_case("openrouter") || !model.trim().starts_with("@preset/") {
+        return None;
+    }
+    let channel = runtime_context
+        .and_then(|context| context.channel.as_deref())
+        .unwrap_or_default();
+    if !channel.eq_ignore_ascii_case("mobile") || !message.contains("[IMAGE:") {
+        return None;
+    }
+
+    let (cleaned, refs) = crate::multimodal::parse_image_markers(message);
+    if refs.is_empty() {
+        return None;
+    }
+
+    let mut next = cleaned.trim().to_string();
+    if !next.is_empty() {
+        next.push_str("\n\n");
+    }
+    next.push_str("[Adjuntos de imagen recibidos]\n");
+    for (index, reference) in refs.iter().enumerate() {
+        let label = index + 1;
+        next.push_str(&format!("- Imagen {label}: {reference}\n"));
+    }
+    next.push_str(
+        "\nNota de sistema: el preset actual no debe recibir imagenes como input multimodal. \
+         Trata estas rutas como adjuntos recibidos y responde al usuario sin fallar. \
+         Si el usuario pide analizar visualmente la imagen, explica brevemente que no podes verla con el modelo actual.",
+    );
+    Some(next)
+}
+
 fn effective_webhook_agentic(webhook_body: &WebhookBody) -> bool {
     webhook_body.agentic
 }
@@ -1661,16 +1699,24 @@ async fn handle_webhook(
         });
 
     let effective_agentic = effective_webhook_agentic(&webhook_body);
+    let effective_message = mobile_openrouter_preset_text_only_image_message(
+        message,
+        webhook_body.runtime_context.as_ref(),
+        &provider_label,
+        &state.model,
+    )
+    .unwrap_or_else(|| message.to_string());
+
     let response_result = if effective_agentic {
         run_gateway_chat_with_tools(
             &state,
-            message,
+            &effective_message,
             session_id.as_deref(),
             webhook_body.runtime_context.as_ref(),
         )
         .await
     } else {
-        run_gateway_chat_simple(&state, message).await
+        run_gateway_chat_simple(&state, &effective_message).await
     };
 
     match response_result {
