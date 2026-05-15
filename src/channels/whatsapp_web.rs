@@ -59,6 +59,8 @@ use wa_rs_core::iq::groups::GROUP_IQ_NAMESPACE;
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_core::iq::spec::IqSpec;
 #[cfg(feature = "whatsapp-web")]
+use wa_rs_core::proto_helpers::MessageExt;
+#[cfg(feature = "whatsapp-web")]
 use wa_rs_core::request::InfoQuery;
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_binary::builder::NodeBuilder;
@@ -68,7 +70,7 @@ use wa_rs_binary::jid::GROUP_SERVER;
 use wa_rs_binary::node::{Node, NodeContent};
 
 #[cfg(feature = "whatsapp-web")]
-const WHATSAPP_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+const WHATSAPP_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_DOCUMENT_MAX_BYTES: usize = 15 * 1024 * 1024;
 #[cfg(feature = "whatsapp-web")]
@@ -108,6 +110,10 @@ const WHATSAPP_COMMUNITY_LINK_TOOL_TOTAL_BUDGET_SECS: u64 = 20;
 const WHATSAPP_OFFICIAL_GROUP_VERIFY_INTERVAL: Duration = Duration::from_secs(3 * 60);
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_OFFICIAL_GROUP_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(10 * 60);
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_MEDIA_BUNDLE_DEBOUNCE: Duration = Duration::from_secs(8);
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_MEDIA_BUNDLE_LOOKBACK: Duration = Duration::from_secs(120);
 
 #[cfg(feature = "whatsapp-web")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +130,13 @@ enum WhatsAppAttachmentKind {
 struct WhatsAppAttachment {
     kind: WhatsAppAttachmentKind,
     target: String,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone)]
+struct PendingWhatsAppMediaTurn {
+    message: ChannelMessage,
+    created_at: Instant,
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -529,6 +542,10 @@ pub struct WhatsAppWebChannel {
     official_group_last_verified_at: Arc<Mutex<Option<Instant>>>,
     /// Cooldown after a rate-limited remote verification to avoid hammering WhatsApp.
     official_group_verify_backoff_until: Arc<Mutex<Option<Instant>>>,
+    /// Text/caption wake-token turns waiting briefly for WhatsApp media that may
+    /// arrive as a separate event from the same user-visible message.
+    pending_media_turns:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, PendingWhatsAppMediaTurn>>>,
 }
 
 impl WhatsAppWebChannel {
@@ -579,6 +596,7 @@ impl WhatsAppWebChannel {
             )),
             official_group_last_verified_at: Arc::new(Mutex::new(None)),
             official_group_verify_backoff_until: Arc::new(Mutex::new(None)),
+            pending_media_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let restored =
             Self::rehydrate_managed_groups(Some(&channel.official_group_jid), &channel.managed_groups);
@@ -2891,6 +2909,42 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn extract_visible_message_text(msg: &wa_rs_proto::whatsapp::Message) -> Option<String> {
+        let mut parts = Vec::new();
+        let mut push_part = |value: Option<&str>| {
+            let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+                return;
+            };
+            if !parts.iter().any(|part: &String| part == value) {
+                parts.push(value.to_string());
+            }
+        };
+
+        push_part(msg.text_content());
+        push_part(
+            msg.image_message
+                .as_deref()
+                .and_then(|image| image.caption.as_deref()),
+        );
+        push_part(
+            msg.document_message
+                .as_deref()
+                .and_then(|document| document.caption.as_deref()),
+        );
+        push_part(
+            msg.video_message
+                .as_deref()
+                .and_then(|video| video.caption.as_deref()),
+        );
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     fn extract_context_info<'a>(
         msg: &'a wa_rs_proto::whatsapp::Message,
     ) -> Option<&'a wa_rs_proto::whatsapp::ContextInfo> {
@@ -3019,6 +3073,165 @@ impl WhatsAppWebChannel {
                 replied_to_agent: trigger.replied_to_agent,
             },
         )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn conversation_policy_requires_visual_analysis(
+        conversation_policy: Option<&ObservedGroupConfig>,
+    ) -> bool {
+        let Some(policy) = conversation_policy else {
+            return false;
+        };
+        if policy.procedure_job_slug.as_deref().unwrap_or("").trim().is_empty() {
+            return false;
+        }
+
+        [
+            policy.procedure_input_schema.as_deref(),
+            policy.procedure_input_contract.as_deref(),
+            policy.procedure_sop.as_deref(),
+            policy.procedure_summary.as_deref(),
+            policy.objective.as_deref(),
+            policy.goal.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| {
+            let normalized = value.to_ascii_lowercase();
+            normalized.contains("visual_analysis")
+                || normalized.contains("visualanalysisv1")
+                || normalized.contains("image analysis")
+                || normalized.contains("ocr")
+        })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn content_has_image_marker(content: &str) -> bool {
+        content.contains("[IMAGE:")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn store_pending_media_bundle(
+        pending_media_turns: &Arc<
+            std::sync::Mutex<std::collections::HashMap<String, PendingWhatsAppMediaTurn>>,
+        >,
+        bundle_key: String,
+        message: ChannelMessage,
+    ) {
+        if let Ok(mut pending) = pending_media_turns.lock() {
+            pending.insert(
+                bundle_key.clone(),
+                PendingWhatsAppMediaTurn {
+                    message,
+                    created_at: Instant::now(),
+                },
+            );
+            tracing::debug!(
+                chat = %bundle_key,
+                "WhatsApp Web media bundle stored image turn awaiting wake-token text"
+            );
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_or_defer_media_bundle(
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        pending_media_turns: Arc<
+            std::sync::Mutex<std::collections::HashMap<String, PendingWhatsAppMediaTurn>>,
+        >,
+        bundle_key: String,
+        message: ChannelMessage,
+        should_defer_for_media: bool,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<ChannelMessage>> {
+        let message_has_image = Self::content_has_image_marker(&message.content);
+
+        if message_has_image {
+            let pending = pending_media_turns
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(&bundle_key));
+            if let Some(mut pending) = pending {
+                if pending.created_at.elapsed() <= WHATSAPP_MEDIA_BUNDLE_LOOKBACK {
+                    pending.message.content = format!(
+                        "{}\n\n{}",
+                        pending.message.content.trim(),
+                        message.content.trim()
+                    );
+                    pending.message.timestamp = message.timestamp;
+                    tracing::debug!(
+                        chat = %bundle_key,
+                        "WhatsApp Web media bundle merged wake-token text with image attachment"
+                    );
+                    return tx.send(pending.message).await;
+                }
+            }
+        }
+
+        if should_defer_for_media && !message_has_image {
+            let pending = pending_media_turns
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(&bundle_key));
+            if let Some(pending) = pending {
+                if pending.created_at.elapsed() <= WHATSAPP_MEDIA_BUNDLE_LOOKBACK
+                    && Self::content_has_image_marker(&pending.message.content)
+                {
+                    let mut bundled = message.clone();
+                    bundled.content = format!(
+                        "{}\n\n{}",
+                        message.content.trim(),
+                        pending.message.content.trim()
+                    );
+                    tracing::debug!(
+                        chat = %bundle_key,
+                        "WhatsApp Web media bundle merged image attachment with wake-token text"
+                    );
+                    return tx.send(bundled).await;
+                }
+            }
+
+            let message_id = message.id.clone();
+            if let Ok(mut pending) = pending_media_turns.lock() {
+                pending.insert(
+                    bundle_key.clone(),
+                    PendingWhatsAppMediaTurn {
+                        message: message.clone(),
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+            let pending_media_turns_for_task = pending_media_turns.clone();
+            let tx_for_task = tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(WHATSAPP_MEDIA_BUNDLE_DEBOUNCE).await;
+                let pending = {
+                    pending_media_turns_for_task
+                        .lock()
+                        .ok()
+                        .and_then(|mut pending| match pending.get(&bundle_key) {
+                            Some(current) if current.message.id == message_id => {
+                                pending.remove(&bundle_key)
+                            }
+                            _ => None,
+                        })
+                };
+                if let Some(pending) = pending {
+                    tracing::debug!(
+                        chat = %bundle_key,
+                        "WhatsApp Web media bundle debounce elapsed without image; dispatching text turn"
+                    );
+                    if let Err(err) = tx_for_task.send(pending.message).await {
+                        tracing::error!(
+                            "Failed to send deferred WhatsApp media-bundle message to channel: {}",
+                            err
+                        );
+                    }
+                }
+            });
+            return Ok(());
+        }
+
+        tx.send(message).await
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -4800,7 +5013,6 @@ impl Channel for WhatsAppWebChannel {
         use wa_rs::pair_code::PairCodeOptions;
         use wa_rs::store::{Device, DeviceStore};
         use wa_rs_binary::jid::JidExt as _;
-        use wa_rs_core::proto_helpers::MessageExt;
         use wa_rs_core::types::events::Event;
         use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
         use wa_rs_ureq_http::UreqHttpClient;
@@ -4871,6 +5083,7 @@ impl Channel for WhatsAppWebChannel {
             let official_group_jid = self.official_group_jid.clone();
             let managed_groups = self.managed_groups.clone();
             let support_provisioning_state = self.support_provisioning_state.clone();
+            let pending_media_turns = self.pending_media_turns.clone();
 
             tracing::info!(
                 raw_pair_phone = ?self.pair_phone,
@@ -4907,6 +5120,7 @@ impl Channel for WhatsAppWebChannel {
                     let official_group_jid = official_group_jid.clone();
                     let managed_groups = managed_groups.clone();
                     let support_provisioning_state = support_provisioning_state.clone();
+                    let pending_media_turns = pending_media_turns.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -5153,6 +5367,8 @@ impl Channel for WhatsAppWebChannel {
                                     Self::collect_document_markers(&client, content_msg).await;
                                 let attachment_count =
                                     image_markers.len() + document_markers.len();
+                                let message_text =
+                                    Self::extract_visible_message_text(content_msg);
 
                                 // Use transcribed voice text as plain user text, so reminder/tool
                                 // detection sees the same shape as a typed message.
@@ -5164,15 +5380,8 @@ impl Channel for WhatsAppWebChannel {
                                         "WhatsApp Web: treating transcribed voice note as plain text"
                                     );
                                     sections.push(vt.clone());
-                                } else {
-                                    let text = content_msg
-                                        .text_content()
-                                        .unwrap_or("")
-                                        .trim()
-                                        .to_string();
-                                    if !text.is_empty() {
-                                        sections.push(text);
-                                    }
+                                } else if let Some(ref text) = message_text {
+                                    sections.push(text.clone());
                                 }
 
                                 sections.extend(image_markers);
@@ -5181,17 +5390,50 @@ impl Channel for WhatsAppWebChannel {
                                 let content = sections.join("\n\n");
                                 let self_identity_aliases =
                                     observation_service.load_self_identity_aliases();
-                                let observed_group_trigger = match decision.chat_kind {
+                                let mut observed_group_trigger = match decision.chat_kind {
                                     WhatsAppChatKind::Group | WhatsAppChatKind::Direct => {
                                         Self::extract_observed_group_trigger(
                                             content_msg,
-                                            content_msg.text_content(),
+                                            voice_text
+                                                .as_deref()
+                                                .or(message_text.as_deref()),
                                             self_phone.as_deref(),
                                             &self_identity_aliases,
                                         )
                                     }
                                     WhatsAppChatKind::SelfChat => ObservedGroupTrigger::default(),
                                 };
+                                let content_has_image_marker =
+                                    Self::content_has_image_marker(&content);
+                                let policy_requires_visual_analysis =
+                                    Self::conversation_policy_requires_visual_analysis(
+                                        conversation_policy.as_ref(),
+                                    );
+                                let media_bundle_key = chat.clone();
+                                let has_pending_media_bundle = pending_media_turns
+                                    .lock()
+                                    .map(|pending| {
+                                        pending
+                                            .get(&media_bundle_key)
+                                            .is_some_and(|pending| {
+                                                pending.created_at.elapsed()
+                                                    <= WHATSAPP_MEDIA_BUNDLE_DEBOUNCE * 3
+                                                    && !Self::content_has_image_marker(
+                                                        &pending.message.content,
+                                                    )
+                                            })
+                                    })
+                                    .unwrap_or(false);
+                                if content_has_image_marker
+                                    && policy_requires_visual_analysis
+                                    && has_pending_media_bundle
+                                {
+                                    observed_group_trigger.mentions_agent = true;
+                                    tracing::debug!(
+                                        chat = %chat,
+                                        "WhatsApp Web media bundle image matched pending wake-token turn"
+                                    );
+                                }
 
                                 tracing::info!(
                                     "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={}, attachments={})",
@@ -5263,6 +5505,38 @@ impl Channel for WhatsAppWebChannel {
                                         &observed_group_trigger,
                                     );
                                     if !should_invoke {
+                                        if policy_requires_visual_analysis
+                                            && content_has_image_marker
+                                        {
+                                            let reply_target = Self::resolve_reply_target(
+                                                &chat,
+                                                decision.chat_kind,
+                                                chat_is_lid,
+                                                mapped_chat_phone.as_deref(),
+                                                self_phone.as_deref(),
+                                                &official_group_jid,
+                                            );
+                                            let runtime_channel = if sender_is_owner {
+                                                super::WHATSAPP_MAIN_RUNTIME_CHANNEL
+                                            } else {
+                                                super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
+                                            };
+                                            Self::store_pending_media_bundle(
+                                                &pending_media_turns,
+                                                media_bundle_key.clone(),
+                                                ChannelMessage {
+                                                    id: uuid::Uuid::new_v4().to_string(),
+                                                    channel: runtime_channel.to_string(),
+                                                    sender: normalized.clone(),
+                                                    reply_target,
+                                                    content: content.clone(),
+                                                    timestamp: chrono::Utc::now().timestamp()
+                                                        as u64,
+                                                    thread_ts: None,
+                                                    interruption_scope_id: None,
+                                                },
+                                            );
+                                        }
                                         tracing::debug!(
                                             chat = %chat,
                                             mode = conversation_policy
@@ -5331,6 +5605,38 @@ impl Channel for WhatsAppWebChannel {
                                             )
                                         });
                                     if !should_invoke {
+                                        if policy_requires_visual_analysis
+                                            && content_has_image_marker
+                                        {
+                                            let reply_target = Self::resolve_reply_target(
+                                                &chat,
+                                                decision.chat_kind,
+                                                chat_is_lid,
+                                                mapped_chat_phone.as_deref(),
+                                                self_phone.as_deref(),
+                                                &official_group_jid,
+                                            );
+                                            let runtime_channel = if sender_is_owner {
+                                                super::WHATSAPP_MAIN_RUNTIME_CHANNEL
+                                            } else {
+                                                super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
+                                            };
+                                            Self::store_pending_media_bundle(
+                                                &pending_media_turns,
+                                                media_bundle_key.clone(),
+                                                ChannelMessage {
+                                                    id: uuid::Uuid::new_v4().to_string(),
+                                                    channel: runtime_channel.to_string(),
+                                                    sender: normalized.clone(),
+                                                    reply_target,
+                                                    content: content.clone(),
+                                                    timestamp: chrono::Utc::now().timestamp()
+                                                        as u64,
+                                                    thread_ts: None,
+                                                    interruption_scope_id: None,
+                                                },
+                                            );
+                                        }
                                         tracing::debug!(
                                             chat = %chat,
                                             mode = conversation_policy
@@ -5439,19 +5745,29 @@ impl Channel for WhatsAppWebChannel {
                                     super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
                                 };
 
-                                if let Err(e) = tx_inner
-                                    .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        channel: runtime_channel.to_string(),
-                                        sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group).
-                                        reply_target,
-                                        content,
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
-                                        interruption_scope_id: None,
-                                    })
-                                    .await
+                                let should_defer_for_media = policy_requires_visual_analysis
+                                    && observed_group_trigger.mentions_agent
+                                    && !content_has_image_marker;
+                                let channel_message = ChannelMessage {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    channel: runtime_channel.to_string(),
+                                    sender: normalized.clone(),
+                                    // Reply to the originating chat JID (DM or group).
+                                    reply_target,
+                                    content,
+                                    timestamp: chrono::Utc::now().timestamp() as u64,
+                                    thread_ts: None,
+                                    interruption_scope_id: None,
+                                };
+
+                                if let Err(e) = Self::send_or_defer_media_bundle(
+                                    tx_inner,
+                                    pending_media_turns.clone(),
+                                    media_bundle_key,
+                                    channel_message,
+                                    should_defer_for_media,
+                                )
+                                .await
                                 {
                                     tracing::error!("Failed to send message to channel: {}", e);
                                 } else {
@@ -6203,6 +6519,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -6276,6 +6593,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491159297734".to_string()),
             rotate_after_bytes: 1024,
@@ -6311,6 +6629,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -6347,6 +6666,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -6383,6 +6703,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -6449,6 +6770,32 @@ mod tests {
             Some("+15551234567"),
             &[],
         );
+        assert!(trigger.mentions_agent);
+        assert!(!trigger.replied_to_agent);
+        assert!(trigger.should_invoke());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_trigger_detects_image_caption_wake_token() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            image_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ImageMessage {
+                    caption: Some("@s86 extrae esta imagen".to_string()),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let text = WhatsAppWebChannel::extract_visible_message_text(&msg);
+
+        let trigger = WhatsAppWebChannel::extract_observed_group_trigger(
+            &msg,
+            text.as_deref(),
+            Some("+15551234567"),
+            &[],
+        );
+        assert_eq!(text.as_deref(), Some("@s86 extrae esta imagen"));
         assert!(trigger.mentions_agent);
         assert!(!trigger.replied_to_agent);
         assert!(trigger.should_invoke());
@@ -6613,6 +6960,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -6679,6 +7027,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -6714,6 +7063,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -6781,6 +7131,7 @@ mod tests {
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
+            procedure_input_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,

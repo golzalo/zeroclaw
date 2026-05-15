@@ -1313,6 +1313,39 @@ pub struct MultimodalConfig {
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
+    /// Optional dedicated vision processor used to turn image inputs into text
+    /// before the main agent/model sees the turn.
+    #[serde(default)]
+    pub processor: MultimodalProcessorConfig,
+}
+
+/// Dedicated visual understanding stage (`[multimodal.processor]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MultimodalProcessorConfig {
+    /// Enable deterministic image preprocessing before the main model call.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Provider used for image understanding.
+    #[serde(default = "default_multimodal_processor_provider")]
+    pub provider: String,
+    /// Vision-capable model or OpenRouter preset used for image understanding.
+    #[serde(default = "default_multimodal_processor_model")]
+    pub model: String,
+    /// Temperature for visual extraction.
+    #[serde(
+        default = "default_multimodal_processor_temperature",
+        deserialize_with = "deserialize_temperature"
+    )]
+    pub temperature: f64,
+    /// Processing mode. Currently informational; `preprocess` is the stable mode.
+    #[serde(default = "default_multimodal_processor_mode")]
+    pub mode: String,
+    /// Include source paths/URLs in the text context given to the main model.
+    #[serde(default = "default_true")]
+    pub include_image_paths: bool,
+    /// Workspace-relative Markdown file containing the visual processor system prompt.
+    #[serde(default = "default_multimodal_processor_prompt_file")]
+    pub prompt_file: String,
 }
 
 fn default_multimodal_max_images() -> usize {
@@ -1338,6 +1371,41 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
+            processor: MultimodalProcessorConfig::default(),
+        }
+    }
+}
+
+fn default_multimodal_processor_provider() -> String {
+    "openrouter".into()
+}
+
+fn default_multimodal_processor_model() -> String {
+    "@preset/vision".into()
+}
+
+fn default_multimodal_processor_temperature() -> f64 {
+    0.0
+}
+
+fn default_multimodal_processor_mode() -> String {
+    "preprocess".into()
+}
+
+fn default_multimodal_processor_prompt_file() -> String {
+    "MULTIMODAL_PROCESSOR.md".into()
+}
+
+impl Default for MultimodalProcessorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_multimodal_processor_provider(),
+            model: default_multimodal_processor_model(),
+            temperature: default_multimodal_processor_temperature(),
+            mode: default_multimodal_processor_mode(),
+            include_image_paths: true,
+            prompt_file: default_multimodal_processor_prompt_file(),
         }
     }
 }
@@ -7506,6 +7574,18 @@ impl Config {
             }
             if route.model.trim().is_empty() {
                 anyhow::bail!("model_routes[{i}].model must not be empty");
+            }
+        }
+
+        if self.multimodal.processor.enabled {
+            if self.multimodal.processor.provider.trim().is_empty() {
+                anyhow::bail!("multimodal.processor.provider must not be empty when enabled");
+            }
+            if self.multimodal.processor.model.trim().is_empty() {
+                anyhow::bail!("multimodal.processor.model must not be empty when enabled");
+            }
+            if self.multimodal.processor.prompt_file.trim().is_empty() {
+                anyhow::bail!("multimodal.processor.prompt_file must not be empty when enabled");
             }
         }
 

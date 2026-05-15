@@ -51,6 +51,46 @@ impl WhatsAppRunPolicyProcedureTool {
 
         None
     }
+
+    fn normalize_input_for_tenant_web(
+        value: serde_json::Value,
+        workspace_dir: &std::path::Path,
+    ) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(input) => {
+                serde_json::Value::String(Self::normalize_string_for_tenant_web(
+                    &input,
+                    workspace_dir,
+                ))
+            }
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| Self::normalize_input_for_tenant_web(item, workspace_dir))
+                    .collect(),
+            ),
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(key, item)| {
+                        (
+                            key,
+                            Self::normalize_input_for_tenant_web(item, workspace_dir),
+                        )
+                    })
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    fn normalize_string_for_tenant_web(input: &str, workspace_dir: &std::path::Path) -> String {
+        let Ok(relative) = std::path::Path::new(input).strip_prefix(workspace_dir) else {
+            return input.to_string();
+        };
+        let mut normalized = PathBuf::from("/workspace");
+        normalized.push(relative);
+        normalized.display().to_string()
+    }
 }
 
 #[async_trait]
@@ -60,7 +100,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
     }
 
     fn description(&self) -> &str {
-        "Run the tenant job bound to the current WhatsApp conversation policy. The caller cannot choose an arbitrary job; the job is resolved from the provided chat_jid policy."
+        "Run the tenant job bound to the current WhatsApp conversation policy. The caller cannot choose an arbitrary job; in WhatsApp channel turns the runtime binds the current chat automatically."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -69,7 +109,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
             "properties": {
                 "chat_jid": {
                     "type": "string",
-                    "description": "Current WhatsApp group or direct chat JID. Use the current reply_target for the conversation."
+                    "description": "Optional current WhatsApp group or direct chat JID. In WhatsApp channel turns, omit this; the runtime binds the current reply_target automatically. Direct/manual calls must provide it."
                 },
                 "input": {
                     "type": "object",
@@ -80,7 +120,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
                     "description": "Optional timeout for the bound procedure run. Defaults to 60000 and is capped at 180000."
                 }
             },
-            "required": ["chat_jid", "input"],
+            "required": ["input"],
             "additionalProperties": false
         })
     }
@@ -204,6 +244,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
             }
         };
 
+        let input = Self::normalize_input_for_tenant_web(input, &self.workspace_dir);
         let body_text = match serde_json::to_string(&input) {
             Ok(body_text) => body_text,
             Err(err) => {
@@ -310,6 +351,7 @@ mod tests {
                     procedure_job_slug: procedure_job_slug.map(str::to_string),
                     procedure_summary: None,
                     procedure_input_schema: None,
+                    procedure_input_contract: None,
                     procedure_sop: None,
                     canonical_phone: None,
                     rotate_after_bytes: 512 * 1024,
@@ -477,5 +519,32 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("does not accept `command`"));
+    }
+
+    #[test]
+    fn normalizes_workspace_paths_for_tenant_web() {
+        let workspace = std::path::Path::new("/zeroclaw-data/workspace");
+        let input = json!({
+            "image_path": "/zeroclaw-data/workspace/attachments/whatsapp/invoice.jpg",
+            "nested": {
+                "paths": [
+                    "/zeroclaw-data/workspace/outbox/documents/report.xlsx",
+                    "/tmp/other.jpg"
+                ]
+            }
+        });
+
+        let normalized =
+            WhatsAppRunPolicyProcedureTool::normalize_input_for_tenant_web(input, workspace);
+
+        assert_eq!(
+            normalized["image_path"],
+            "/workspace/attachments/whatsapp/invoice.jpg"
+        );
+        assert_eq!(
+            normalized["nested"]["paths"][0],
+            "/workspace/outbox/documents/report.xlsx"
+        );
+        assert_eq!(normalized["nested"]["paths"][1], "/tmp/other.jpg");
     }
 }
