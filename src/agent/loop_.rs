@@ -5763,6 +5763,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut side_effect_claims = SideEffectClaimTracker::default();
     let mut requests = Vec::new();
     let mut tool_failures = Vec::new();
+    let mut blocked_by_policy: HashSet<(String, String)> = HashSet::new();
     let mut repeated_tool_failures: HashMap<(String, String, String), usize> = HashMap::new();
 
     for iteration in 0..max_iterations {
@@ -6557,7 +6558,7 @@ pub(crate) async fn run_tool_call_loop(
 
             let signature = tool_call_signature(&tool_name, &tool_args);
             let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
-            if !dedup_exempt && !seen_tool_signatures.insert(signature) {
+            if !dedup_exempt && (blocked_by_policy.contains(&signature) || !seen_tool_signatures.insert(signature)) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
                 );
@@ -6682,6 +6683,14 @@ pub(crate) async fn run_tool_call_loop(
                             activated_tools = ?activated_tool_names,
                             "Activated skill-scoped tools after read_skill"
                         );
+                    }
+                }
+            }
+
+            if !outcome.success {
+                if let Some(ref reason) = outcome.error_reason {
+                    if reason.contains("security policy") || reason.contains("disallowed by policy") {
+                        blocked_by_policy.insert(tool_call_signature(&call.name, &call.arguments));
                     }
                 }
             }

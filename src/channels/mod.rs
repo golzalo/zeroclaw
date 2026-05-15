@@ -180,8 +180,7 @@ type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
-/// Messages shorter than this (e.g. "ok", "thanks") are not stored,
-/// reducing noise in memory recall.
+#[allow(dead_code)]
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 /// Background sweep interval for indexing WhatsApp conversation journals into memory.
 const WHATSAPP_JOURNAL_INDEX_INTERVAL_SECS: u64 = 15;
@@ -351,6 +350,7 @@ struct ChannelRuntimeContext {
     system_prompt: Arc<String>,
     model: Arc<String>,
     temperature: f64,
+    #[allow(dead_code)]
     auto_save_memory: bool,
     max_tool_iterations: usize,
     min_relevance_score: f64,
@@ -562,6 +562,7 @@ fn is_allowed_skill_name(skill_name: &str, allowed_skills: Option<&[String]>) ->
         .any(|allowed| allowed.eq_ignore_ascii_case(skill_name))
 }
 
+#[cfg(test)]
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     // Include thread_ts for per-topic memory isolation in forum groups
     match &msg.thread_ts {
@@ -3792,23 +3793,6 @@ async fn process_channel_message(
             return;
         }
     };
-    if whatsapp_conversation_policy.is_none()
-        && ctx.auto_save_memory
-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !memory::should_skip_autosave_content(&msg.content)
-    {
-        let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
-            .store(
-                &autosave_key,
-                &msg.content,
-                crate::memory::MemoryCategory::Conversation,
-                Some(&history_key),
-            )
-            .await;
-    }
-
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
