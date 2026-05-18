@@ -360,6 +360,7 @@ mod tests {
                     last_rotated_at: None,
                     initial_outreach_sent_at: None,
                     initial_outreach_preview: None,
+                    reply_to_all: false,
                 },
             )]))
             .unwrap();

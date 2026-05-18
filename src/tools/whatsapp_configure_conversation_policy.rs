@@ -325,9 +325,13 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                 "clear_procedure": {
                     "type": "boolean",
                     "description": "When true, remove any existing procedure binding from this policy."
+                },
+                "reply_to_all": {
+                    "type": "boolean",
+                    "description": "When true, the agent answers every inbound message in this conversation. When false, the agent answers only messages that explicitly include @s86. Required — the skill must clarify with the user before calling."
                 }
             },
-            "required": ["target_kind", "mode", "delivery_chat_jid"]
+            "required": ["target_kind", "mode", "delivery_chat_jid", "reply_to_all"]
         })
     }
 
@@ -373,6 +377,10 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                 });
             }
         };
+        let reply_to_all = args
+            .get("reply_to_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let service = WhatsAppObservationService::new(self.workspace_dir.clone());
 
@@ -424,6 +432,7 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     Some(mode),
                     skill_name.as_deref(),
                     procedure.as_ref(),
+                    reply_to_all,
                 ) {
                     Ok(observed) => observed,
                     Err(err) => {
@@ -534,6 +543,7 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     canonical_phone.as_deref(),
                     skill_name.as_deref(),
                     procedure.as_ref(),
+                    reply_to_all,
                 ) {
                     Ok(observed) => observed,
                     Err(err) => {
@@ -625,7 +635,8 @@ mod tests {
                 "group_name": "Los Pibes",
                 "mode": "mention_reply",
                 "delivery_chat_jid": "120363408016257691@g.us",
-                "skill_name": "whatsapp_mention_reply"
+                "skill_name": "whatsapp_mention_reply",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -680,7 +691,8 @@ mod tests {
                     "required_current_turn_inputs": ["spend message"],
                     "on_invalid_input": "Ask for the missing spend details."
                 },
-                "procedure_sop": "Extract valid input, run the procedure, and reply from the result."
+                "procedure_sop": "Extract valid input, run the procedure, and reply from the result.",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -730,7 +742,8 @@ mod tests {
                 "procedure_job_slug": "spend-guard",
                 "procedure_input_schema": { "type": "object" },
                 "procedure_input_contract": "Require valid input before calling.",
-                "procedure_sop": "Run the procedure."
+                "procedure_sop": "Run the procedure.",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -774,7 +787,8 @@ mod tests {
                 "delivery_chat_jid": "120363408016257691@g.us",
                 "skill_name": "whatsapp_mention_reply",
                 "goal": "Answer only when summoned with lightweight jokes.",
-                "clear_procedure": true
+                "clear_procedure": true,
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -817,7 +831,8 @@ mod tests {
                 "mode": "mention_reply",
                 "delivery_chat_jid": "120363408016257691@g.us",
                 "goal": "Validate messages.",
-                "procedure_sop": "Run a missing job."
+                "procedure_sop": "Run a missing job.",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -854,7 +869,8 @@ mod tests {
                 "goal": "Validate messages.",
                 "procedure_job_slug": "spend-guard",
                 "procedure_input_contract": "Require valid input before calling.",
-                "procedure_sop": "Run the procedure."
+                "procedure_sop": "Run the procedure.",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -885,13 +901,14 @@ mod tests {
         let result = tool
             .execute(json!({
                 "target_kind": "group",
-                "group_name": "Los Pibes",
                 "mode": "mention_reply",
+                "group_name": "Los Pibes",
                 "delivery_chat_jid": "120363408016257691@g.us",
                 "goal": "Validate messages.",
                 "procedure_job_slug": "spend-guard",
                 "procedure_input_schema": { "type": "object" },
-                "procedure_sop": "Run the procedure."
+                "procedure_sop": "Run the procedure.",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -923,7 +940,8 @@ mod tests {
                 "mode": "objective_dm",
                 "delivery_chat_jid": "120363408016257691@g.us",
                 "objective": "Cerrar el acuerdo y validar pendientes.",
-                "skill_name": "whatsapp_objective_dm"
+                "skill_name": "whatsapp_objective_dm",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -976,7 +994,8 @@ mod tests {
                 "contact_name": "Gonzalo TIENDAMIA",
                 "mode": "observe_only",
                 "delivery_chat_jid": "120363408016257691@g.us",
-                "skill_name": "whatsapp_direct_observer"
+                "skill_name": "whatsapp_direct_observer",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -1016,7 +1035,8 @@ mod tests {
                 "contact_phone": "+54 9 11 3411 5686",
                 "mode": "observe_only",
                 "delivery_chat_jid": "5491134115686@s.whatsapp.net",
-                "skill_name": "whatsapp_direct_observer"
+                "skill_name": "whatsapp_direct_observer",
+                "reply_to_all": false
             }))
             .await
             .unwrap();
@@ -1026,6 +1046,52 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("control chat cannot be the same WhatsApp 1:1")));
+    }
+
+    #[tokio::test]
+    async fn configure_policy_with_reply_to_all_persists_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("skills").join("whatsapp_mention_reply");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: whatsapp_mention_reply\ndescription: Mention reply\n---\n# Mention Reply\n",
+        )
+        .unwrap();
+
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363025123456789@g.us".into(),
+                group_name: "Los Pibes".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let tool = WhatsAppConfigureConversationPolicyTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "skill_name": "whatsapp_mention_reply",
+                "reply_to_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let observed = service
+            .observed_group_config("120363025123456789@g.us")
+            .unwrap();
+        assert!(observed.reply_to_all);
     }
 
 }

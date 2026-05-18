@@ -9496,6 +9496,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 "Cerrar el acuerdo y validar el trabajo realizado.",
                 Some("+15551234567"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
 
@@ -9540,6 +9541,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     ),
                     clear_procedure: false,
                 }),
+                false,
             )
             .unwrap();
 
@@ -9588,6 +9590,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     ),
                     clear_procedure: false,
                 }),
+                false,
             )
             .unwrap();
         service
@@ -9602,6 +9605,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     clear_procedure: true,
                     ..Default::default()
                 }),
+                false,
             )
             .unwrap();
 
@@ -9639,6 +9643,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 "Cerrar el acuerdo y validar el trabajo realizado.",
                 Some("+15551234567"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
 

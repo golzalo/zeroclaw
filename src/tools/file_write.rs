@@ -168,12 +168,15 @@ impl Tool for FileWriteTool {
         }
 
         let write_result = if append {
-            tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&resolved_target)
-                .await
-                .and_then(|mut f| async move { f.write_all(content.as_bytes()).await }.await)
+            async {
+                let mut f = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&resolved_target)
+                    .await?;
+                f.write_all(content.as_bytes()).await
+            }
+            .await
         } else {
             tokio::fs::write(&resolved_target, content).await
         };

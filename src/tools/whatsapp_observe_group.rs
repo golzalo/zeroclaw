@@ -55,9 +55,13 @@ impl Tool for WhatsAppObserveGroupTool {
                 "skill_name": {
                     "type": "string",
                     "description": "Optional workspace skill name from workspace/skills. If omitted, the existing policy skill is preserved when present."
+                },
+                "reply_to_all": {
+                    "type": "boolean",
+                    "description": "When true, the agent answers every inbound message in this conversation. When false, the agent answers only messages that explicitly include @s86. Required — the skill must clarify with the user before calling."
                 }
             },
-            "required": ["delivery_chat_jid"]
+            "required": ["delivery_chat_jid", "reply_to_all"]
         })
     }
 
@@ -135,12 +139,18 @@ impl Tool for WhatsAppObserveGroupTool {
             }
         };
 
+        let reply_to_all = args
+            .get("reply_to_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let observed = match service.register_observed_group_with_mode_and_skill(
             &group.group_jid,
             &group.group_name,
             delivery_chat_jid,
             mode,
             skill_name.as_deref(),
+            reply_to_all,
         ) {
             Ok(observed) => observed,
             Err(err) => {
@@ -152,17 +162,20 @@ impl Tool for WhatsAppObserveGroupTool {
             }
         };
 
-        let mode_note = match observed.mode {
-            ConversationMode::ObserveOnly => {
+        let mode_note = match (observed.mode, observed.reply_to_all) {
+            (ConversationMode::ObserveOnly, _) => {
                 "Passive capture only; the agent will not reply inside that group."
             }
-            ConversationMode::MentionReply => {
+            (ConversationMode::MentionReply, true) | (ConversationMode::ManagedGroup, true) => {
+                "The agent will answer every inbound message."
+            }
+            (ConversationMode::MentionReply, false) => {
                 "The agent will only answer when a message explicitly includes `@s86`."
             }
-            ConversationMode::ObjectiveDm => {
+            (ConversationMode::ObjectiveDm, _) => {
                 "Reserved for direct-message objective workflows; group replies stay disabled."
             }
-            ConversationMode::ManagedGroup => {
+            (ConversationMode::ManagedGroup, false) => {
                 "The group is managed by the agent, but replies still require an explicit `@s86` summon."
             }
         };
@@ -223,7 +236,8 @@ mod tests {
                 "group_name": "Los Pibes",
                 "delivery_chat_jid": "120363408016257691@g.us",
                 "mode": "mention_reply",
-                "skill_name": "whatsapp_mention_reply"
+                "skill_name": "whatsapp_mention_reply",
+                "reply_to_all": false
             }))
             .await
             .unwrap();

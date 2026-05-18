@@ -104,9 +104,14 @@ pub fn should_invoke_restricted_worker(
     mode: ConversationMode,
     status: ConversationPolicyStatus,
     trigger: RestrictedConversationTrigger,
+    reply_to_all: bool,
 ) -> bool {
     if status != ConversationPolicyStatus::Active || !mode.allows_agent_reply() {
         return false;
+    }
+
+    if reply_to_all {
+        return true;
     }
 
     match (chat_kind, mode) {
@@ -131,6 +136,7 @@ mod tests {
             ConversationMode::MentionReply,
             ConversationPolicyStatus::Active,
             RestrictedConversationTrigger::default(),
+            false,
         ));
 
         assert!(should_invoke_restricted_worker(
@@ -141,6 +147,7 @@ mod tests {
                 mentions_agent: true,
                 replied_to_agent: false,
             },
+            false,
         ));
     }
 
@@ -151,6 +158,7 @@ mod tests {
             ConversationMode::ObjectiveDm,
             ConversationPolicyStatus::Active,
             RestrictedConversationTrigger::default(),
+            false,
         ));
 
         assert!(should_invoke_restricted_worker(
@@ -161,6 +169,7 @@ mod tests {
                 mentions_agent: false,
                 replied_to_agent: true,
             },
+            false,
         ));
     }
 
@@ -176,12 +185,14 @@ mod tests {
             ConversationMode::ObserveOnly,
             ConversationPolicyStatus::Active,
             trigger,
+            false,
         ));
         assert!(!should_invoke_restricted_worker(
             ConversationChatKind::Direct,
             ConversationMode::ObjectiveDm,
             ConversationPolicyStatus::Paused,
             trigger,
+            false,
         ));
     }
 
@@ -195,6 +206,57 @@ mod tests {
                 mentions_agent: true,
                 replied_to_agent: true,
             },
+            false,
+        ));
+    }
+
+    #[test]
+    fn reply_to_all_bypasses_trigger_when_mode_allows_reply() {
+        assert!(should_invoke_restricted_worker(
+            ConversationChatKind::Group,
+            ConversationMode::MentionReply,
+            ConversationPolicyStatus::Active,
+            RestrictedConversationTrigger::default(),
+            true,
+        ));
+        assert!(should_invoke_restricted_worker(
+            ConversationChatKind::Direct,
+            ConversationMode::ObjectiveDm,
+            ConversationPolicyStatus::Active,
+            RestrictedConversationTrigger::default(),
+            true,
+        ));
+        assert!(should_invoke_restricted_worker(
+            ConversationChatKind::Group,
+            ConversationMode::ManagedGroup,
+            ConversationPolicyStatus::Active,
+            RestrictedConversationTrigger::default(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn reply_to_all_is_ignored_when_status_inactive_or_observe_only() {
+        assert!(!should_invoke_restricted_worker(
+            ConversationChatKind::Group,
+            ConversationMode::MentionReply,
+            ConversationPolicyStatus::Paused,
+            RestrictedConversationTrigger::default(),
+            true,
+        ));
+        assert!(!should_invoke_restricted_worker(
+            ConversationChatKind::Group,
+            ConversationMode::ObserveOnly,
+            ConversationPolicyStatus::Active,
+            RestrictedConversationTrigger::default(),
+            true,
+        ));
+        assert!(!should_invoke_restricted_worker(
+            ConversationChatKind::Direct,
+            ConversationMode::ObjectiveDm,
+            ConversationPolicyStatus::Archived,
+            RestrictedConversationTrigger::default(),
+            true,
         ));
     }
 }

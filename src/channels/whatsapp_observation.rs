@@ -88,6 +88,8 @@ pub struct ObservedGroupConfig {
     pub initial_outreach_sent_at: Option<String>,
     #[serde(default)]
     pub initial_outreach_preview: Option<String>,
+    #[serde(default)]
+    pub reply_to_all: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,6 +308,7 @@ impl WhatsAppObservationService {
             delivery_chat_jid,
             None,
             None,
+            false,
         )
     }
 
@@ -322,6 +325,7 @@ impl WhatsAppObservationService {
             delivery_chat_jid,
             mode,
             None,
+            false,
         )
     }
 
@@ -332,6 +336,7 @@ impl WhatsAppObservationService {
         delivery_chat_jid: &str,
         mode: Option<ConversationMode>,
         skill_name: Option<&str>,
+        reply_to_all: bool,
     ) -> Result<ObservedGroupConfig> {
         self.register_observed_group_with_metadata(
             group_jid,
@@ -340,6 +345,7 @@ impl WhatsAppObservationService {
             mode,
             skill_name,
             None,
+            reply_to_all,
         )
     }
 
@@ -351,6 +357,7 @@ impl WhatsAppObservationService {
         mode: Option<ConversationMode>,
         skill_name: Option<&str>,
         procedure: Option<&ConversationProcedureMetadata>,
+        reply_to_all: bool,
     ) -> Result<ObservedGroupConfig> {
         let mut groups = self.load_observed_groups();
         let now = chrono::Utc::now().to_rfc3339();
@@ -380,6 +387,7 @@ impl WhatsAppObservationService {
                 last_rotated_at: None,
                 initial_outreach_sent_at: None,
                 initial_outreach_preview: None,
+                reply_to_all,
             });
         entry.group_name = group_name.to_string();
         entry.delivery_chat_jid = delivery_chat_jid.to_string();
@@ -401,6 +409,7 @@ impl WhatsAppObservationService {
         Self::apply_procedure_metadata(entry, procedure)?;
         entry.canonical_phone = None;
         entry.status = ConversationPolicyStatus::Active;
+        entry.reply_to_all = reply_to_all;
         if entry.rotate_after_bytes == 0 {
             entry.rotate_after_bytes = default_rotate_after_bytes();
         }
@@ -429,6 +438,7 @@ impl WhatsAppObservationService {
             objective,
             canonical_phone,
             None,
+            false,
         )
     }
 
@@ -441,6 +451,7 @@ impl WhatsAppObservationService {
         objective: &str,
         canonical_phone: Option<&str>,
         skill_name: Option<&str>,
+        reply_to_all: bool,
     ) -> Result<ObservedGroupConfig> {
         self.register_direct_chat_policy_with_metadata(
             chat_jid,
@@ -451,6 +462,7 @@ impl WhatsAppObservationService {
             canonical_phone,
             skill_name,
             None,
+            reply_to_all,
         )
     }
 
@@ -464,6 +476,7 @@ impl WhatsAppObservationService {
         canonical_phone: Option<&str>,
         skill_name: Option<&str>,
         procedure: Option<&ConversationProcedureMetadata>,
+        reply_to_all: bool,
     ) -> Result<ObservedGroupConfig> {
         let chat_jid = chat_jid.trim();
         if chat_jid.is_empty() {
@@ -539,6 +552,7 @@ impl WhatsAppObservationService {
                 last_rotated_at: None,
                 initial_outreach_sent_at: None,
                 initial_outreach_preview: None,
+                reply_to_all,
             });
         entry.group_jid = policy_jid;
         entry.group_name = chat_name.to_string();
@@ -559,6 +573,7 @@ impl WhatsAppObservationService {
         }
         Self::apply_procedure_metadata(entry, procedure)?;
         entry.canonical_phone = canonical_phone;
+        entry.reply_to_all = reply_to_all;
         if entry.rotate_after_bytes == 0 {
             entry.rotate_after_bytes = default_rotate_after_bytes();
         }
@@ -1770,7 +1785,15 @@ impl WhatsAppObservationService {
         }
 
         match message.role.as_str() {
-            "user" => Some(crate::providers::ChatMessage::user(content)),
+            "user" => {
+                let sender = message.sender.trim();
+                let labeled = if sender.is_empty() {
+                    content.to_string()
+                } else {
+                    format!("<ID: {sender}>\n{content}")
+                };
+                Some(crate::providers::ChatMessage::user(labeled))
+            }
             "assistant" => Some(crate::providers::ChatMessage::assistant(content)),
             _ => None,
         }
@@ -2140,7 +2163,7 @@ mod tests {
         assert_eq!(tail[0].role, "assistant");
         assert_eq!(tail[0].content, "Primera respuesta");
         assert_eq!(tail[1].role, "user");
-        assert_eq!(tail[1].content, "Segundo mensaje");
+        assert_eq!(tail[1].content, "<ID: Gonza>\nSegundo mensaje");
     }
 
     #[test]
@@ -2265,6 +2288,7 @@ mod tests {
                 "Ayudar con estrategias de temporada baja.",
                 Some("+54 9 11 3411 5686"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
 
@@ -2313,6 +2337,7 @@ mod tests {
                         last_rotated_at: None,
                         initial_outreach_sent_at: None,
                         initial_outreach_preview: None,
+                        reply_to_all: false,
                     },
                 ),
                 (
@@ -2341,6 +2366,7 @@ mod tests {
                         last_rotated_at: None,
                         initial_outreach_sent_at: None,
                         initial_outreach_preview: None,
+                        reply_to_all: false,
                     },
                 ),
             ]))
@@ -2377,6 +2403,7 @@ mod tests {
                 "",
                 Some("+54 9 11 7074-2021"),
                 Some("whatsapp_direct_observer"),
+                false,
             )
             .unwrap();
 
@@ -2408,6 +2435,7 @@ mod tests {
                 "Confirmar horario de encuentro despues de las 9:30.",
                 Some("+54 9 11 7074-2021"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
 
@@ -2600,6 +2628,7 @@ mod tests {
                 "Ayudar con estrategias de temporada baja.",
                 Some("+5491134115686"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
 
@@ -2622,6 +2651,7 @@ mod tests {
                 "Coordinar una fecha de encuentro.",
                 Some("+54 9 11 7074-2021"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
 
@@ -2655,6 +2685,7 @@ mod tests {
                 "__whatsapp_official_group__",
                 Some(ConversationMode::MentionReply),
                 Some("whatsapp_mention_reply"),
+                false,
             )
             .unwrap();
 

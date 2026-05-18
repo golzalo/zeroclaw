@@ -3040,6 +3040,7 @@ impl WhatsAppWebChannel {
                 mentions_agent: trigger.mentions_agent,
                 replied_to_agent: trigger.replied_to_agent,
             },
+            observed_group.reply_to_all,
         )
     }
 
@@ -3072,6 +3073,7 @@ impl WhatsAppWebChannel {
                 mentions_agent: trigger.mentions_agent,
                 replied_to_agent: trigger.replied_to_agent,
             },
+            observed_direct.reply_to_all,
         )
     }
 
@@ -5739,7 +5741,7 @@ impl Channel for WhatsAppWebChannel {
                                     self_phone.as_deref(),
                                     &official_group_jid,
                                 );
-                                let runtime_channel = if sender_is_owner && !direct_objective_policy_active {
+                                let runtime_channel = if sender_is_owner && !direct_objective_policy_active && !group_is_observed {
                                     super::WHATSAPP_MAIN_RUNTIME_CHANNEL
                                 } else {
                                     super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
@@ -6528,6 +6530,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
         assert!(WhatsAppWebChannel::allows_conversation_policy_override(
             &decision,
@@ -6602,6 +6605,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
         assert!(WhatsAppWebChannel::allows_conversation_policy_override(
             &decision,
@@ -6638,6 +6642,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
 
         assert!(WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
@@ -6675,6 +6680,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
 
         assert!(!WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
@@ -6712,6 +6718,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
 
         let wake_trigger = ObservedGroupTrigger {
@@ -6969,6 +6976,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
         let empty_trigger = ObservedGroupTrigger::default();
         assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
@@ -7036,6 +7044,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
 
         assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
@@ -7072,6 +7081,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
         let empty_trigger = ObservedGroupTrigger::default();
         let mention_trigger = ObservedGroupTrigger {
@@ -7087,6 +7097,131 @@ mod tests {
         assert!(WhatsAppWebChannel::should_invoke_observed_direct_agent(
             &direct_policy,
             &mention_trigger,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn observed_group_with_reply_to_all_invokes_without_wake_token() {
+        let policy = ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Los Pibes".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::MentionReply,
+            status: ConversationPolicyStatus::Active,
+            objective: None,
+            skill_name: Some("whatsapp_mention_reply".to_string()),
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_input_contract: None,
+            procedure_sop: None,
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+            reply_to_all: true,
+        };
+        let no_mention = ObservedGroupTrigger::default();
+        assert!(WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &policy,
+            false,
+            &no_mention,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn observed_direct_with_reply_to_all_invokes_without_wake_token() {
+        let policy = ObservedGroupConfig {
+            group_jid: "5491170742021@s.whatsapp.net".to_string(),
+            group_name: "Cliente Demo".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Direct,
+            mode: ConversationMode::ObjectiveDm,
+            status: ConversationPolicyStatus::Active,
+            objective: Some("Cerrar el acuerdo".to_string()),
+            skill_name: Some("whatsapp_objective_dm".to_string()),
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_input_contract: None,
+            procedure_sop: None,
+            canonical_phone: Some("+5491170742021".to_string()),
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+            reply_to_all: true,
+        };
+        let no_mention = ObservedGroupTrigger::default();
+        assert!(WhatsAppWebChannel::should_invoke_observed_direct_agent(
+            &policy,
+            &no_mention,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn reply_to_all_does_not_override_observe_only_or_paused() {
+        let base = ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Los Pibes".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::MentionReply,
+            status: ConversationPolicyStatus::Active,
+            objective: None,
+            skill_name: None,
+            goal: None,
+            procedure_job_slug: None,
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_input_contract: None,
+            procedure_sop: None,
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+            reply_to_all: true,
+        };
+        let no_mention = ObservedGroupTrigger::default();
+
+        let observe_only = ObservedGroupConfig {
+            mode: ConversationMode::ObserveOnly,
+            ..base.clone()
+        };
+        assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &observe_only,
+            false,
+            &no_mention,
+        ));
+
+        let paused = ObservedGroupConfig {
+            status: ConversationPolicyStatus::Paused,
+            ..base
+        };
+        assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &paused,
+            false,
+            &no_mention,
         ));
     }
 
@@ -7140,6 +7275,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: false,
         };
         let empty_trigger = ObservedGroupTrigger::default();
         assert!(!WhatsAppWebChannel::should_invoke_group_agent(

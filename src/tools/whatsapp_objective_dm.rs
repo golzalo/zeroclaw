@@ -263,6 +263,11 @@ impl Tool for WhatsAppObjectiveDmTool {
                 });
             }
         };
+        let reply_to_all = args
+            .get("reply_to_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let observed = match service.register_direct_chat_policy_with_skill(
             &chat_jid,
             &contact_name,
@@ -271,6 +276,7 @@ impl Tool for WhatsAppObjectiveDmTool {
             objective,
             canonical_phone.as_deref(),
             skill_name.as_deref(),
+            reply_to_all,
         ) {
             Ok(observed) => observed,
             Err(err) => {

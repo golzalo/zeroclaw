@@ -305,6 +305,7 @@ mod tests {
                 "Confirmar horario de encuentro despues de las 9:30.",
                 Some("+5491170742021"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
 
@@ -357,6 +358,7 @@ mod tests {
                 "Confirmar horario de encuentro despues de las 9:30.",
                 Some("+5491170742021"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
         service

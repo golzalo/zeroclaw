@@ -168,6 +168,7 @@ mod tests {
                 "Coordinar horario.",
                 Some("+54 9 11 7074-2021"),
                 Some("whatsapp_objective_dm"),
+                false,
             )
             .unwrap();
 
