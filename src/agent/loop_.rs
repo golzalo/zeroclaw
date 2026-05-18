@@ -424,7 +424,7 @@ const CONTINUATION_CHECKPOINT_OPEN_TAG: &str = "<continuation_checkpoint>";
 const CONTINUATION_CHECKPOINT_CLOSE_TAG: &str = "</continuation_checkpoint>";
 const CONTINUATION_CHECKPOINT_REF_OPEN_TAG: &str = "<continuation_checkpoint_ref>";
 const CONTINUATION_CHECKPOINT_REF_CLOSE_TAG: &str = "</continuation_checkpoint_ref>";
-const CONTINUATION_CHECKPOINT_SOURCE_CHAR_LIMIT: usize = 12_000;
+const CONTINUATION_CHECKPOINT_SOURCE_CHAR_LIMIT: usize = 60_000;
 const CONTINUATION_CHECKPOINT_FIELD_CHAR_LIMIT: usize = 900;
 
 const CONTINUE_REQUEST_HINTS: &[&str] = &[

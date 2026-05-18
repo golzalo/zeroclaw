@@ -3,6 +3,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt as _;
 
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
@@ -36,6 +37,10 @@ impl Tool for FileWriteTool {
                 "content": {
                     "type": "string",
                     "description": "Content to write to the file"
+                },
+                "append": {
+                    "type": "boolean",
+                    "description": "If true, append content to the file instead of overwriting. If the file does not exist it is created. Defaults to false."
                 }
             },
             "required": ["path", "content"]
@@ -52,6 +57,11 @@ impl Tool for FileWriteTool {
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
+
+        let append = args
+            .get("append")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -157,7 +167,18 @@ impl Tool for FileWriteTool {
             });
         }
 
-        match tokio::fs::write(&resolved_target, content).await {
+        let write_result = if append {
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&resolved_target)
+                .await
+                .and_then(|mut f| async move { f.write_all(content.as_bytes()).await }.await)
+        } else {
+            tokio::fs::write(&resolved_target, content).await
+        };
+
+        match write_result {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Written {} bytes to {path}", content.len()),
@@ -537,6 +558,47 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success, "paths with null bytes must be blocked");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_append_to_existing() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_append");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        tool.execute(json!({"path": "out.txt", "content": "hello\n"}))
+            .await
+            .unwrap();
+        let result = tool
+            .execute(json!({"path": "out.txt", "content": "world\n", "append": true}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let content = tokio::fs::read_to_string(dir.join("out.txt")).await.unwrap();
+        assert_eq!(content, "hello\nworld\n");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_append_creates_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_append_create");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "new.txt", "content": "created\n", "append": true}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let content = tokio::fs::read_to_string(dir.join("new.txt")).await.unwrap();
+        assert_eq!(content, "created\n");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
