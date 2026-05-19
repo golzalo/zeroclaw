@@ -2264,6 +2264,16 @@ fn looks_like_artifact_reference(candidate: &str) -> bool {
 
 fn resolve_artifact_reference(reference: &str, workspace_dir: &Path) -> PathBuf {
     let candidate = reference.trim();
+
+    // The agent's mental model uses `/workspace/` as the workspace root (tool
+    // descriptors document runtime attachment paths as `/workspace/attachments/...`).
+    // Rebase these onto the real workspace_dir before checking existence so the
+    // validator does not false-positive on paths that are correct in the agent's
+    // frame of reference but differ only in the mount prefix.
+    if let Some(stripped) = candidate.strip_prefix("/workspace/") {
+        return workspace_dir.join(stripped);
+    }
+
     let path = Path::new(candidate);
     if path.is_absolute() {
         return path.to_path_buf();
@@ -8711,6 +8721,48 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn resolve_artifact_reference_rebases_workspace_prefix_absolute_path() {
+        let ws = Path::new("/zeroclaw-data/workspace");
+        // The agent treats /workspace/ as the workspace root; validator must rebase.
+        let resolved = resolve_artifact_reference("/workspace/attachments/whatsapp/foo.jpg", ws);
+        assert_eq!(
+            resolved,
+            PathBuf::from("/zeroclaw-data/workspace/attachments/whatsapp/foo.jpg")
+        );
+    }
+
+    #[test]
+    fn resolve_artifact_reference_rebases_deepened_workspace_prefix() {
+        // After one failed repair cycle the LLM emits /workspace/workspace/X.
+        // With the fix the validator strips the leading /workspace/ and resolves
+        // to workspace_dir/workspace/X — which is where file_write actually wrote it.
+        let ws = Path::new("/zeroclaw-data/workspace");
+        let resolved =
+            resolve_artifact_reference("/workspace/workspace/attachments/foo.pdf", ws);
+        assert_eq!(
+            resolved,
+            PathBuf::from("/zeroclaw-data/workspace/workspace/attachments/foo.pdf")
+        );
+    }
+
+    #[test]
+    fn resolve_artifact_reference_leaves_other_absolute_paths_unchanged() {
+        let ws = Path::new("/zeroclaw-data/workspace");
+        let resolved = resolve_artifact_reference("/etc/passwd", ws);
+        assert_eq!(resolved, PathBuf::from("/etc/passwd"));
+    }
+
+    #[test]
+    fn resolve_artifact_reference_relative_workspace_prefix_unchanged() {
+        let ws = Path::new("/zeroclaw-data/workspace");
+        let resolved = resolve_artifact_reference("workspace/attachments/foo.jpg", ws);
+        assert_eq!(
+            resolved,
+            PathBuf::from("/zeroclaw-data/workspace/attachments/foo.jpg")
+        );
+    }
 
     #[test]
     fn artifact_reference_extraction_ignores_remote_provider_filenames() {
