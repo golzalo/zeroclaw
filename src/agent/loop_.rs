@@ -4995,7 +4995,12 @@ fn maybe_normalize_whatsapp_policy_procedure_call(
         return;
     };
 
-    if channel_name == "whatsapp" {
+    if channel_name
+        .split_once(':')
+        .map(|(base, _)| base)
+        .unwrap_or(channel_name)
+        == "whatsapp"
+    {
         if let Some(reply_target) = channel_reply_target
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -8853,6 +8858,24 @@ Encontré estos 5 archivos en Google Drive:
 
         assert_eq!(args["chat_jid"], "120363025123456789@g.us");
         assert!(args["input"].as_object().is_some_and(|input| input.is_empty()));
+    }
+
+    #[test]
+    fn maybe_normalize_whatsapp_policy_procedure_binds_third_party_channel() {
+        let mut args = serde_json::json!({
+            "input": {
+                "attachments": []
+            }
+        });
+
+        maybe_normalize_whatsapp_policy_procedure_call(
+            "whatsapp_run_policy_procedure",
+            &mut args,
+            "whatsapp:third_party",
+            Some("120363025123456789@g.us"),
+        );
+
+        assert_eq!(args["chat_jid"], "120363025123456789@g.us");
     }
 
     #[tokio::test]

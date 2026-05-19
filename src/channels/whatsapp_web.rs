@@ -137,6 +137,7 @@ struct WhatsAppAttachment {
 struct PendingWhatsAppMediaTurn {
     message: ChannelMessage,
     created_at: Instant,
+    wake_token_seen: bool,
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -3108,8 +3109,107 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
-    fn content_has_image_marker(content: &str) -> bool {
-        content.contains("[IMAGE:")
+    fn conversation_policy_requires_attachment_bundle(
+        conversation_policy: Option<&ObservedGroupConfig>,
+    ) -> bool {
+        let Some(policy) = conversation_policy else {
+            return false;
+        };
+        if policy.procedure_job_slug.as_deref().unwrap_or("").trim().is_empty() {
+            return false;
+        }
+
+        [
+            policy.procedure_input_schema.as_deref(),
+            policy.procedure_input_contract.as_deref(),
+            policy.procedure_sop.as_deref(),
+            policy.procedure_summary.as_deref(),
+            policy.objective.as_deref(),
+            policy.goal.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| {
+            let normalized = value.to_ascii_lowercase();
+            normalized.contains("attachments")
+                || normalized.contains("attachment")
+                || normalized.contains("adjunto")
+                || normalized.contains("adjuntos")
+                || normalized.contains("archivo")
+                || normalized.contains("archivos")
+                || normalized.contains("documento")
+                || normalized.contains("documentos")
+                || normalized.contains("imagen")
+                || normalized.contains("imagenes")
+                || normalized.contains("image")
+                || normalized.contains("images")
+                || normalized.contains("foto")
+                || normalized.contains("fotos")
+        })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn content_has_media_marker(content: &str) -> bool {
+        content.contains("[IMAGE:") || content.contains("[Document:")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn merge_media_bundle_content(
+        pending_content: &str,
+        current_content: &str,
+        pending_has_media: bool,
+        current_has_media: bool,
+    ) -> String {
+        let pending_content = pending_content.trim();
+        let current_content = current_content.trim();
+        if pending_content.is_empty() {
+            return current_content.to_string();
+        }
+        if current_content.is_empty() {
+            return pending_content.to_string();
+        }
+        if !current_has_media && pending_has_media {
+            format!("{current_content}\n\n{pending_content}")
+        } else {
+            format!("{pending_content}\n\n{current_content}")
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn schedule_pending_media_bundle_dispatch(
+        pending_media_turns: Arc<
+            std::sync::Mutex<std::collections::HashMap<String, PendingWhatsAppMediaTurn>>,
+        >,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        bundle_key: String,
+        message_id: String,
+    ) {
+        tokio::spawn(async move {
+            tokio::time::sleep(WHATSAPP_MEDIA_BUNDLE_DEBOUNCE).await;
+            let pending = {
+                pending_media_turns
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| match pending.get(&bundle_key) {
+                        Some(current) if current.message.id == message_id => {
+                            pending.remove(&bundle_key)
+                        }
+                        _ => None,
+                    })
+            };
+            if let Some(pending) = pending {
+                tracing::debug!(
+                    chat = %bundle_key,
+                    "WhatsApp Web media bundle debounce elapsed; dispatching bundled turn"
+                );
+                if let Err(err) = tx.send(pending.message).await {
+                    tracing::error!(
+                        "Failed to send deferred WhatsApp media-bundle message to channel: {}",
+                        err
+                    );
+                }
+            }
+        });
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3126,11 +3226,12 @@ impl WhatsAppWebChannel {
                 PendingWhatsAppMediaTurn {
                     message,
                     created_at: Instant::now(),
+                    wake_token_seen: false,
                 },
             );
             tracing::debug!(
                 chat = %bundle_key,
-                "WhatsApp Web media bundle stored image turn awaiting wake-token text"
+                "WhatsApp Web media bundle stored turn awaiting counterpart"
             );
         }
     }
@@ -3143,97 +3244,66 @@ impl WhatsAppWebChannel {
         >,
         bundle_key: String,
         message: ChannelMessage,
-        should_defer_for_media: bool,
+        should_bundle_media: bool,
     ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<ChannelMessage>> {
-        let message_has_image = Self::content_has_image_marker(&message.content);
-
-        if message_has_image {
-            let pending = pending_media_turns
-                .lock()
-                .ok()
-                .and_then(|mut pending| pending.remove(&bundle_key));
-            if let Some(mut pending) = pending {
-                if pending.created_at.elapsed() <= WHATSAPP_MEDIA_BUNDLE_LOOKBACK {
-                    pending.message.content = format!(
-                        "{}\n\n{}",
-                        pending.message.content.trim(),
-                        message.content.trim()
-                    );
-                    pending.message.timestamp = message.timestamp;
-                    tracing::debug!(
-                        chat = %bundle_key,
-                        "WhatsApp Web media bundle merged wake-token text with image attachment"
-                    );
-                    return tx.send(pending.message).await;
-                }
-            }
+        if !should_bundle_media {
+            return tx.send(message).await;
         }
 
-        if should_defer_for_media && !message_has_image {
-            let pending = pending_media_turns
-                .lock()
-                .ok()
-                .and_then(|mut pending| pending.remove(&bundle_key));
-            if let Some(pending) = pending {
-                if pending.created_at.elapsed() <= WHATSAPP_MEDIA_BUNDLE_LOOKBACK
-                    && Self::content_has_image_marker(&pending.message.content)
-                {
-                    let mut bundled = message.clone();
-                    bundled.content = format!(
-                        "{}\n\n{}",
-                        message.content.trim(),
-                        pending.message.content.trim()
-                    );
-                    tracing::debug!(
-                        chat = %bundle_key,
-                        "WhatsApp Web media bundle merged image attachment with wake-token text"
-                    );
-                    return tx.send(bundled).await;
-                }
-            }
-
-            let message_id = message.id.clone();
-            if let Ok(mut pending) = pending_media_turns.lock() {
-                pending.insert(
-                    bundle_key.clone(),
-                    PendingWhatsAppMediaTurn {
-                        message: message.clone(),
-                        created_at: Instant::now(),
-                    },
+        let message_has_media = Self::content_has_media_marker(&message.content);
+        let pending = pending_media_turns
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&bundle_key));
+        if let Some(mut pending) = pending {
+            if pending.created_at.elapsed() <= WHATSAPP_MEDIA_BUNDLE_LOOKBACK {
+                let pending_has_media = Self::content_has_media_marker(&pending.message.content);
+                pending.message.content = Self::merge_media_bundle_content(
+                    &pending.message.content,
+                    &message.content,
+                    pending_has_media,
+                    message_has_media,
                 );
-            }
-            let pending_media_turns_for_task = pending_media_turns.clone();
-            let tx_for_task = tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(WHATSAPP_MEDIA_BUNDLE_DEBOUNCE).await;
-                let pending = {
-                    pending_media_turns_for_task
-                        .lock()
-                        .ok()
-                        .and_then(|mut pending| match pending.get(&bundle_key) {
-                            Some(current) if current.message.id == message_id => {
-                                pending.remove(&bundle_key)
-                            }
-                            _ => None,
-                        })
-                };
-                if let Some(pending) = pending {
-                    tracing::debug!(
-                        chat = %bundle_key,
-                        "WhatsApp Web media bundle debounce elapsed without image; dispatching text turn"
-                    );
-                    if let Err(err) = tx_for_task.send(pending.message).await {
-                        tracing::error!(
-                            "Failed to send deferred WhatsApp media-bundle message to channel: {}",
-                            err
-                        );
-                    }
+                pending.message.timestamp = message.timestamp;
+                pending.message.id = message.id.clone();
+                pending.created_at = Instant::now();
+                pending.wake_token_seen = true;
+                let message_id = pending.message.id.clone();
+                if let Ok(mut pending_turns) = pending_media_turns.lock() {
+                    pending_turns.insert(bundle_key.clone(), pending);
                 }
-            });
-            return Ok(());
+                Self::schedule_pending_media_bundle_dispatch(
+                    pending_media_turns,
+                    tx,
+                    bundle_key.clone(),
+                    message_id,
+                );
+                tracing::debug!(
+                    chat = %bundle_key,
+                    "WhatsApp Web media bundle merged adjacent media/text turn"
+                );
+                return Ok(());
+            }
         }
 
-        tx.send(message).await
+        let message_id = message.id.clone();
+        if let Ok(mut pending) = pending_media_turns.lock() {
+            pending.insert(
+                bundle_key.clone(),
+                PendingWhatsAppMediaTurn {
+                    message,
+                    created_at: Instant::now(),
+                    wake_token_seen: true,
+                },
+            );
+        }
+        Self::schedule_pending_media_bundle_dispatch(
+            pending_media_turns,
+            tx,
+            bundle_key,
+            message_id,
+        );
+        Ok(())
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -5405,35 +5475,40 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                     WhatsAppChatKind::SelfChat => ObservedGroupTrigger::default(),
                                 };
-                                let content_has_image_marker =
-                                    Self::content_has_image_marker(&content);
+                                let content_has_media_marker =
+                                    Self::content_has_media_marker(&content);
                                 let policy_requires_visual_analysis =
                                     Self::conversation_policy_requires_visual_analysis(
                                         conversation_policy.as_ref(),
                                     );
-                                let media_bundle_key = chat.clone();
+                                let policy_requires_attachment_bundle =
+                                    Self::conversation_policy_requires_attachment_bundle(
+                                        conversation_policy.as_ref(),
+                                    );
+                                let policy_requires_media_bundle =
+                                    policy_requires_visual_analysis
+                                        || policy_requires_attachment_bundle;
+                                let media_bundle_key = format!("{chat}|{normalized}");
                                 let has_pending_media_bundle = pending_media_turns
                                     .lock()
                                     .map(|pending| {
                                         pending
                                             .get(&media_bundle_key)
                                             .is_some_and(|pending| {
-                                                pending.created_at.elapsed()
-                                                    <= WHATSAPP_MEDIA_BUNDLE_DEBOUNCE * 3
-                                                    && !Self::content_has_image_marker(
-                                                        &pending.message.content,
-                                                    )
+                                                pending.wake_token_seen
+                                                    && (pending.created_at.elapsed()
+                                                        <= WHATSAPP_MEDIA_BUNDLE_DEBOUNCE * 3)
                                             })
                                     })
                                     .unwrap_or(false);
-                                if content_has_image_marker
-                                    && policy_requires_visual_analysis
+                                if content_has_media_marker
+                                    && policy_requires_media_bundle
                                     && has_pending_media_bundle
                                 {
                                     observed_group_trigger.mentions_agent = true;
                                     tracing::debug!(
                                         chat = %chat,
-                                        "WhatsApp Web media bundle image matched pending wake-token turn"
+                                        "WhatsApp Web media bundle attachment matched pending wake-token turn"
                                     );
                                 }
 
@@ -5507,8 +5582,8 @@ impl Channel for WhatsAppWebChannel {
                                         &observed_group_trigger,
                                     );
                                     if !should_invoke {
-                                        if policy_requires_visual_analysis
-                                            && content_has_image_marker
+                                        if policy_requires_media_bundle
+                                            && content_has_media_marker
                                         {
                                             let reply_target = Self::resolve_reply_target(
                                                 &chat,
@@ -5607,8 +5682,8 @@ impl Channel for WhatsAppWebChannel {
                                             )
                                         });
                                     if !should_invoke {
-                                        if policy_requires_visual_analysis
-                                            && content_has_image_marker
+                                        if policy_requires_media_bundle
+                                            && content_has_media_marker
                                         {
                                             let reply_target = Self::resolve_reply_target(
                                                 &chat,
@@ -5747,9 +5822,8 @@ impl Channel for WhatsAppWebChannel {
                                     super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
                                 };
 
-                                let should_defer_for_media = policy_requires_visual_analysis
-                                    && observed_group_trigger.mentions_agent
-                                    && !content_has_image_marker;
+                                let should_bundle_media = policy_requires_media_bundle
+                                    && observed_group_trigger.mentions_agent;
                                 let channel_message = ChannelMessage {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     channel: runtime_channel.to_string(),
@@ -5765,10 +5839,10 @@ impl Channel for WhatsAppWebChannel {
                                 if let Err(e) = Self::send_or_defer_media_bundle(
                                     tx_inner,
                                     pending_media_turns.clone(),
-                                    media_bundle_key,
-                                    channel_message,
-                                    should_defer_for_media,
-                                )
+	                                    media_bundle_key,
+	                                    channel_message,
+	                                    should_bundle_media,
+	                                )
                                 .await
                                 {
                                     tracing::error!("Failed to send message to channel: {}", e);

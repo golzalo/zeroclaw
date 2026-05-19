@@ -114,6 +114,9 @@ pub async fn preprocess_images_to_text_context(
 
     let mut changed = false;
     let mut next_messages = Vec::with_capacity(messages.len());
+    let mut next_attachment_requires_visual_analysis = false;
+    let mut policy_requires_visual_analysis = false;
+    let mut last_skipped_image_refs: Vec<String> = Vec::new();
 
     for message in messages.iter() {
         if message.role != "user" {
@@ -123,7 +126,63 @@ pub async fn preprocess_images_to_text_context(
 
         let (cleaned_text, image_refs) = parse_image_markers(&message.content);
         if image_refs.is_empty() {
+            let normalized_text = normalize_intent_text(&cleaned_text);
+            if requests_next_attachment_visual_analysis(&normalized_text) {
+                next_attachment_requires_visual_analysis = true;
+            }
+            if requests_policy_attachment_visual_analysis(&normalized_text) {
+                policy_requires_visual_analysis = true;
+            }
+            if requests_previous_attachment_visual_analysis(&normalized_text)
+                && !last_skipped_image_refs.is_empty()
+            {
+                let request_text = if cleaned_text.trim().is_empty() {
+                    "The user asked to analyze the most recent image attachment."
+                } else {
+                    cleaned_text.trim()
+                };
+                let analysis = analyze_image_refs_to_visual_analysis(
+                    request_text,
+                    &last_skipped_image_refs,
+                    config,
+                    reliability,
+                    workspace_dir,
+                )
+                .await?;
+
+                next_messages.push(ChatMessage {
+                    role: message.role.clone(),
+                    content: compose_visual_analysis_context(
+                        request_text,
+                        &last_skipped_image_refs,
+                        &analysis,
+                        config,
+                    ),
+                });
+                changed = true;
+                continue;
+            }
             next_messages.push(message.clone());
+            continue;
+        }
+
+        let visual_intent = should_analyze_image_attachments(
+            &cleaned_text,
+            next_attachment_requires_visual_analysis,
+            policy_requires_visual_analysis,
+        );
+        next_attachment_requires_visual_analysis = false;
+        if !visual_intent {
+            last_skipped_image_refs = image_refs.clone();
+            next_messages.push(ChatMessage {
+                role: message.role.clone(),
+                content: compose_non_visual_attachment_context(
+                    &cleaned_text,
+                    &image_refs,
+                    config.processor.include_image_paths,
+                ),
+            });
+            changed = true;
             continue;
         }
 
@@ -139,27 +198,15 @@ pub async fn preprocess_images_to_text_context(
             reliability,
             workspace_dir,
         );
-        let sources = if config.processor.include_image_paths {
-            format!(
-                "\nSources:\n{}",
-                image_refs
-                    .iter()
-                    .map(|reference| format!("- {reference}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        } else {
-            String::new()
-        };
         let analysis = analysis.await?;
 
         next_messages.push(ChatMessage {
             role: message.role.clone(),
-            content: format!(
-                "{request_text}\n\n[Image analysis]\nSchema: visual_analysis.v1\nProcessor: {}/{}\nMode: {}\n{sources}\nVisualAnalysisV1:\n{analysis}\n[/Image analysis]",
-                config.processor.provider.trim(),
-                config.processor.model.trim(),
-                config.processor.mode.trim()
+            content: compose_visual_analysis_context(
+                request_text,
+                &image_refs,
+                &analysis,
+                config,
             ),
         });
         changed = true;
@@ -170,6 +217,195 @@ pub async fn preprocess_images_to_text_context(
     }
 
     Ok(changed)
+}
+
+fn compose_visual_analysis_context(
+    request_text: &str,
+    image_refs: &[String],
+    analysis: &str,
+    config: &MultimodalConfig,
+) -> String {
+    let sources = if config.processor.include_image_paths {
+        format!(
+            "\nSources:\n{}",
+            image_refs
+                .iter()
+                .map(|reference| format!("- {reference}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{request_text}\n\n[Image analysis]\nSchema: visual_analysis.v1\nProcessor: {}/{}\nMode: {}\n{sources}\nVisualAnalysisV1:\n{analysis}\n[/Image analysis]",
+        config.processor.provider.trim(),
+        config.processor.model.trim(),
+        config.processor.mode.trim()
+    )
+}
+
+fn compose_non_visual_attachment_context(
+    request_text: &str,
+    image_refs: &[String],
+    include_image_paths: bool,
+) -> String {
+    let request_text = if request_text.trim().is_empty() {
+        "The user sent image attachment(s)."
+    } else {
+        request_text.trim()
+    };
+    let mut content = format!(
+        "{request_text}\n\n[Image attachment]\nVisual analysis: skipped. The current request is attachment/storage-only or does not explicitly ask to analyze image contents. Do not describe, infer, or summarize this image unless a later turn includes [Image analysis] for it."
+    );
+    if include_image_paths {
+        content.push_str("\nSources:");
+        for image_ref in image_refs {
+            content.push_str("\n- ");
+            content.push_str(image_ref);
+        }
+    } else {
+        content.push_str(&format!("\nCount: {}", image_refs.len()));
+    }
+    content.push_str("\n[/Image attachment]");
+    content
+}
+
+fn should_analyze_image_attachments(
+    request_text: &str,
+    next_attachment_requires_visual_analysis: bool,
+    policy_requires_visual_analysis: bool,
+) -> bool {
+    if next_attachment_requires_visual_analysis || policy_requires_visual_analysis {
+        return true;
+    }
+
+    let normalized = normalize_intent_text(request_text);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    has_visual_semantic_intent(&normalized)
+}
+
+fn normalize_intent_text(input: &str) -> String {
+    input
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'ñ' => 'n',
+            other => other,
+        })
+        .collect::<String>()
+}
+
+fn has_visual_semantic_intent(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "analiz",
+            "extrae",
+            "extraer",
+            "lee ",
+            "leer",
+            "leelo",
+            "leela",
+            "interpre",
+            "ocr",
+            "vision",
+            "visual",
+            "que ves",
+            "contenido",
+            "texto",
+            "transcrib",
+            "describ",
+            "identific",
+            "clasific",
+            "monto",
+            "total",
+            "concepto",
+            "fecha",
+            "vencimiento",
+            "remitida",
+            "direccion",
+            "campo",
+            "datos",
+            "data",
+            "entende",
+            "entender",
+        ],
+    )
+}
+
+fn requests_next_attachment_visual_analysis(normalized: &str) -> bool {
+    has_visual_semantic_intent(normalized)
+        && contains_any(normalized, &["proximo", "proxima", "siguiente", "next"])
+        && contains_any(
+            normalized,
+            &["archivo", "imagen", "foto", "adjunto", "documento", "file"],
+        )
+}
+
+fn requests_policy_attachment_visual_analysis(normalized: &str) -> bool {
+    has_visual_semantic_intent(normalized)
+        && contains_any(normalized, &["cuando", "cada vez", "whenever"])
+        && contains_any(normalized, &["mencion", "@s86", "invoc"])
+        && contains_any(
+            normalized,
+            &["archivo", "imagen", "foto", "adjunto", "documento", "file"],
+        )
+}
+
+fn requests_previous_attachment_visual_analysis(normalized: &str) -> bool {
+    has_visual_semantic_intent(normalized)
+        && contains_any(
+            normalized,
+            &[
+                "analizala",
+                "analizalo",
+                "analizarla",
+                "analizarlo",
+                "la podes analizar",
+                "lo podes analizar",
+                "puedes analizarla",
+                "puedes analizarlo",
+                "podes analizarla",
+                "podes analizarlo",
+                "que ves en esta",
+                "que ves en esa",
+                "que ves en la",
+                "esta imagen",
+                "esa imagen",
+                "la imagen",
+                "esta foto",
+                "esa foto",
+                "la foto",
+                "este archivo",
+                "ese archivo",
+                "el archivo",
+                "este adjunto",
+                "ese adjunto",
+                "el adjunto",
+                "esta factura",
+                "esa factura",
+                "la factura",
+                "este documento",
+                "ese documento",
+                "el documento",
+                "esto",
+                "eso",
+            ],
+        )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 pub async fn analyze_image_refs_to_visual_analysis(
@@ -1002,6 +1238,7 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::MultimodalProcessorConfig;
 
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
@@ -1077,6 +1314,99 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("coerced to visual_analysis.v1"))));
         assert_eq!(value["structured_data"]["document_type"], "unknown");
+    }
+
+    #[test]
+    fn image_intent_gate_skips_upload_only_requests() {
+        assert!(!should_analyze_image_attachments(
+            "subi esta imagen a la carpeta de Drive",
+            false,
+            false
+        ));
+        assert!(!should_analyze_image_attachments(
+            "guardá este adjunto en Drive",
+            false,
+            false
+        ));
+        assert!(!should_analyze_image_attachments("", false, false));
+    }
+
+    #[test]
+    fn image_intent_gate_allows_explicit_visual_requests() {
+        assert!(should_analyze_image_attachments(
+            "analizá esta factura y extraé monto total",
+            false,
+            false
+        ));
+        assert!(should_analyze_image_attachments(
+            "qué ves en esta imagen?",
+            false,
+            false
+        ));
+        assert!(should_analyze_image_attachments(
+            "subí esta imagen a Drive y extraé los datos",
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn image_intent_gate_allows_prior_next_file_request() {
+        let normalized = normalize_intent_text("el próximo archivo analizalo");
+        assert!(requests_next_attachment_visual_analysis(&normalized));
+        assert!(should_analyze_image_attachments("", true, false));
+    }
+
+    #[test]
+    fn image_intent_gate_allows_observed_policy_request() {
+        let normalized =
+            normalize_intent_text("observá este grupo y cuando te mencionen analizá el archivo");
+        assert!(requests_policy_attachment_visual_analysis(&normalized));
+        assert!(should_analyze_image_attachments("@s86", false, true));
+    }
+
+    #[test]
+    fn image_intent_gate_allows_deferred_previous_attachment_request() {
+        let normalized = normalize_intent_text("la podes analizar?");
+        assert!(requests_previous_attachment_visual_analysis(&normalized));
+
+        let normalized = normalize_intent_text("analizá esto");
+        assert!(requests_previous_attachment_visual_analysis(&normalized));
+
+        let normalized = normalize_intent_text("analizá este código");
+        assert!(!requests_previous_attachment_visual_analysis(&normalized));
+    }
+
+    #[tokio::test]
+    async fn preprocess_images_replaces_upload_only_marker_with_attachment_context() {
+        let mut messages = vec![ChatMessage::user(
+            "subí esto a Drive [IMAGE:/workspace/attachments/whatsapp/invoice.jpg]".to_string(),
+        )];
+
+        let config = MultimodalConfig {
+            processor: MultimodalProcessorConfig {
+                enabled: true,
+                include_image_paths: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let changed = preprocess_images_to_text_context(
+            &mut messages,
+            &config,
+            &ReliabilityConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(count_image_markers(&messages), 0);
+        assert!(messages[0].content.contains("[Image attachment]"));
+        assert!(messages[0]
+            .content
+            .contains("/workspace/attachments/whatsapp/invoice.jpg"));
+        assert!(!messages[0].content.contains("VisualAnalysisV1"));
     }
 
     #[tokio::test]
