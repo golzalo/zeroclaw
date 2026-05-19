@@ -550,6 +550,18 @@ static SERVICE_JOB_COMMAND_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:--name|--job)\s+"?([A-Za-z0-9._-]+)"?"#)
         .expect("valid service job command regex")
 });
+static SERVICE_BUILDER_TARGET_SIGNAL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?im)^\s*(?:TARGET_ID|PROPOSED_SLUG|procedure_job_slug)\s*[:=]\s*`?([A-Za-z0-9._-]+)`?\s*$",
+    )
+    .expect("valid service builder target signal regex")
+});
+static SERVICE_BUILDER_INLINE_SLUG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:procedimiento vinculado|procedure_job|job slug|slug)[^`\n]*`([A-Za-z0-9._-]+)`",
+    )
+    .expect("valid service builder inline slug regex")
+});
 
 fn build_service_job_continuation_target(slug: &str) -> ContinuationTarget {
     ContinuationTarget {
@@ -788,10 +800,48 @@ fn is_service_builder_pending_contract_message(message: &ChatMessage) -> bool {
         return false;
     }
     let lowered = message.content.to_ascii_lowercase();
-    lowered.contains("service_builder")
+    if lowered.contains("service_builder")
         && (lowered.contains("status: awaiting_confirmation")
             || lowered.contains("verification_status: pending_user_confirmation")
             || lowered.contains("step: propose_contract"))
+    {
+        return true;
+    }
+
+    let asks_for_confirmation = lowered.contains("responde yes")
+        || lowered.contains("reply yes")
+        || lowered.contains("confirmas con yes")
+        || lowered.contains("confirmás con yes")
+        || lowered.contains("confirmar")
+        || lowered.contains("confirmas")
+        || lowered.contains("confirmás");
+    let contract_signal = lowered.contains("contrato")
+        || lowered.contains("servicio propuesto")
+        || lowered.contains("resumen del servicio propuesto")
+        || lowered.contains("processing contract");
+    let service_signal = lowered.contains("service builder")
+        || lowered.contains("service_builder")
+        || lowered.contains("tenant-app/server/jobs")
+        || lowered.contains("google drive")
+        || lowered.contains("whatsapp")
+        || lowered.contains("cron")
+        || lowered.contains(" job")
+        || lowered.contains("proceso");
+
+    if message.role == "assistant" && asks_for_confirmation && contract_signal && service_signal {
+        return true;
+    }
+
+    message.role == "assistant"
+        && (lowered.contains("contrato propuesto")
+            || lowered.contains("contrato de procesamiento")
+            || lowered.contains("processing contract"))
+        && (lowered.contains("service builder")
+            || lowered.contains("procedure_job")
+            || lowered.contains("procedimiento vinculado"))
+        && (lowered.contains("responde yes")
+            || lowered.contains("reply yes")
+            || lowered.contains("confirmar"))
 }
 
 fn is_service_builder_done_message(message: &ChatMessage) -> bool {
@@ -804,32 +854,175 @@ fn is_service_builder_done_message(message: &ChatMessage) -> bool {
         && (lowered.contains("status: scheduled") || lowered.contains("status: verified"))
 }
 
-fn latest_user_confirmed_pending_service_contract(history: &[ChatMessage]) -> bool {
-    let Some((latest_user_index, latest_user)) = history
+#[derive(Debug, Clone)]
+struct PendingServiceBuilderContract {
+    proposed_slug: Option<String>,
+    contract_text: String,
+}
+
+fn is_placeholder_service_job_slug(slug: &str) -> bool {
+    let normalized = slug
+        .trim()
+        .trim_matches('`')
+        .trim_matches(|ch| ch == '<' || ch == '>')
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "" | "job" | "slug" | "target" | "target-id" | "target_id" | "existing-job"
+            | "existing_job" | "slug-if-known"
+    )
+}
+
+fn extract_service_builder_job_slug(content: &str) -> Option<String> {
+    for capture in SERVICE_BUILDER_TARGET_SIGNAL_REGEX.captures_iter(content) {
+        let slug = capture.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+        if !is_placeholder_service_job_slug(slug) {
+            return Some(slug.to_string());
+        }
+    }
+
+    for capture in SERVICE_BUILDER_INLINE_SLUG_REGEX.captures_iter(content) {
+        let slug = capture.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+        if !is_placeholder_service_job_slug(slug) {
+            return Some(slug.to_string());
+        }
+    }
+
+    for regex in [
+        &*SERVICE_JOB_PATH_REGEX,
+        &*SERVICE_JOB_API_REGEX,
+        &*SERVICE_JOB_COMMAND_REGEX,
+    ] {
+        for capture in regex.captures_iter(content) {
+            let slug = capture.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+            if !is_placeholder_service_job_slug(slug) {
+                return Some(slug.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn pending_service_builder_contract_before(
+    history: &[ChatMessage],
+    end_index: usize,
+) -> Option<PendingServiceBuilderContract> {
+    let mut pending_contract: Option<PendingServiceBuilderContract> = None;
+    for message in history.iter().take(end_index) {
+        if is_service_builder_pending_contract_message(message) {
+            let proposed_slug = extract_service_builder_job_slug(&message.content)
+                .or_else(|| {
+                    pending_contract
+                        .as_ref()
+                        .and_then(|contract| contract.proposed_slug.clone())
+                });
+            pending_contract = Some(PendingServiceBuilderContract {
+                proposed_slug,
+                contract_text: truncate_with_ellipsis(&message.content, 7000),
+            });
+        } else if is_service_builder_done_message(message) {
+            pending_contract = None;
+        }
+    }
+
+    pending_contract
+}
+
+fn latest_confirmed_pending_service_builder_contract(
+    history: &[ChatMessage],
+) -> Option<PendingServiceBuilderContract> {
+    let (latest_user_index, latest_user) = history
         .iter()
         .enumerate()
         .rev()
         .find(|(_, message)| {
             message.role == "user" && !is_runtime_user_message(&message.content)
-        })
-    else {
-        return false;
-    };
+        })?;
 
     if !looks_like_service_contract_confirmation(&latest_user.content) {
-        return false;
+        return None;
     }
 
-    let mut pending_contract = false;
-    for message in &history[..latest_user_index] {
-        if is_service_builder_pending_contract_message(message) {
-            pending_contract = true;
-        } else if is_service_builder_done_message(message) {
-            pending_contract = false;
-        }
-    }
+    pending_service_builder_contract_before(history, latest_user_index)
+}
 
-    pending_contract
+fn latest_user_confirmed_pending_service_contract(history: &[ChatMessage]) -> bool {
+    latest_confirmed_pending_service_builder_contract(history).is_some()
+}
+
+fn build_confirmed_service_builder_delegate_prompt(
+    history: &[ChatMessage],
+    original_prompt: &str,
+) -> Option<String> {
+    let pending_contract = latest_confirmed_pending_service_builder_contract(history)?;
+    let mut prompt = String::new();
+    let _ = writeln!(
+        prompt,
+        "The user has already confirmed the pending service_builder processing contract."
+    );
+    let _ = writeln!(prompt, "Do not ask for confirmation again.");
+    let _ = writeln!(
+        prompt,
+        "Do not return STEP: propose_contract or STATUS: awaiting_confirmation."
+    );
+    let _ = writeln!(
+        prompt,
+        "Implement now and continue until STEP: done with STATUS: verified or scheduled, or return STATUS: blocked with concrete evidence."
+    );
+    let _ = writeln!(prompt);
+    let _ = writeln!(prompt, "USER_CONFIRMED_PROCESSING_CONTRACT: true");
+    if let Some(slug) = pending_contract.proposed_slug.as_deref() {
+        let _ = writeln!(prompt, "NEW_JOB: true");
+        let _ = writeln!(prompt, "PROPOSED_SLUG: {slug}");
+    }
+    let _ = writeln!(
+        prompt,
+        "Use EXISTING_JOB only if tenant_service_builder.py status confirms that exact slug already exists on disk."
+    );
+    let _ = writeln!(
+        prompt,
+        "Never use placeholder slugs such as existing-job, job, slug, or <slug>."
+    );
+    let original_prompt = original_prompt.trim();
+    if !original_prompt.is_empty() {
+        let _ = writeln!(prompt);
+        let _ = writeln!(prompt, "Original delegate prompt from main, for context only:");
+        let _ = writeln!(prompt, "{}", truncate_with_ellipsis(original_prompt, 3000));
+    }
+    let _ = writeln!(prompt);
+    let _ = writeln!(prompt, "CONFIRMED_SERVICE_BUILDER_CONTRACT:");
+    let _ = writeln!(prompt, "{}", pending_contract.contract_text);
+    Some(prompt)
+}
+
+fn maybe_normalize_confirmed_service_builder_delegate_prompt(
+    history: &[ChatMessage],
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+) -> Option<String> {
+    if tool_name != "delegate" {
+        return None;
+    }
+    let args = tool_args.as_object_mut()?;
+    let agent_name = args
+        .get("agent")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    if !agent_name.eq_ignore_ascii_case("service_builder") {
+        return None;
+    }
+    let original_prompt = args
+        .get("prompt")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let normalized_prompt = build_confirmed_service_builder_delegate_prompt(history, original_prompt)?;
+    args.insert(
+        "prompt".to_string(),
+        serde_json::Value::String(normalized_prompt.clone()),
+    );
+    Some(normalized_prompt)
 }
 
 fn recent_service_builder_context(history: &[ChatMessage]) -> bool {
@@ -6118,6 +6311,32 @@ pub(crate) async fn run_tool_call_loop(
                 continue;
             }
 
+            if latest_user_confirmed_pending_service_contract(history)
+                && tools_registry.iter().any(|t| t.name() == "delegate")
+            {
+                runtime_trace::record_event(
+                    "final_response_missing_confirmed_service_builder_delegation",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(
+                        "assistant answered after service_builder contract confirmation without delegating",
+                    ),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "text": scrub_credentials(&display_text),
+                    }),
+                );
+
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(internal_repair_message(
+                    "The user just confirmed a pending service_builder processing contract. Your next action must be a delegate tool call to service_builder, not a final answer. Call delegate with USER_CONFIRMED_PROCESSING_CONTRACT: true, preserve the proposed job slug as PROPOSED_SLUG for a fresh job, include the confirmed contract text, and wait for a real STEP: done response before confirming success to the user.",
+                ));
+                continue;
+            }
+
             if latest_user_message_requests_tool_first_execution(history) {
                 runtime_trace::record_event(
                     "final_response_missing_required_tool_execution",
@@ -6432,6 +6651,25 @@ pub(crate) async fn run_tool_call_loop(
                 &mut tool_args,
                 workspace_dir,
             );
+            if let Some(normalized_prompt) = maybe_normalize_confirmed_service_builder_delegate_prompt(
+                history,
+                &tool_name,
+                &mut tool_args,
+            ) {
+                runtime_trace::record_event(
+                    "service_builder_delegate_prompt_normalized_after_confirmation",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "prompt": scrub_credentials(&truncate_with_ellipsis(&normalized_prompt, 1200)),
+                    }),
+                );
+            }
             if let Some(blocked) =
                 blocked_tenant_service_execution_cron_add(&tool_name, &tool_args)
             {
@@ -11576,6 +11814,78 @@ Tail"#;
         ];
 
         assert!(latest_user_confirmed_pending_service_contract(&history));
+    }
+
+    #[test]
+    fn detects_user_confirmation_after_presented_service_builder_contract() {
+        let history = vec![
+            ChatMessage::user("observa el grupo y subi documentos a Drive"),
+            ChatMessage::assistant(
+                "Acá está el contrato propuesto por el service builder:\n\n\
+                 **Contrato de Procesamiento**\n\n\
+                 **Procedimiento vinculado:** `whatsapp-group-cc535-drive-attachments`\n\n\
+                 Responde YES para confirmar y que lo implemente.",
+            ),
+            ChatMessage::user("YES"),
+        ];
+
+        assert!(latest_user_confirmed_pending_service_contract(&history));
+    }
+
+    #[test]
+    fn detects_user_confirmation_after_main_rephrased_service_contract() {
+        let history = vec![
+            ChatMessage::user("subi adjuntos del grupo a Drive"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTEP: propose_contract\nSTATUS: awaiting_confirmation\nTARGET_ID: whatsapp-group-drive-amigazo-uploader\nCONTRACT:\n  description: subir adjuntos a Drive",
+            ),
+            ChatMessage::assistant(
+                "Acá va el resumen del servicio propuesto:\n\n\
+                 Servicio: Monitor de archivos -> Google Drive \"Amigazo\"\n\n\
+                 Responde YES para confirmar, o decime qué cambiar.",
+            ),
+            ChatMessage::user("YES"),
+        ];
+
+        assert!(latest_user_confirmed_pending_service_contract(&history));
+        let pending = latest_confirmed_pending_service_builder_contract(&history).unwrap();
+        assert_eq!(
+            pending.proposed_slug.as_deref(),
+            Some("whatsapp-group-drive-amigazo-uploader")
+        );
+    }
+
+    #[test]
+    fn normalizes_confirmed_service_builder_delegate_prompt() {
+        let history = vec![
+            ChatMessage::user("subi adjuntos del grupo a Drive"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTEP: propose_contract\nSTATUS: awaiting_confirmation\nTARGET_ID: whatsapp-group-drive-amigazo-uploader\nCONTRACT:\n  description: subir adjuntos a Drive",
+            ),
+            ChatMessage::assistant(
+                "Acá va el resumen del servicio propuesto:\n\n\
+                 Servicio: Monitor de archivos -> Google Drive \"Amigazo\"\n\n\
+                 Responde YES para confirmar, o decime qué cambiar.",
+            ),
+            ChatMessage::user("YES"),
+        ];
+        let mut args = serde_json::json!({
+            "agent": "service_builder",
+            "prompt": "El usuario confirmó con YES. Implementá. Usá EXISTING_JOB."
+        });
+
+        let normalized = maybe_normalize_confirmed_service_builder_delegate_prompt(
+            &history,
+            "delegate",
+            &mut args,
+        )
+        .unwrap();
+
+        assert!(normalized.contains("USER_CONFIRMED_PROCESSING_CONTRACT: true"));
+        assert!(normalized.contains("NEW_JOB: true"));
+        assert!(normalized.contains("PROPOSED_SLUG: whatsapp-group-drive-amigazo-uploader"));
+        assert!(normalized.contains("Do not ask for confirmation again."));
+        assert_eq!(args["prompt"], serde_json::Value::String(normalized));
     }
 
     #[test]
