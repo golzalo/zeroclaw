@@ -6340,32 +6340,6 @@ pub(crate) async fn run_tool_call_loop(
                 continue;
             }
 
-            if latest_user_confirmed_pending_service_contract(history)
-                && tools_registry.iter().any(|t| t.name() == "delegate")
-            {
-                runtime_trace::record_event(
-                    "final_response_missing_confirmed_service_builder_delegation",
-                    Some(channel_name),
-                    Some(provider_name),
-                    Some(model),
-                    Some(&turn_id),
-                    Some(false),
-                    Some(
-                        "assistant answered after service_builder contract confirmation without delegating",
-                    ),
-                    serde_json::json!({
-                        "iteration": iteration + 1,
-                        "text": scrub_credentials(&display_text),
-                    }),
-                );
-
-                history.push(ChatMessage::assistant(response_text.clone()));
-                history.push(internal_repair_message(
-                    "The user just confirmed a pending service_builder processing contract. Your next action must be a delegate tool call to service_builder, not a final answer. Call delegate with USER_CONFIRMED_PROCESSING_CONTRACT: true, preserve the proposed job slug as PROPOSED_SLUG for a fresh job, include the confirmed contract text, and wait for a real STEP: done response before confirming success to the user.",
-                ));
-                continue;
-            }
-
             if latest_user_message_requests_tool_first_execution(history) {
                 runtime_trace::record_event(
                     "final_response_missing_required_tool_execution",
@@ -6384,33 +6358,6 @@ pub(crate) async fn run_tool_call_loop(
                 history.push(ChatMessage::assistant(response_text.clone()));
                 history.push(internal_repair_message(
                     "This turn is under an implementation/service directive that requires concrete tool execution before replying. Do not answer with consultation, scripts for the user to run elsewhere, or setup instructions. Use tools now, or if a concrete blocker prevents tool execution in this runtime, reply briefly with that blocker only.",
-                ));
-                continue;
-            }
-
-            if latest_user_confirmed_pending_service_contract(history)
-                && response_claims_service_builder_completion(&display_text)
-                && tools_registry.iter().any(|t| t.name() == "delegate")
-            {
-                runtime_trace::record_event(
-                    "final_response_unverified_service_builder_completion",
-                    Some(channel_name),
-                    Some(provider_name),
-                    Some(model),
-                    Some(&turn_id),
-                    Some(false),
-                    Some(
-                        "assistant claimed a service_builder job was ready before STEP: done",
-                    ),
-                    serde_json::json!({
-                        "iteration": iteration + 1,
-                        "text": scrub_credentials(&display_text),
-                    }),
-                );
-
-                history.push(ChatMessage::assistant(response_text.clone()));
-                history.push(internal_repair_message(
-                    "The user just confirmed a pending service_builder processing contract. Do not claim the service is implemented, ready, scheduled, active, or running yet. Re-delegate to service_builder with USER_CONFIRMED_PROCESSING_CONTRACT: true, preserve the same job identity from the proposal (NEW_JOB/PROPOSED_SLUG or EXISTING_JOB), include the confirmed contract text, and wait for a real STEP: done response with STATUS: verified or STATUS: scheduled before confirming success to the user.",
                 ));
                 continue;
             }
