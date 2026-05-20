@@ -854,6 +854,15 @@ fn is_service_builder_done_message(message: &ChatMessage) -> bool {
         && (lowered.contains("status: scheduled") || lowered.contains("status: verified"))
 }
 
+fn is_service_builder_blocked_message(message: &ChatMessage) -> bool {
+    if message.role != "tool" && message.role != "assistant" {
+        return false;
+    }
+    let lowered = message.content.to_ascii_lowercase();
+    lowered.contains("service_builder")
+        && (lowered.contains("status: blocked") || lowered.contains("blocker:"))
+}
+
 #[derive(Debug, Clone)]
 struct PendingServiceBuilderContract {
     proposed_slug: Option<String>,
@@ -941,6 +950,16 @@ fn latest_confirmed_pending_service_builder_contract(
         })?;
 
     if !looks_like_service_contract_confirmation(&latest_user.content) {
+        return None;
+    }
+
+    if history
+        .iter()
+        .skip(latest_user_index + 1)
+        .any(|message| {
+            is_service_builder_done_message(message) || is_service_builder_blocked_message(message)
+        })
+    {
         return None;
     }
 
@@ -11938,6 +11957,42 @@ Tail"#;
         assert!(normalized.contains("PROPOSED_SLUG: whatsapp-group-drive-amigazo-uploader"));
         assert!(normalized.contains("Do not ask for confirmation again."));
         assert_eq!(args["prompt"], serde_json::Value::String(normalized));
+    }
+
+    #[test]
+    fn confirmed_service_builder_contract_is_not_pending_after_done_same_turn() {
+        let history = vec![
+            ChatMessage::user("subi adjuntos del grupo a Drive"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTEP: propose_contract\nSTATUS: awaiting_confirmation\nTARGET_ID: whatsapp-group-drive-amigazo-uploader\nCONTRACT:\n  description: subir adjuntos a Drive",
+            ),
+            ChatMessage::assistant("Contrato propuesto. Responde YES para confirmar."),
+            ChatMessage::user("YES"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTEP: done\nTARGET_ID: whatsapp-group-drive-amigazo-uploader\nSTATUS: verified",
+            ),
+            ChatMessage::assistant("Servicio listo y verificado."),
+        ];
+
+        assert!(!latest_user_confirmed_pending_service_contract(&history));
+    }
+
+    #[test]
+    fn confirmed_service_builder_contract_is_not_pending_after_blocker_same_turn() {
+        let history = vec![
+            ChatMessage::user("subi adjuntos del grupo a Drive"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTEP: propose_contract\nSTATUS: awaiting_confirmation\nTARGET_ID: whatsapp-group-drive-amigazo-uploader",
+            ),
+            ChatMessage::assistant("Contrato propuesto. Responde YES para confirmar."),
+            ChatMessage::user("YES"),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTATUS: blocked\nBLOCKER: missing Google authorization",
+            ),
+            ChatMessage::assistant("Falta autorizar Google Drive."),
+        ];
+
+        assert!(!latest_user_confirmed_pending_service_contract(&history));
     }
 
     #[test]
