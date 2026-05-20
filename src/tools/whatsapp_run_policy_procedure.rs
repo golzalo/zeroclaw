@@ -69,18 +69,50 @@ impl WhatsAppRunPolicyProcedureTool {
                     .map(|item| Self::normalize_input_for_tenant_web(item, workspace_dir))
                     .collect(),
             ),
-            serde_json::Value::Object(map) => serde_json::Value::Object(
-                map.into_iter()
+            serde_json::Value::Object(map) => {
+                let mut normalized: serde_json::Map<String, serde_json::Value> = map
+                    .into_iter()
                     .map(|(key, item)| {
                         (
                             key,
                             Self::normalize_input_for_tenant_web(item, workspace_dir),
                         )
                     })
-                    .collect(),
-            ),
+                    .collect();
+                if let Some(serde_json::Value::Array(attachments)) =
+                    normalized.get_mut("attachments")
+                {
+                    Self::dedupe_attachment_inputs(attachments);
+                }
+                serde_json::Value::Object(normalized)
+            }
             other => other,
         }
+    }
+
+    fn dedupe_attachment_inputs(attachments: &mut Vec<serde_json::Value>) {
+        let mut seen = std::collections::HashSet::new();
+        attachments.retain(|attachment| {
+            let Some(key) = Self::attachment_dedupe_key(attachment) else {
+                return true;
+            };
+            seen.insert(key)
+        });
+    }
+
+    fn attachment_dedupe_key(attachment: &serde_json::Value) -> Option<String> {
+        let object = attachment.as_object()?;
+        for key in ["path", "localPath", "url", "contentBase64", "b64"] {
+            let value = object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(value) = value {
+                return Some(format!("{key}:{value}"));
+            }
+        }
+        None
     }
 
     fn normalize_string_for_tenant_web(input: &str, workspace_dir: &std::path::Path) -> String {
@@ -547,5 +579,40 @@ mod tests {
             "/workspace/outbox/documents/report.xlsx"
         );
         assert_eq!(normalized["nested"]["paths"][1], "/tmp/other.jpg");
+    }
+
+    #[test]
+    fn normalizes_and_dedupes_repeated_attachment_inputs() {
+        let workspace = std::path::Path::new("/zeroclaw-data/workspace");
+        let input = json!({
+            "attachments": [
+                {
+                    "filename": "a.jpg",
+                    "path": "/zeroclaw-data/workspace/attachments/whatsapp/a.jpg"
+                },
+                {
+                    "filename": "a-copy.jpg",
+                    "path": "/zeroclaw-data/workspace/attachments/whatsapp/a.jpg"
+                },
+                {
+                    "filename": "b.jpg",
+                    "path": "/zeroclaw-data/workspace/attachments/whatsapp/b.jpg"
+                }
+            ]
+        });
+
+        let normalized =
+            WhatsAppRunPolicyProcedureTool::normalize_input_for_tenant_web(input, workspace);
+
+        let attachments = normalized["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(
+            attachments[0]["path"],
+            "/workspace/attachments/whatsapp/a.jpg"
+        );
+        assert_eq!(
+            attachments[1]["path"],
+            "/workspace/attachments/whatsapp/b.jpg"
+        );
     }
 }

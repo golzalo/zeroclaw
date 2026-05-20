@@ -3154,6 +3154,50 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn should_defer_media_bundle(
+        policy_requires_media_bundle: bool,
+        content_has_media_marker: bool,
+        trigger: &ObservedGroupTrigger,
+    ) -> bool {
+        policy_requires_media_bundle && (trigger.mentions_agent || content_has_media_marker)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn media_marker_key(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if [
+            "[IMAGE:",
+            "[Document:",
+            "[DOCUMENT:",
+            "[VIDEO:",
+            "[AUDIO:",
+            "[VOICE:",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+        {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn dedupe_media_marker_lines(content: &str) -> String {
+        let mut seen = std::collections::HashSet::new();
+        let mut lines = Vec::new();
+        for line in content.lines() {
+            if let Some(key) = Self::media_marker_key(line) {
+                if !seen.insert(key) {
+                    continue;
+                }
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     fn merge_media_bundle_content(
         pending_content: &str,
         current_content: &str,
@@ -3168,11 +3212,12 @@ impl WhatsAppWebChannel {
         if current_content.is_empty() {
             return pending_content.to_string();
         }
-        if !current_has_media && pending_has_media {
+        let merged = if !current_has_media && pending_has_media {
             format!("{current_content}\n\n{pending_content}")
         } else {
             format!("{pending_content}\n\n{current_content}")
-        }
+        };
+        Self::dedupe_media_marker_lines(&merged)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -5822,8 +5867,11 @@ impl Channel for WhatsAppWebChannel {
                                     super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
                                 };
 
-                                let should_bundle_media = policy_requires_media_bundle
-                                    && observed_group_trigger.mentions_agent;
+                                let should_bundle_media = Self::should_defer_media_bundle(
+                                    policy_requires_media_bundle,
+                                    content_has_media_marker,
+                                    &observed_group_trigger,
+                                );
                                 let channel_message = ChannelMessage {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     channel: runtime_channel.to_string(),
@@ -5839,10 +5887,10 @@ impl Channel for WhatsAppWebChannel {
                                 if let Err(e) = Self::send_or_defer_media_bundle(
                                     tx_inner,
                                     pending_media_turns.clone(),
-	                                    media_bundle_key,
-	                                    channel_message,
-	                                    should_bundle_media,
-	                                )
+                                    media_bundle_key,
+                                    channel_message,
+                                    should_bundle_media,
+                                )
                                 .await
                                 {
                                     tracing::error!("Failed to send message to channel: {}", e);
@@ -7209,6 +7257,40 @@ mod tests {
             false,
             &no_mention,
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_attachment_policy_defers_media_without_wake_token() {
+        let no_mention = ObservedGroupTrigger::default();
+        assert!(WhatsAppWebChannel::should_defer_media_bundle(
+            true,
+            true,
+            &no_mention,
+        ));
+        assert!(!WhatsAppWebChannel::should_defer_media_bundle(
+            true,
+            false,
+            &no_mention,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_bundle_merge_dedupes_repeated_attachment_markers() {
+        let merged = WhatsAppWebChannel::merge_media_bundle_content(
+            "[IMAGE:/workspace/attachments/whatsapp/a.jpg]\n\n[IMAGE:/workspace/attachments/whatsapp/b.jpg]",
+            "[IMAGE:/workspace/attachments/whatsapp/a.jpg]\n\n[IMAGE:/workspace/attachments/whatsapp/c.jpg]",
+            true,
+            true,
+        );
+
+        assert_eq!(
+            merged.matches("[IMAGE:/workspace/attachments/whatsapp/a.jpg]").count(),
+            1
+        );
+        assert!(merged.contains("[IMAGE:/workspace/attachments/whatsapp/b.jpg]"));
+        assert!(merged.contains("[IMAGE:/workspace/attachments/whatsapp/c.jpg]"));
     }
 
     #[test]
