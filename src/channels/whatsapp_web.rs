@@ -3149,8 +3149,22 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn canonical_media_marker_prefixes() -> [&'static str; 6] {
+        [
+            "[IMAGE:",
+            "[DOCUMENT:",
+            "[VIDEO:",
+            "[AUDIO:",
+            "[VOICE:",
+            "[FILE:",
+        ]
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     fn content_has_media_marker(content: &str) -> bool {
-        content.contains("[IMAGE:") || content.contains("[Document:")
+        Self::canonical_media_marker_prefixes()
+            .iter()
+            .any(|prefix| content.contains(prefix))
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3165,16 +3179,9 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     fn media_marker_key(line: &str) -> Option<String> {
         let trimmed = line.trim();
-        if [
-            "[IMAGE:",
-            "[Document:",
-            "[DOCUMENT:",
-            "[VIDEO:",
-            "[AUDIO:",
-            "[VOICE:",
-        ]
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
+        if Self::canonical_media_marker_prefixes()
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
         {
             Some(trimmed.to_string())
         } else {
@@ -3522,6 +3529,11 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    fn document_attachment_marker(target_path: &Path) -> String {
+        format!("[DOCUMENT:{}]", target_path.display())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
     async fn download_document_file(
         client: &wa_rs::Client,
         document: &wa_rs_proto::whatsapp::message::DocumentMessage,
@@ -3568,11 +3580,7 @@ impl WhatsAppWebChannel {
             return None;
         }
 
-        Some(format!(
-            "[Document: {}] {}",
-            safe_name,
-            target_path.display()
-        ))
+        Some(Self::document_attachment_marker(&target_path))
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -8148,6 +8156,44 @@ mod tests {
         std::env::remove_var("ZEROCLAW_WORKSPACE");
         let _ = std::fs::remove_file(&readme);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_document_attachment_marker_is_canonical() {
+        let path = Path::new("/zeroclaw-data/workspace/attachments/whatsapp/invoice.pdf");
+
+        assert_eq!(
+            WhatsAppWebChannel::document_attachment_marker(path),
+            "[DOCUMENT:/zeroclaw-data/workspace/attachments/whatsapp/invoice.pdf]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_content_has_media_marker_detects_canonical_families() {
+        for marker in [
+            "[IMAGE:/tmp/a.jpg]",
+            "[DOCUMENT:/tmp/a.pdf]",
+            "[VIDEO:/tmp/a.mp4]",
+            "[AUDIO:/tmp/a.mp3]",
+            "[VOICE:/tmp/a.ogg]",
+            "[FILE:/tmp/a.bin]",
+        ] {
+            assert!(WhatsAppWebChannel::content_has_media_marker(marker));
+            assert_eq!(
+                WhatsAppWebChannel::media_marker_key(marker),
+                Some(marker.to_string())
+            );
+        }
+
+        assert!(!WhatsAppWebChannel::content_has_media_marker(
+            "[Document: invoice.pdf] /tmp/invoice.pdf"
+        ));
+        assert_eq!(
+            WhatsAppWebChannel::media_marker_key("[Document: invoice.pdf] /tmp/invoice.pdf"),
+            None
+        );
     }
 
     #[test]
