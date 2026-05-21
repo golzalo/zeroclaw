@@ -1205,16 +1205,22 @@ impl WhatsAppObservationService {
             anyhow::bail!("No cached WhatsApp groups are available yet");
         }
 
+        let requested_name = group_name.map(str::trim).filter(|value| !value.is_empty());
+
         if let Some(group_jid) = group_jid.map(str::trim).filter(|value| !value.is_empty()) {
-            return groups
-                .into_iter()
-                .find(|group| group.group_jid == group_jid)
-                .ok_or_else(|| anyhow!("Unknown WhatsApp group JID `{group_jid}`"));
+            if let Some(found) = groups.iter().find(|group| group.group_jid == group_jid) {
+                return Ok(found.clone());
+            }
+            // The provided JID does not match any visible group. This commonly
+            // happens when the caller passes the current/control chat JID instead
+            // of the target group JID. If a group name was also provided, prefer
+            // resolving by name rather than failing on the bad JID.
+            if requested_name.is_none() {
+                anyhow::bail!("Unknown WhatsApp group JID `{group_jid}`");
+            }
         }
 
-        let requested_name = group_name
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let requested_name = requested_name
             .ok_or_else(|| anyhow!("Provide either `group_jid` or `group_name`"))?;
         let requested_lower = requested_name.to_ascii_lowercase();
 
@@ -2528,6 +2534,40 @@ mod tests {
 
         let by_partial = service.resolve_visible_group(None, Some("pibes")).unwrap();
         assert_eq!(by_partial.group_jid, "120363025123456789@g.us");
+    }
+
+    #[test]
+    fn resolve_visible_group_falls_back_to_name_when_jid_is_unknown() {
+        // Regression: the caller passes the control/managed-group JID as
+        // `group_jid` (a chat that is not in the visible-group cache) while still
+        // naming the real target group. Resolution must fall back to the name
+        // instead of failing on the bad JID.
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363411859972027@g.us".into(),
+                group_name: "S86 - vacas3".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let resolved = service
+            .resolve_visible_group(
+                Some("120363427394921125@g.us"),
+                Some("S86 - vacas3"),
+            )
+            .unwrap();
+        assert_eq!(resolved.group_jid, "120363411859972027@g.us");
+
+        // Unknown JID with no name still fails.
+        let err = service
+            .resolve_visible_group(Some("120363427394921125@g.us"), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("Unknown WhatsApp group JID"));
     }
 
     #[test]
