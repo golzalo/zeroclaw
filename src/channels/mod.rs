@@ -2431,8 +2431,6 @@ fn is_likely_image_request(text: &str) -> bool {
 }
 
 fn infer_image_prompt_from_history(history: &[ChatMessage]) -> Option<String> {
-    let mut fallback = None;
-
     for turn in history.iter().rev() {
         if turn.role != "user" {
             continue;
@@ -2446,13 +2444,9 @@ fn infer_image_prompt_from_history(history: &[ChatMessage]) -> Option<String> {
         if is_likely_image_request(content) && !is_likely_delivery_followup(content) {
             return Some(content.to_string());
         }
-
-        if fallback.is_none() && !is_likely_delivery_followup(content) {
-            fallback = Some(content.to_string());
-        }
     }
 
-    fallback
+    None
 }
 
 fn slugify_image_basename(prompt: &str) -> String {
@@ -6549,6 +6543,7 @@ mod tests {
             last_rotated_at: None,
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
+            reply_to_all: true,
         }
     }
 
@@ -12320,6 +12315,33 @@ This is an example JSON object for profile settings."#;
         assert_eq!(
             billing.get("size").and_then(|value| value.as_str()),
             Some("1024x1024")
+        );
+    }
+
+    #[test]
+    fn image_prompt_inference_requires_explicit_image_request() {
+        let history = vec![
+            ChatMessage::user(
+                "quiero que observes el grupo S86 y que cuando manden documentos los subas a Drive",
+            ),
+            ChatMessage::assistant("Responde YES para confirmar."),
+            ChatMessage::user("YES"),
+        ];
+
+        assert_eq!(infer_image_prompt_from_history(&history), None);
+    }
+
+    #[test]
+    fn image_prompt_inference_can_use_prior_explicit_image_request() {
+        let history = vec![
+            ChatMessage::user("crea una imagen simple con el texto aprobado"),
+            ChatMessage::assistant("No pude adjuntarla todavia."),
+            ChatMessage::user("pasamela por whatsapp"),
+        ];
+
+        assert_eq!(
+            infer_image_prompt_from_history(&history).as_deref(),
+            Some("crea una imagen simple con el texto aprobado")
         );
     }
 }
