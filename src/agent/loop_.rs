@@ -399,6 +399,86 @@ const SCHEDULING_FAILURE_HINTS: &[&str] = &[
     "unable",
 ];
 
+const POLICY_PROCEDURE_INPUT_HINTS: &[&str] = &[
+    "[audio:",
+    "[document:",
+    "[file:",
+    "[image attachment]",
+    "[image:",
+    "[video:",
+    "normalized_document.v1",
+    "visual_analysis.v1",
+    "visualanalysisv1",
+];
+
+const POLICY_PROCEDURE_SUCCESS_CLAIM_HINTS: &[&str] = &[
+    "actualicé",
+    "actualice",
+    "actualiz",
+    "append",
+    "appended",
+    "cread",
+    "creé",
+    "cree",
+    "created",
+    "enviad",
+    "envié",
+    "envie",
+    "guardad",
+    "guardé",
+    "guarde",
+    "procesad",
+    "procesé",
+    "procese",
+    "processed",
+    "recorded",
+    "registrad",
+    "registré",
+    "registre",
+    "saved",
+    "sent",
+    "subí",
+    "subi",
+    "subid",
+    "subió",
+    "subio",
+    "subieron",
+    "uploaded",
+    "wrote",
+    "written",
+];
+
+const POLICY_PROCEDURE_FAILURE_CLAIM_HINTS: &[&str] = &[
+    "blocked",
+    "could not",
+    "error",
+    "failed",
+    "fallo",
+    "falló",
+    "falta",
+    "faltan",
+    "invalid",
+    "missing",
+    "need",
+    "needs",
+    "necesit",
+    "no hay",
+    "no pude",
+    "no puedo",
+    "no se pudo",
+    "no subí",
+    "no subi",
+    "no trae",
+    "sin adjuntos",
+    "unable",
+    "requier",
+    "require",
+    "requires",
+    "required",
+];
+
+const MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN: usize = 3;
+
 const SERVICE_BUILDER_COMPLETION_HINTS: &[&str] = &[
     "cada 5 minutos",
     "corriendo",
@@ -766,6 +846,49 @@ fn response_claims_service_builder_completion(display_text: &str) -> bool {
         && !SCHEDULING_FAILURE_HINTS
             .iter()
             .any(|hint| lowered.contains(hint))
+}
+
+fn latest_user_turn_has_policy_procedure_input(history: &[ChatMessage]) -> bool {
+    let Some(last_user) = latest_human_user_message(history) else {
+        return false;
+    };
+    let lowered = last_user.to_lowercase();
+    POLICY_PROCEDURE_INPUT_HINTS
+        .iter()
+        .any(|hint| lowered.contains(hint))
+}
+
+fn active_turn_has_bound_policy_procedure_input(history: &[ChatMessage]) -> bool {
+    let has_bound_procedure = history.iter().any(|message| {
+        message.role == "system"
+            && message.content.contains("Conversation policy procedure:")
+            && message.content.contains("bound on-demand tenant job")
+            && message.content.contains("whatsapp_run_policy_procedure")
+    });
+
+    has_bound_procedure && latest_user_turn_has_policy_procedure_input(history)
+}
+
+fn response_claims_policy_procedure_success(display_text: &str) -> bool {
+    let lowered = display_text.to_lowercase();
+    POLICY_PROCEDURE_SUCCESS_CLAIM_HINTS
+        .iter()
+        .any(|hint| lowered.contains(hint))
+        && !POLICY_PROCEDURE_FAILURE_CLAIM_HINTS
+            .iter()
+            .any(|hint| lowered.contains(hint))
+}
+
+fn policy_procedure_claim_limit_message(history: &[ChatMessage], attempts: usize) -> String {
+    if prefers_spanish_for_user_message(history, None, None) {
+        format!(
+            "No pude confirmar la ejecución del procedimiento: el asistente intentó reclamar éxito {attempts} veces sin un resultado exitoso de `whatsapp_run_policy_procedure` en este turno. Corté los reintentos para evitar un falso positivo."
+        )
+    } else {
+        format!(
+            "I could not confirm the procedure execution: the assistant tried to claim success {attempts} times without a successful `whatsapp_run_policy_procedure` result in this turn. I stopped retrying to avoid a false positive."
+        )
+    }
 }
 
 fn looks_like_service_contract_confirmation(content: &str) -> bool {
@@ -5958,6 +6081,8 @@ pub(crate) async fn run_tool_call_loop(
     let turn_id = Uuid::new_v4().to_string();
     let mut scheduled_delivery_created = false;
     let mut scheduled_delivery_verified = false;
+    let mut policy_procedure_succeeded = false;
+    let mut policy_procedure_unverified_claims = 0usize;
     let mut side_effect_claims = SideEffectClaimTracker::default();
     let mut requests = Vec::new();
     let mut tool_failures = Vec::new();
@@ -6401,6 +6526,75 @@ pub(crate) async fn run_tool_call_loop(
                     history.push(internal_repair_message(repair_prompt));
                     continue;
                 }
+            }
+
+            if active_turn_has_bound_policy_procedure_input(history)
+                && response_claims_policy_procedure_success(&display_text)
+                && !policy_procedure_succeeded
+            {
+                policy_procedure_unverified_claims += 1;
+                runtime_trace::record_event(
+                    "final_response_unverified_policy_procedure",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(
+                        "assistant claimed a bound procedure side effect without executing the policy procedure",
+                    ),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "claim_attempt": policy_procedure_unverified_claims,
+                        "max_claim_attempts": MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN,
+                        "text": scrub_credentials(&display_text),
+                    }),
+                );
+
+                if policy_procedure_unverified_claims
+                    >= MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN
+                {
+                    let blocker = policy_procedure_claim_limit_message(
+                        history,
+                        policy_procedure_unverified_claims,
+                    );
+                    runtime_trace::record_event(
+                        "policy_procedure_claim_guard_exhausted",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some("assistant repeatedly claimed a bound procedure side effect without tool evidence"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "claim_attempts": policy_procedure_unverified_claims,
+                            "max_claim_attempts": MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN,
+                            "text": scrub_credentials(&display_text),
+                        }),
+                    );
+
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        let _ = tx.send(blocker.clone()).await;
+                    }
+                    history.push(ChatMessage::assistant(blocker.clone()));
+                    tool_failures.push(format!(
+                        "whatsapp_run_policy_procedure: unverified success claim repeated {policy_procedure_unverified_claims} times without a successful tool result"
+                    ));
+                    return Ok(AgentTurnOutcome {
+                        output: blocker,
+                        continuation: None,
+                        requests,
+                        tool_failures,
+                    });
+                }
+
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(internal_repair_message(
+                    "The current conversation has a bound procedure and this turn contains current-turn procedure input. Your previous response claimed the action succeeded, but this turn has no successful whatsapp_run_policy_procedure result. Call whatsapp_run_policy_procedure now with the valid current-turn input, or if the input is invalid/missing, reply briefly with that concrete blocker. Do not claim success without the tool result.",
+                ));
+                continue;
             }
 
             if let Some(claim) = side_effect_claims.unverified_final_response_claim(&display_text) {
@@ -6847,6 +7041,9 @@ pub(crate) async fn run_tool_call_loop(
         {
             let outcome = outcome;
             if outcome.success {
+                if call.name == "whatsapp_run_policy_procedure" {
+                    policy_procedure_succeeded = true;
+                }
                 if call.name == "cron_add" || call.name == "cron_update" {
                     scheduled_delivery_created = true;
                 }
@@ -9132,6 +9329,55 @@ Encontré estos 5 archivos en Google Drive:
         );
 
         assert_eq!(args["chat_jid"], "120363025123456789@g.us");
+    }
+
+    #[test]
+    fn active_turn_has_bound_policy_procedure_input_detects_current_attachments() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.",
+            ),
+            ChatMessage::user(
+                "[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/a.jpg\n[/Image attachment]",
+            ),
+        ];
+
+        assert!(active_turn_has_bound_policy_procedure_input(&history));
+    }
+
+    #[test]
+    fn active_turn_has_bound_policy_procedure_input_ignores_text_only_turns() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.",
+            ),
+            ChatMessage::user("Mentira"),
+        ];
+
+        assert!(!active_turn_has_bound_policy_procedure_input(&history));
+    }
+
+    #[test]
+    fn response_claims_policy_procedure_success_detects_external_effect_claims() {
+        assert!(response_claims_policy_procedure_success(
+            "✅ Subí las 4 imágenes a Google Drive."
+        ));
+        assert!(response_claims_policy_procedure_success(
+            "Processed 3 invoices and appended the rows."
+        ));
+    }
+
+    #[test]
+    fn response_claims_policy_procedure_success_ignores_blocker_claims() {
+        assert!(!response_claims_policy_procedure_success(
+            "No pude subir los archivos porque este turno no trae adjuntos válidos."
+        ));
+        assert!(!response_claims_policy_procedure_success(
+            "The procedure failed with an invalid input error."
+        ));
+        assert!(!response_claims_policy_procedure_success(
+            "Necesito un adjunto válido para poder actualizar Drive."
+        ));
     }
 
     #[tokio::test]
