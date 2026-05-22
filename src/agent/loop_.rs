@@ -477,6 +477,24 @@ const POLICY_PROCEDURE_FAILURE_CLAIM_HINTS: &[&str] = &[
     "required",
 ];
 
+const POLICY_PROCEDURE_NON_FAILURE_ERROR_PHRASES: &[&str] = &[
+    "sin errores",
+    "sin error",
+    "0 errores",
+    "0 error",
+    "cero errores",
+    "ningún error",
+    "ningun error",
+    "no hubo errores",
+    "no hubo error",
+    "no errors",
+    "no error",
+    "without errors",
+    "without error",
+    "zero errors",
+    "error-free",
+];
+
 const MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN: usize = 3;
 
 const SERVICE_BUILDER_COMPLETION_HINTS: &[&str] = &[
@@ -871,12 +889,17 @@ fn active_turn_has_bound_policy_procedure_input(history: &[ChatMessage]) -> bool
 
 fn response_claims_policy_procedure_success(display_text: &str) -> bool {
     let lowered = display_text.to_lowercase();
+    let mut failure_scan_text = lowered.clone();
+    for phrase in POLICY_PROCEDURE_NON_FAILURE_ERROR_PHRASES {
+        failure_scan_text = failure_scan_text.replace(phrase, "");
+    }
+
     POLICY_PROCEDURE_SUCCESS_CLAIM_HINTS
         .iter()
         .any(|hint| lowered.contains(hint))
         && !POLICY_PROCEDURE_FAILURE_CLAIM_HINTS
             .iter()
-            .any(|hint| lowered.contains(hint))
+            .any(|hint| failure_scan_text.contains(hint))
 }
 
 fn policy_procedure_claim_limit_message(history: &[ChatMessage], attempts: usize) -> String {
@@ -9363,6 +9386,12 @@ Encontré estos 5 archivos en Google Drive:
             "✅ Subí las 4 imágenes a Google Drive."
         ));
         assert!(response_claims_policy_procedure_success(
+            "✅ 11 archivos subidos correctamente a la carpeta Anda en Google Drive. Sin errores."
+        ));
+        assert!(response_claims_policy_procedure_success(
+            "Uploaded 9 files with 0 errors."
+        ));
+        assert!(response_claims_policy_procedure_success(
             "Processed 3 invoices and appended the rows."
         ));
     }
@@ -9374,6 +9403,9 @@ Encontré estos 5 archivos en Google Drive:
         ));
         assert!(!response_claims_policy_procedure_success(
             "The procedure failed with an invalid input error."
+        ));
+        assert!(!response_claims_policy_procedure_success(
+            "Subí algunos archivos, pero hubo un error al completar la carga."
         ));
         assert!(!response_claims_policy_procedure_success(
             "Necesito un adjunto válido para poder actualizar Drive."
