@@ -137,7 +137,8 @@ fn compute_usage_cost_for_prices(
     output_price_per_million: f64,
 ) -> f64 {
     let normalized_cached_input_tokens = cached_input_tokens.min(input_tokens);
-    let normalized_billable_input_tokens = input_tokens.saturating_sub(normalized_cached_input_tokens);
+    let normalized_billable_input_tokens =
+        input_tokens.saturating_sub(normalized_cached_input_tokens);
     let input_cost = (normalized_billable_input_tokens as f64 / 1_000_000.0)
         * sanitize_price(input_price_per_million);
     let cached_input_cost = (normalized_cached_input_tokens as f64 / 1_000_000.0)

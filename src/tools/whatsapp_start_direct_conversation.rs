@@ -74,7 +74,10 @@ impl WhatsAppStartDirectConversationTool {
             ));
         }
 
-        if let Some(contact_phone) = contact_phone.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(contact_phone) = contact_phone
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             if let Ok(chat) = service.resolve_visible_direct_chat(None, None, Some(contact_phone)) {
                 return Ok(chat.chat_jid);
             }
@@ -91,9 +94,9 @@ impl WhatsAppStartDirectConversationTool {
         let contact_name = contact_name
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!(
-                "Provide `chat_jid`, `contact_phone`, or `contact_name`"
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Provide `chat_jid`, `contact_phone`, or `contact_name`")
+            })?;
         let chat = service.resolve_visible_direct_chat(None, Some(contact_name), None)?;
         Ok(chat.chat_jid)
     }
@@ -139,10 +142,10 @@ impl Tool for WhatsAppStartDirectConversationTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if let Err(error) = self.security.enforce_tool_operation(
-            ToolOperation::Act,
-            "whatsapp_start_direct_conversation",
-        ) {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "whatsapp_start_direct_conversation")
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -241,7 +244,9 @@ impl Tool for WhatsAppStartDirectConversationTool {
             });
         };
 
-        channel.send(&SendMessage::new(message, &policy.group_jid)).await?;
+        channel
+            .send(&SendMessage::new(message, &policy.group_jid))
+            .await?;
         let observed = service.mark_initial_outreach_sent(&policy.group_jid, message)?;
 
         Ok(ToolResult {

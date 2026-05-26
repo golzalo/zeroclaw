@@ -1,7 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::{
-    build_delegate_resume_prompt, run_tool_call_loop,
-};
+use crate::agent::loop_::{build_delegate_resume_prompt, run_tool_call_loop};
 use crate::agent::subagent_history_store;
 use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
@@ -33,9 +31,6 @@ fn looks_like_delegate_batch_continue_request(prompt: &str) -> bool {
         "10x" | "x10"
     )
 }
-
-
-
 
 fn delegate_task_scope(scope_key: &str, agent_name: &str) -> String {
     format!("{scope_key}::delegate::{agent_name}")
@@ -165,8 +160,7 @@ Original request:\n\
 
 fn normalize_delegate_prompt(agent_name: &str, prompt: &str) -> String {
     if agent_name.eq_ignore_ascii_case("drive") {
-        return maybe_rewrite_drive_delegate_prompt(prompt)
-            .unwrap_or_else(|| prompt.to_string());
+        return maybe_rewrite_drive_delegate_prompt(prompt).unwrap_or_else(|| prompt.to_string());
     }
     prompt.to_string()
 }
@@ -514,7 +508,8 @@ impl Tool for DelegateTool {
                 .await;
         }
 
-        let messages = build_delegate_messages(agent_config.system_prompt.as_deref(), &routed_prompt);
+        let messages =
+            build_delegate_messages(agent_config.system_prompt.as_deref(), &routed_prompt);
         let quote = if let Some(remote_budget) = remote_budget.as_ref() {
             let (estimated_input_tokens, estimated_output_tokens) = estimate_delegate_tokens(
                 agent_config.system_prompt.as_deref(),
@@ -703,19 +698,18 @@ impl DelegateTool {
         // the prompt is phrased. This fixes the iterate-mode bug where a natural-language
         // prompt bypassed the gate and caused the subagent to restart from scratch.
         let resume_checkpoint = match (self.workspace_dir.as_deref(), delegate_scope.as_deref()) {
-            (Some(workspace_dir), Some(scope_key)) => {
-                task_checkpoint_store::load_checkpoint(
-                    workspace_dir,
-                    scope_key,
-                    ROOT_TASK_CHECKPOINT_AGENT,
-                )
-                .ok()
-                .flatten()
-            }
+            (Some(workspace_dir), Some(scope_key)) => task_checkpoint_store::load_checkpoint(
+                workspace_dir,
+                scope_key,
+                ROOT_TASK_CHECKPOINT_AGENT,
+            )
+            .ok()
+            .flatten(),
             _ => None,
         };
 
-        let effective_max_iterations = (agent_config.max_iterations * iterations_multiplier).min(100);
+        let effective_max_iterations =
+            (agent_config.max_iterations * iterations_multiplier).min(100);
 
         let agent_skills: Vec<crate::skills::Skill> = if !agent_config.skills.is_empty() {
             if let Some(workspace_dir) = &self.workspace_dir {
@@ -1079,6 +1073,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         agents.insert(
@@ -1097,6 +1092,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         agents
@@ -1254,6 +1250,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills: Vec::new(),
             context_files: Vec::new(),
+            skip_bootstrap: false,
         }
     }
 
@@ -1310,8 +1307,6 @@ mod tests {
         assert!(prompt.contains("Please finish the publish step and fix the probe failure."));
         assert!(prompt.contains("Refactor the handler"));
     }
-
-   
 
     #[test]
     fn normalize_delegate_prompt_routes_drive_doc_with_image_to_docx_upload() {
@@ -1462,6 +1457,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1572,6 +1568,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1611,6 +1608,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1702,7 +1700,9 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false, 1)
+            .execute_agentic(
+                "agentic", &config, &provider, "run", 0.2, None, None, false, 1,
+            )
             .await
             .unwrap();
 
@@ -1724,7 +1724,9 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false, 1)
+            .execute_agentic(
+                "agentic", &config, &provider, "run", 0.2, None, None, false, 1,
+            )
             .await
             .unwrap();
 
@@ -1744,14 +1746,14 @@ mod tests {
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false, 1)
+            .execute_agentic(
+                "agentic", &config, &provider, "run", 0.2, None, None, false, 1,
+            )
             .await
             .unwrap();
 
         assert!(result.success);
-        assert!(result
-            .output
-            .contains("continuation checkpoint"));
+        assert!(result.output.contains("continuation checkpoint"));
         assert!(result.output.contains("<continuation_checkpoint>"));
     }
 
@@ -1763,7 +1765,9 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None, None, false, 1)
+            .execute_agentic(
+                "agentic", &config, &provider, "run", 0.2, None, None, false, 1,
+            )
             .await
             .unwrap();
 
@@ -1891,7 +1895,9 @@ mod tests {
 
         let provider = McpToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2, None, None, false, 1)
+            .execute_agentic(
+                "agentic", &config, &provider, "run mcp", 0.2, None, None, false, 1,
+            )
             .await
             .unwrap();
 
@@ -1954,7 +1960,9 @@ mod tests {
 
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>])))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(EchoTool) as Arc<dyn Tool>
+            ])))
             .with_workspace(workspace.path().to_path_buf(), false, None);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let provider = CaptureMessagesThenDoneProvider { seen: seen.clone() };
@@ -1976,14 +1984,30 @@ mod tests {
 
         assert!(result.success);
         let seen = seen.lock().unwrap();
-        assert!(seen.iter().any(|msg| msg.role == "assistant" && msg.content == "Scaffold listo."));
-        assert!(seen.iter().any(|msg| msg.role == "assistant" && msg.content.contains("¿Quieres que siga?")));
-        assert!(seen.iter().any(|msg| msg.role == "user" && msg.content == "10x"));
-        assert!(!seen.iter().any(|msg| msg.content.contains("Prior subagent transcript")));
-        assert!(!seen.iter().any(|msg| msg.content.contains("CONTINUATION RESUME DIRECTIVE")));
-        assert!(!seen.iter().any(|msg| msg.content.contains("saved checkpoint")));
-        assert!(!seen.iter().any(|msg| msg.content.starts_with("[Tool results]")));
-        assert!(!seen.iter().any(|msg| msg.content.starts_with("EXISTING_JOB:")));
+        assert!(seen
+            .iter()
+            .any(|msg| msg.role == "assistant" && msg.content == "Scaffold listo."));
+        assert!(seen
+            .iter()
+            .any(|msg| msg.role == "assistant" && msg.content.contains("¿Quieres que siga?")));
+        assert!(seen
+            .iter()
+            .any(|msg| msg.role == "user" && msg.content == "10x"));
+        assert!(!seen
+            .iter()
+            .any(|msg| msg.content.contains("Prior subagent transcript")));
+        assert!(!seen
+            .iter()
+            .any(|msg| msg.content.contains("CONTINUATION RESUME DIRECTIVE")));
+        assert!(!seen
+            .iter()
+            .any(|msg| msg.content.contains("saved checkpoint")));
+        assert!(!seen
+            .iter()
+            .any(|msg| msg.content.starts_with("[Tool results]")));
+        assert!(!seen
+            .iter()
+            .any(|msg| msg.content.starts_with("EXISTING_JOB:")));
     }
 
     #[test]
@@ -2018,6 +2042,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills: Vec::new(),
             context_files: Vec::new(),
+            skip_bootstrap: false,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2047,6 +2072,7 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills: Vec::new(),
             context_files: Vec::new(),
+            skip_bootstrap: false,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2103,6 +2129,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2131,6 +2158,7 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2159,6 +2187,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2187,6 +2216,7 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2215,6 +2245,7 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         assert!(config.validate().is_ok());
@@ -2239,6 +2270,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         assert!(config.validate().is_ok());

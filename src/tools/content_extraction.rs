@@ -83,7 +83,9 @@ fn html_from_extraction(
     original_html: &str,
     extracted: Option<&rs_trafilatura::ExtractResult>,
 ) -> anyhow::Result<String> {
-    if let Some(extracted_html) = extracted.and_then(|result| non_empty(result.content_html.as_deref())) {
+    if let Some(extracted_html) =
+        extracted.and_then(|result| non_empty(result.content_html.as_deref()))
+    {
         return Ok(extracted_html.to_string());
     }
 
@@ -203,8 +205,7 @@ mod tests {
     fn html_format_preserves_image_tags() {
         let html = "<html><body><article><h1>Title</h1><img src=\"https://example.com/hero.jpg\" alt=\"hero\" /><p>Hello world</p></article></body></html>";
         let extracted =
-            extract_html_for_llm(html, "https://example.com/page", HtmlOutputFormat::Html)
-                .unwrap();
+            extract_html_for_llm(html, "https://example.com/page", HtmlOutputFormat::Html).unwrap();
 
         assert!(extracted.contains("<img"));
         assert!(extracted.contains("hero.jpg"));

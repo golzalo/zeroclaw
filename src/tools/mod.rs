@@ -89,8 +89,8 @@ pub mod whatsapp_enable_community;
 pub mod whatsapp_list_direct_chats;
 pub mod whatsapp_list_groups;
 pub mod whatsapp_list_observed_groups;
-pub mod whatsapp_observe_group;
 pub mod whatsapp_objective_dm;
+pub mod whatsapp_observe_group;
 pub mod whatsapp_run_policy_procedure;
 pub mod whatsapp_start_direct_conversation;
 pub mod whatsapp_unobserve_group;
@@ -169,8 +169,8 @@ pub use whatsapp_enable_community::WhatsAppEnableCommunityTool;
 pub use whatsapp_list_direct_chats::WhatsAppListDirectChatsTool;
 pub use whatsapp_list_groups::WhatsAppListGroupsTool;
 pub use whatsapp_list_observed_groups::WhatsAppListObservedGroupsTool;
-pub use whatsapp_observe_group::WhatsAppObserveGroupTool;
 pub use whatsapp_objective_dm::WhatsAppObjectiveDmTool;
+pub use whatsapp_observe_group::WhatsAppObserveGroupTool;
 pub use whatsapp_run_policy_procedure::WhatsAppRunPolicyProcedureTool;
 pub use whatsapp_start_direct_conversation::WhatsAppStartDirectConversationTool;
 pub use whatsapp_unobserve_group::WhatsAppUnobserveGroupTool;
@@ -442,7 +442,9 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(WhatsAppCreateTopicGroupTool::new(security.clone())),
         Arc::new(WhatsAppEnableCommunityTool::new(security.clone())),
-        Arc::new(WhatsAppListDirectChatsTool::new(workspace_dir.to_path_buf())),
+        Arc::new(WhatsAppListDirectChatsTool::new(
+            workspace_dir.to_path_buf(),
+        )),
         Arc::new(WhatsAppListGroupsTool::new(workspace_dir.to_path_buf())),
         Arc::new(WhatsAppListObservedGroupsTool::new(
             workspace_dir.to_path_buf(),
@@ -1163,6 +1165,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
 

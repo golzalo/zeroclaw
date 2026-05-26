@@ -2,15 +2,16 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const DEFAULT_ROTATE_AFTER_BYTES: u64 = 512 * 1024;
 const DEFAULT_KEEP_LOG_SEGMENTS: usize = 8;
+static OBSERVED_GROUP_LOG_APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub use crate::channels::conversation_policy::{
-    ConversationChatKind, ConversationMode, ConversationPolicyStatus,
-    ConversationProcedureMetadata,
+    ConversationChatKind, ConversationMode, ConversationPolicyStatus, ConversationProcedureMetadata,
 };
 
 fn default_channel() -> String {
@@ -70,6 +71,10 @@ pub struct ObservedGroupConfig {
     pub procedure_input_schema: Option<String>,
     #[serde(default)]
     pub procedure_input_contract: Option<String>,
+    #[serde(default)]
+    pub procedure_output_contract: Option<String>,
+    #[serde(default)]
+    pub procedure_claim_contract: Option<String>,
     #[serde(default)]
     pub procedure_sop: Option<String>,
     #[serde(default)]
@@ -287,13 +292,21 @@ impl WhatsAppObservationService {
         groups: &HashMap<String, ObservedGroupConfig>,
     ) -> Result<()> {
         let dir = self.observed_groups_dir();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| anyhow!("Failed to create observed groups dir {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            anyhow!(
+                "Failed to create observed groups dir {}: {e}",
+                dir.display()
+            )
+        })?;
         let serialized = serde_json::to_string_pretty(groups)
             .map_err(|e| anyhow!("Failed to serialize observed groups config: {e}"))?;
         let path = self.observed_groups_index_path();
-        std::fs::write(&path, serialized)
-            .map_err(|e| anyhow!("Failed to write observed groups index {}: {e}", path.display()))
+        std::fs::write(&path, serialized).map_err(|e| {
+            anyhow!(
+                "Failed to write observed groups index {}: {e}",
+                path.display()
+            )
+        })
     }
 
     pub fn register_observed_group(
@@ -378,6 +391,8 @@ impl WhatsAppObservationService {
                 procedure_summary: None,
                 procedure_input_schema: None,
                 procedure_input_contract: None,
+                procedure_output_contract: None,
+                procedure_claim_contract: None,
                 procedure_sop: None,
                 canonical_phone: None,
                 rotate_after_bytes: default_rotate_after_bytes(),
@@ -490,9 +505,7 @@ impl WhatsAppObservationService {
             anyhow::bail!("Direct chat goal cannot be empty");
         }
         if mode != ConversationMode::ObjectiveDm && !goal.is_empty() {
-            anyhow::bail!(
-                "Direct chat goal is only supported when mode is `objective_dm`"
-            );
+            anyhow::bail!("Direct chat goal is only supported when mode is `objective_dm`");
         }
 
         let chat_name = if chat_name.trim().is_empty() {
@@ -501,8 +514,7 @@ impl WhatsAppObservationService {
             chat_name.trim()
         };
 
-        let canonical_phone =
-            Self::canonical_direct_chat_phone(chat_jid, canonical_phone);
+        let canonical_phone = Self::canonical_direct_chat_phone(chat_jid, canonical_phone);
         let policy_jid = Self::canonical_direct_policy_jid(chat_jid, canonical_phone.as_deref());
         self.record_visible_direct_chat(chat_jid, chat_name, canonical_phone.as_deref())?;
 
@@ -542,6 +554,8 @@ impl WhatsAppObservationService {
                 procedure_summary: None,
                 procedure_input_schema: None,
                 procedure_input_contract: None,
+                procedure_output_contract: None,
+                procedure_claim_contract: None,
                 procedure_sop: None,
                 canonical_phone: canonical_phone.clone(),
                 rotate_after_bytes: default_rotate_after_bytes(),
@@ -595,15 +609,18 @@ impl WhatsAppObservationService {
             .ok_or_else(|| anyhow!("No WhatsApp conversation policy found for `{chat_jid}`"))?;
 
         entry.initial_outreach_sent_at = Some(chrono::Utc::now().to_rfc3339());
-        entry.initial_outreach_preview = Self::normalize_optional_text(preview)
-            .map(|value| Self::truncate_text(&value, 240));
+        entry.initial_outreach_preview =
+            Self::normalize_optional_text(preview).map(|value| Self::truncate_text(&value, 240));
 
         let observed = entry.clone();
         self.save_observed_groups(&groups)?;
         Ok(observed)
     }
 
-    pub fn unregister_observed_group(&self, group_jid: &str) -> Result<Option<ObservedGroupConfig>> {
+    pub fn unregister_observed_group(
+        &self,
+        group_jid: &str,
+    ) -> Result<Option<ObservedGroupConfig>> {
         let mut groups = self.load_observed_groups();
         let removed = groups.remove(group_jid);
         self.save_observed_groups(&groups)?;
@@ -651,7 +668,10 @@ impl WhatsAppObservationService {
         self.load_observed_groups().remove(group_jid)
     }
 
-    pub fn conversation_policy_config(&self, conversation_jid: &str) -> Option<ObservedGroupConfig> {
+    pub fn conversation_policy_config(
+        &self,
+        conversation_jid: &str,
+    ) -> Option<ObservedGroupConfig> {
         self.observed_group_config(conversation_jid)
     }
 
@@ -711,12 +731,17 @@ impl WhatsAppObservationService {
         groups.into_values().find(|policy| {
             policy.chat_kind == ConversationChatKind::Direct
                 && policy.canonical_phone.as_ref().is_some_and(|phone| {
-                    normalized_candidates.iter().any(|candidate| candidate == phone)
+                    normalized_candidates
+                        .iter()
+                        .any(|candidate| candidate == phone)
                 })
         })
     }
 
-    pub fn observed_groups_for_delivery_chat(&self, chat_jid: Option<&str>) -> Vec<ObservedGroupConfig> {
+    pub fn observed_groups_for_delivery_chat(
+        &self,
+        chat_jid: Option<&str>,
+    ) -> Vec<ObservedGroupConfig> {
         let mut groups: Vec<ObservedGroupConfig> = self
             .load_observed_groups()
             .into_values()
@@ -769,9 +794,7 @@ impl WhatsAppObservationService {
             } else {
                 names.join(", ")
             };
-            anyhow::bail!(
-                "Unknown workspace skill `{skill_name}`. Available skills: {available}"
-            );
+            anyhow::bail!("Unknown workspace skill `{skill_name}`. Available skills: {available}");
         };
 
         Ok(Some(skill.name))
@@ -791,7 +814,9 @@ impl WhatsAppObservationService {
             return groups
                 .into_iter()
                 .find(|group| group.group_jid == group_jid)
-                .ok_or_else(|| anyhow!("Unknown configured WhatsApp conversation JID `{group_jid}`"));
+                .ok_or_else(|| {
+                    anyhow!("Unknown configured WhatsApp conversation JID `{group_jid}`")
+                });
         }
 
         let requested_name = group_name
@@ -811,7 +836,12 @@ impl WhatsAppObservationService {
 
         let mut partial_matches: Vec<ObservedGroupConfig> = groups
             .into_iter()
-            .filter(|group| group.group_name.to_ascii_lowercase().contains(&requested_lower))
+            .filter(|group| {
+                group
+                    .group_name
+                    .to_ascii_lowercase()
+                    .contains(&requested_lower)
+            })
             .collect();
         if partial_matches.len() == 1 {
             return Ok(partial_matches.remove(0));
@@ -839,11 +869,12 @@ impl WhatsAppObservationService {
             .resolve_visible_direct_chat(None, Some(requested_name), Some(requested_name))
             .ok()
             .and_then(|chat| {
-                self.conversation_policy_for_target(&chat.chat_jid).or_else(|| {
-                    chat.canonical_phone
-                        .as_deref()
-                        .and_then(|phone| self.conversation_policy_for_target(phone))
-                })
+                self.conversation_policy_for_target(&chat.chat_jid)
+                    .or_else(|| {
+                        chat.canonical_phone
+                            .as_deref()
+                            .and_then(|phone| self.conversation_policy_for_target(phone))
+                    })
             })
         {
             return Ok(policy);
@@ -865,7 +896,11 @@ impl WhatsAppObservationService {
         self.save_suppressed_group_fallbacks(&groups)
     }
 
-    pub fn clear_group_fallback_suppression(&self, group_jid: &str, group_name: &str) -> Result<()> {
+    pub fn clear_group_fallback_suppression(
+        &self,
+        group_jid: &str,
+        group_name: &str,
+    ) -> Result<()> {
         let mut groups = self.load_suppressed_group_fallbacks();
         let original_len = groups.len();
         groups.retain(|record| {
@@ -877,22 +912,20 @@ impl WhatsAppObservationService {
         Ok(())
     }
 
-    pub fn is_group_fallback_suppressed(
-        &self,
-        group_jid: &str,
-        group_name: Option<&str>,
-    ) -> bool {
+    pub fn is_group_fallback_suppressed(&self, group_jid: &str, group_name: Option<&str>) -> bool {
         let group_jid = group_jid.trim();
         let group_name = group_name
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_ascii_lowercase);
-        self.load_suppressed_group_fallbacks().into_iter().any(|record| {
-            record.group_jid == group_jid
-                || group_name.as_ref().is_some_and(|candidate| {
-                    record.group_name.to_ascii_lowercase() == *candidate
-                })
-        })
+        self.load_suppressed_group_fallbacks()
+            .into_iter()
+            .any(|record| {
+                record.group_jid == group_jid
+                    || group_name.as_ref().is_some_and(|candidate| {
+                        record.group_name.to_ascii_lowercase() == *candidate
+                    })
+            })
     }
 
     pub fn append_observed_group_message(
@@ -923,6 +956,10 @@ impl WhatsAppObservationService {
         if trimmed.is_empty() {
             return Ok(());
         }
+        let _append_guard = OBSERVED_GROUP_LOG_APPEND_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| anyhow!("Observed group log append lock poisoned"))?;
         let timestamp = chrono::Utc::now().to_rfc3339();
         let mut groups = self.load_observed_groups();
         if let Some(group) = groups.get_mut(group_jid) {
@@ -937,11 +974,16 @@ impl WhatsAppObservationService {
             self.save_observed_groups(&groups)?;
         }
         let dir = self.observed_groups_dir();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| anyhow!("Failed to create observed groups dir {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            anyhow!(
+                "Failed to create observed groups dir {}: {e}",
+                dir.display()
+            )
+        })?;
         let path = self.observed_group_log_path(group_jid);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .map_err(|e| anyhow!("Failed to open observed group log {}: {e}", path.display()))?;
@@ -962,8 +1004,39 @@ impl WhatsAppObservationService {
             content: trimmed.to_string(),
         })
         .map_err(|e| anyhow!("Failed to serialize observed group message: {e}"))?;
-        writeln!(file, "{line}")
-            .map_err(|e| anyhow!("Failed to append observed group log {}: {e}", path.display()))
+        let mut record = line.into_bytes();
+        record.push(b'\n');
+        if file
+            .metadata()
+            .map_err(|e| anyhow!("Failed to stat observed group log {}: {e}", path.display()))?
+            .len()
+            > 0
+        {
+            file.seek(SeekFrom::End(-1)).map_err(|e| {
+                anyhow!(
+                    "Failed to inspect observed group log {}: {e}",
+                    path.display()
+                )
+            })?;
+            let mut last_byte = [0_u8; 1];
+            file.read_exact(&mut last_byte).map_err(|e| {
+                anyhow!("Failed to read observed group log {}: {e}", path.display())
+            })?;
+            if last_byte[0] != b'\n' {
+                file.write_all(b"\n").map_err(|e| {
+                    anyhow!(
+                        "Failed to repair observed group log boundary {}: {e}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        file.write_all(&record).map_err(|e| {
+            anyhow!(
+                "Failed to append observed group log {}: {e}",
+                path.display()
+            )
+        })
     }
 
     pub fn read_conversation_journal_tail_as_chat_messages(
@@ -976,7 +1049,11 @@ impl WhatsAppObservationService {
         }
 
         let mut collected = Vec::with_capacity(limit);
-        for path in self.observed_group_log_segments(group_jid)?.into_iter().rev() {
+        for path in self
+            .observed_group_log_segments(group_jid)?
+            .into_iter()
+            .rev()
+        {
             let messages = Self::read_observed_group_messages_from_path(&path)?;
             for message in messages.into_iter().rev() {
                 if let Some(chat_message) = Self::observed_group_message_to_chat_message(&message) {
@@ -999,7 +1076,9 @@ impl WhatsAppObservationService {
     ) -> Result<usize> {
         let mut indexed = 0usize;
         for policy in self.observed_groups_for_delivery_chat(None) {
-            indexed += self.index_conversation_journal_to_memory(memory, &policy).await?;
+            indexed += self
+                .index_conversation_journal_to_memory(memory, &policy)
+                .await?;
         }
         Ok(indexed)
     }
@@ -1034,7 +1113,8 @@ impl WhatsAppObservationService {
                 offset = 0;
             }
 
-            let (messages, new_offset) = Self::read_observed_group_messages_from_offset(&path, offset)?;
+            let (messages, new_offset) =
+                Self::read_observed_group_messages_from_offset(&path, offset)?;
             for message in messages {
                 if !Self::should_index_observed_group_message(&message) {
                     continue;
@@ -1075,8 +1155,12 @@ impl WhatsAppObservationService {
         })?;
         let serialized = serde_json::to_string_pretty(groups)
             .map_err(|e| anyhow!("Failed to serialize visible groups cache: {e}"))?;
-        std::fs::write(&path, serialized)
-            .map_err(|e| anyhow!("Failed to write visible groups cache {}: {e}", path.display()))
+        std::fs::write(&path, serialized).map_err(|e| {
+            anyhow!(
+                "Failed to write visible groups cache {}: {e}",
+                path.display()
+            )
+        })
     }
 
     pub fn load_visible_groups(&self) -> Vec<VisibleGroupRecord> {
@@ -1138,8 +1222,7 @@ impl WhatsAppObservationService {
         } else {
             display_name.trim()
         };
-        let canonical_phone =
-            Self::canonical_direct_chat_phone(chat_jid, canonical_phone);
+        let canonical_phone = Self::canonical_direct_chat_phone(chat_jid, canonical_phone);
         let now = chrono::Utc::now().to_rfc3339();
 
         let mut chats = self.load_visible_direct_chats();
@@ -1219,8 +1302,8 @@ impl WhatsAppObservationService {
             }
         }
 
-        let requested_name = requested_name
-            .ok_or_else(|| anyhow!("Provide either `group_jid` or `group_name`"))?;
+        let requested_name =
+            requested_name.ok_or_else(|| anyhow!("Provide either `group_jid` or `group_name`"))?;
         let requested_lower = requested_name.to_ascii_lowercase();
 
         let mut exact_matches: Vec<VisibleGroupRecord> = groups
@@ -1234,7 +1317,12 @@ impl WhatsAppObservationService {
 
         let mut partial_matches: Vec<VisibleGroupRecord> = groups
             .into_iter()
-            .filter(|group| group.group_name.to_ascii_lowercase().contains(&requested_lower))
+            .filter(|group| {
+                group
+                    .group_name
+                    .to_ascii_lowercase()
+                    .contains(&requested_lower)
+            })
             .collect();
         if partial_matches.len() == 1 {
             return Ok(partial_matches.remove(0));
@@ -1306,7 +1394,11 @@ impl WhatsAppObservationService {
 
         let mut partial_matches: Vec<VisibleDirectChatRecord> = chats
             .into_iter()
-            .filter(|chat| chat.display_name.to_ascii_lowercase().contains(&requested_lower))
+            .filter(|chat| {
+                chat.display_name
+                    .to_ascii_lowercase()
+                    .contains(&requested_lower)
+            })
             .collect();
         if partial_matches.len() == 1 {
             return Ok(partial_matches.remove(0));
@@ -1318,7 +1410,10 @@ impl WhatsAppObservationService {
                 .chain(partial_matches)
                 .map(|chat| {
                     let phone = chat.canonical_phone.as_deref().unwrap_or("-");
-                    format!("{} (jid={}, phone={})", chat.display_name, chat.chat_jid, phone)
+                    format!(
+                        "{} (jid={}, phone={})",
+                        chat.display_name, chat.chat_jid, phone
+                    )
                 })
                 .collect();
             names.sort();
@@ -1340,11 +1435,12 @@ pub fn render_visible_groups(groups: &[VisibleGroupRecord]) -> String {
 
     let mut output = format!("Cached WhatsApp groups ({}):\n", groups.len());
     for group in groups {
-        let parent = group
-            .linked_parent_jid
-            .as_deref()
-            .unwrap_or("-");
-        let default_flag = if group.is_default_sub_group { " default-sub-group" } else { "" };
+        let parent = group.linked_parent_jid.as_deref().unwrap_or("-");
+        let default_flag = if group.is_default_sub_group {
+            " default-sub-group"
+        } else {
+            ""
+        };
         output.push_str(&format!(
             "- {} | jid={} | parent={}{}\n",
             group.group_name, group.group_jid, parent, default_flag
@@ -1441,7 +1537,10 @@ impl WhatsAppObservationService {
             entry.procedure_summary = None;
             entry.procedure_input_schema = None;
             entry.procedure_input_contract = None;
+            entry.procedure_output_contract = None;
+            entry.procedure_claim_contract = None;
             entry.procedure_sop = None;
+            entry.policy_tools.clear();
         }
 
         if let Some(goal) = procedure
@@ -1478,6 +1577,14 @@ impl WhatsAppObservationService {
                 .and_then(Self::normalize_optional_text);
             entry.procedure_input_contract = procedure
                 .procedure_input_contract
+                .as_deref()
+                .and_then(Self::normalize_optional_text);
+            entry.procedure_output_contract = procedure
+                .procedure_output_contract
+                .as_deref()
+                .and_then(Self::normalize_optional_text);
+            entry.procedure_claim_contract = procedure
+                .procedure_claim_contract
                 .as_deref()
                 .and_then(Self::normalize_optional_text);
             entry.procedure_sop = procedure
@@ -1608,7 +1715,10 @@ impl WhatsAppObservationService {
         incoming_display_name.contains('@') && !existing_display_name.contains('@')
     }
 
-    fn canonical_direct_chat_phone(chat_jid: &str, canonical_phone: Option<&str>) -> Option<String> {
+    fn canonical_direct_chat_phone(
+        chat_jid: &str,
+        canonical_phone: Option<&str>,
+    ) -> Option<String> {
         canonical_phone
             .and_then(Self::normalize_phone_token)
             .or_else(|| {
@@ -1668,7 +1778,8 @@ impl WhatsAppObservationService {
     }
 
     fn sanitize_memory_key_token(value: &str) -> String {
-        value.chars()
+        value
+            .chars()
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
             .collect()
     }
@@ -1705,14 +1816,21 @@ impl WhatsAppObservationService {
     }
 
     fn read_observed_group_messages_from_path(path: &Path) -> Result<Vec<ObservedGroupMessage>> {
-        let file = std::fs::File::open(path)
-            .map_err(|error| anyhow!("Failed to open observed group log {}: {error}", path.display()))?;
+        let file = std::fs::File::open(path).map_err(|error| {
+            anyhow!(
+                "Failed to open observed group log {}: {error}",
+                path.display()
+            )
+        })?;
         let reader = BufReader::new(file);
         let mut messages = Vec::new();
 
         for line_result in reader.lines() {
             let line = line_result.map_err(|error| {
-                anyhow!("Failed to read observed group log line {}: {error}", path.display())
+                anyhow!(
+                    "Failed to read observed group log line {}: {error}",
+                    path.display()
+                )
             })?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -1737,12 +1855,19 @@ impl WhatsAppObservationService {
         path: &Path,
         offset: u64,
     ) -> Result<(Vec<ObservedGroupMessage>, u64)> {
-        let file = std::fs::File::open(path)
-            .map_err(|error| anyhow!("Failed to open observed group log {}: {error}", path.display()))?;
+        let file = std::fs::File::open(path).map_err(|error| {
+            anyhow!(
+                "Failed to open observed group log {}: {error}",
+                path.display()
+            )
+        })?;
         let mut reader = BufReader::new(file);
-        reader
-            .seek(SeekFrom::Start(offset))
-            .map_err(|error| anyhow!("Failed to seek observed group log {}: {error}", path.display()))?;
+        reader.seek(SeekFrom::Start(offset)).map_err(|error| {
+            anyhow!(
+                "Failed to seek observed group log {}: {error}",
+                path.display()
+            )
+        })?;
 
         let mut messages = Vec::new();
         let mut cursor = offset;
@@ -1750,7 +1875,10 @@ impl WhatsAppObservationService {
         loop {
             let mut line = String::new();
             let bytes = reader.read_line(&mut line).map_err(|error| {
-                anyhow!("Failed to read observed group log line {}: {error}", path.display())
+                anyhow!(
+                    "Failed to read observed group log line {}: {error}",
+                    path.display()
+                )
             })?;
             if bytes == 0 {
                 break;
@@ -1806,10 +1934,7 @@ impl WhatsAppObservationService {
         Self::observed_group_message_to_chat_message(message).is_some()
     }
 
-    fn observed_group_memory_key(
-        conversation_jid: &str,
-        message: &ObservedGroupMessage,
-    ) -> String {
+    fn observed_group_memory_key(conversation_jid: &str, message: &ObservedGroupMessage) -> String {
         let event = Self::sanitize_memory_key_token(message.event.trim());
         let role = Self::sanitize_memory_key_token(message.role.trim());
         let token = message
@@ -1888,8 +2013,9 @@ impl WhatsAppObservationService {
                 parent.display()
             )
         })?;
-        let serialized = serde_json::to_string_pretty(state)
-            .map_err(|error| anyhow!("Failed to serialize WhatsApp journal index state: {error}"))?;
+        let serialized = serde_json::to_string_pretty(state).map_err(|error| {
+            anyhow!("Failed to serialize WhatsApp journal index state: {error}")
+        })?;
         std::fs::write(&path, serialized).map_err(|error| {
             anyhow!(
                 "Failed to write WhatsApp journal index state {}: {error}",
@@ -1945,7 +2071,11 @@ impl WhatsAppObservationService {
         Ok(Some(rotated_at))
     }
 
-    fn prune_observed_group_archives(&self, group_jid: &str, keep_log_segments: usize) -> Result<()> {
+    fn prune_observed_group_archives(
+        &self,
+        group_jid: &str,
+        keep_log_segments: usize,
+    ) -> Result<()> {
         let keep = keep_log_segments.max(1);
         let archive_dir = self.observed_group_archive_dir(group_jid);
         let entries = match std::fs::read_dir(&archive_dir) {
@@ -2037,10 +2167,9 @@ mod tests {
             )
             .unwrap();
 
-        let raw = std::fs::read_to_string(
-            service.observed_group_log_path("120363025123456789@g.us"),
-        )
-        .unwrap();
+        let raw =
+            std::fs::read_to_string(service.observed_group_log_path("120363025123456789@g.us"))
+                .unwrap();
         let line = raw.lines().next().unwrap();
         let entry: ObservedGroupMessage = serde_json::from_str(line).unwrap();
         assert_eq!(entry.role, "user");
@@ -2049,6 +2178,68 @@ mod tests {
         assert!(entry.mentions_agent);
         assert_eq!(entry.quoted_message_id.as_deref(), Some("wamid-parent"));
         assert_eq!(entry.content, "Hola equipo");
+    }
+
+    #[test]
+    fn append_observed_group_message_preserves_jsonl_boundary_after_unterminated_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        let group_jid = "120363025123456789@g.us";
+        let path = service.observed_group_log_path(group_jid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"seed\":true}").unwrap();
+
+        service
+            .append_observed_group_message(group_jid, "user", "+5491112345678", "Hola equipo")
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "{\"seed\":true}");
+        let entry: ObservedGroupMessage = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(entry.content, "Hola equipo");
+    }
+
+    #[test]
+    fn append_observed_group_message_serializes_concurrent_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().to_path_buf();
+        let group_jid = "120363025123456789@g.us";
+        let mut handles = Vec::new();
+
+        for index in 0..24 {
+            let service = WhatsAppObservationService::new(workspace.clone());
+            handles.push(std::thread::spawn(move || {
+                service
+                    .append_observed_group_message(
+                        group_jid,
+                        "user",
+                        "+5491112345678",
+                        &format!("mensaje {index}"),
+                    )
+                    .unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let service = WhatsAppObservationService::new(workspace);
+        let raw = std::fs::read_to_string(service.observed_group_log_path(group_jid)).unwrap();
+        let contents = raw
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<ObservedGroupMessage>(line)
+                    .unwrap()
+                    .content
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(contents.len(), 24);
+        for index in 0..24 {
+            assert!(contents.contains(&format!("mensaje {index}")));
+        }
     }
 
     #[test]
@@ -2090,10 +2281,9 @@ mod tests {
             .collect();
         assert_eq!(archived_files.len(), 1);
 
-        let active_raw = std::fs::read_to_string(
-            service.observed_group_log_path("120363025123456789@g.us"),
-        )
-        .unwrap();
+        let active_raw =
+            std::fs::read_to_string(service.observed_group_log_path("120363025123456789@g.us"))
+                .unwrap();
         assert_eq!(active_raw.lines().count(), 1);
 
         let updated = service
@@ -2186,11 +2376,14 @@ mod tests {
             content: "Hola".into(),
         };
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, format!("{}\n", serde_json::to_string(&first).unwrap())).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+        )
+        .unwrap();
 
         let (initial, offset) =
-            WhatsAppObservationService::read_observed_group_messages_from_offset(&path, 0)
-                .unwrap();
+            WhatsAppObservationService::read_observed_group_messages_from_offset(&path, 0).unwrap();
         assert_eq!(initial.len(), 1);
         assert!(offset > 0);
 
@@ -2204,7 +2397,10 @@ mod tests {
             quoted_message_id: None,
             content: "Hola Gonza".into(),
         };
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(file, "{}", serde_json::to_string(&second).unwrap()).unwrap();
 
         let (incremental, new_offset) =
@@ -2258,10 +2454,7 @@ mod tests {
 
         assert_eq!(observed.chat_kind, ConversationChatKind::Direct);
         assert_eq!(observed.mode, ConversationMode::ObjectiveDm);
-        assert_eq!(
-            observed.canonical_phone.as_deref(),
-            Some("+15551234567")
-        );
+        assert_eq!(observed.canonical_phone.as_deref(), Some("+15551234567"));
 
         let by_target = service
             .conversation_policy_for_target("+1 (555) 123-4567")
@@ -2274,7 +2467,10 @@ mod tests {
                 &["+15551234567".to_string()],
             )
             .unwrap();
-        assert_eq!(by_candidates.goal.as_deref(), Some("Cerrar el acuerdo de entrega y validar pendientes."));
+        assert_eq!(
+            by_candidates.goal.as_deref(),
+            Some("Cerrar el acuerdo de entrega y validar pendientes.")
+        );
     }
 
     #[test]
@@ -2331,6 +2527,8 @@ mod tests {
                         procedure_summary: None,
                         procedure_input_schema: None,
                         procedure_input_contract: None,
+                        procedure_output_contract: None,
+                        procedure_claim_contract: None,
                         procedure_sop: None,
                         canonical_phone: Some("+5491134115686".to_string()),
                         rotate_after_bytes: 1024,
@@ -2360,6 +2558,8 @@ mod tests {
                         procedure_summary: None,
                         procedure_input_schema: None,
                         procedure_input_contract: None,
+                        procedure_output_contract: None,
+                        procedure_claim_contract: None,
                         procedure_sop: None,
                         canonical_phone: Some("+5491134115686".to_string()),
                         rotate_after_bytes: 1024,
@@ -2553,10 +2753,7 @@ mod tests {
             .unwrap();
 
         let resolved = service
-            .resolve_visible_group(
-                Some("120363427394921125@g.us"),
-                Some("S86 - vacas3"),
-            )
+            .resolve_visible_group(Some("120363427394921125@g.us"), Some("S86 - vacas3"))
             .unwrap();
         assert_eq!(resolved.group_jid, "120363411859972027@g.us");
 
@@ -2669,9 +2866,7 @@ mod tests {
             )
             .unwrap();
 
-        let observed = service
-            .resolve_observed_group(None, Some("Naty"))
-            .unwrap();
+        let observed = service.resolve_observed_group(None, Some("Naty")).unwrap();
         assert_eq!(observed.canonical_phone.as_deref(), Some("+5491134115686"));
     }
 
@@ -2706,14 +2901,8 @@ mod tests {
         service
             .suppress_group_fallback("120363025123456789@g.us", "Los Pibes")
             .unwrap();
-        assert!(service.is_group_fallback_suppressed(
-            "120363025123456789@g.us",
-            Some("Los Pibes")
-        ));
-        assert!(service.is_group_fallback_suppressed(
-            "120363099999999999@g.us",
-            Some("Los Pibes")
-        ));
+        assert!(service.is_group_fallback_suppressed("120363025123456789@g.us", Some("Los Pibes")));
+        assert!(service.is_group_fallback_suppressed("120363099999999999@g.us", Some("Los Pibes")));
 
         service
             .register_observed_group_with_mode_and_skill(
@@ -2726,10 +2915,6 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!service.is_group_fallback_suppressed(
-            "120363025123456789@g.us",
-            Some("Los Pibes")
-        ));
+        assert!(!service.is_group_fallback_suppressed("120363025123456789@g.us", Some("Los Pibes")));
     }
-
 }

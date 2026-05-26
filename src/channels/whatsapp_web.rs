@@ -3034,7 +3034,21 @@ impl WhatsAppWebChannel {
         observed_group: &ObservedGroupConfig,
         _is_main_channel: bool,
         trigger: &ObservedGroupTrigger,
+        content_has_media_marker: bool,
     ) -> bool {
+        if Self::conversation_policy_requires_media_bundle(Some(observed_group)) {
+            return should_invoke_restricted_worker(
+                observed_group.chat_kind,
+                observed_group.mode,
+                observed_group.status,
+                RestrictedConversationTrigger {
+                    mentions_agent: trigger.mentions_agent,
+                    replied_to_agent: trigger.replied_to_agent,
+                },
+                content_has_media_marker,
+            );
+        }
+
         should_invoke_restricted_worker(
             observed_group.chat_kind,
             observed_group.mode,
@@ -3053,11 +3067,17 @@ impl WhatsAppWebChannel {
         is_main_channel: bool,
         conversation_policy: Option<&ObservedGroupConfig>,
         trigger: &ObservedGroupTrigger,
+        content_has_media_marker: bool,
     ) -> bool {
         if let Some(policy) =
             conversation_policy.filter(|policy| policy.chat_kind == ConversationChatKind::Group)
         {
-            return Self::should_invoke_observed_group_agent(policy, is_main_channel, trigger);
+            return Self::should_invoke_observed_group_agent(
+                policy,
+                is_main_channel,
+                trigger,
+                content_has_media_marker,
+            );
         }
 
         (group_is_managed || is_main_channel) && trigger.should_invoke()
@@ -3106,7 +3126,21 @@ impl WhatsAppWebChannel {
     fn should_invoke_observed_direct_agent(
         observed_direct: &ObservedGroupConfig,
         trigger: &ObservedGroupTrigger,
+        content_has_media_marker: bool,
     ) -> bool {
+        if Self::conversation_policy_requires_media_bundle(Some(observed_direct)) {
+            return should_invoke_restricted_worker(
+                observed_direct.chat_kind,
+                observed_direct.mode,
+                observed_direct.status,
+                RestrictedConversationTrigger {
+                    mentions_agent: trigger.mentions_agent,
+                    replied_to_agent: trigger.replied_to_agent,
+                },
+                content_has_media_marker,
+            );
+        }
+
         should_invoke_restricted_worker(
             observed_direct.chat_kind,
             observed_direct.mode,
@@ -3117,6 +3151,14 @@ impl WhatsAppWebChannel {
             },
             observed_direct.reply_to_all,
         )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn conversation_policy_requires_media_bundle(
+        conversation_policy: Option<&ObservedGroupConfig>,
+    ) -> bool {
+        Self::conversation_policy_requires_visual_analysis(conversation_policy)
+            || Self::conversation_policy_requires_attachment_bundle(conversation_policy)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3136,9 +3178,14 @@ impl WhatsAppWebChannel {
             return false;
         }
 
+        if let Some(input_contract) = policy.procedure_input_contract.as_deref() {
+            return crate::agent::loop_::bound_procedure_input_contract_requires_visual_analysis_input(
+                input_contract,
+            );
+        }
+
         [
             policy.procedure_input_schema.as_deref(),
-            policy.procedure_input_contract.as_deref(),
             policy.procedure_sop.as_deref(),
             policy.procedure_summary.as_deref(),
             policy.goal.as_deref(),
@@ -3171,9 +3218,14 @@ impl WhatsAppWebChannel {
             return false;
         }
 
+        if let Some(input_contract) = policy.procedure_input_contract.as_deref() {
+            return crate::agent::loop_::bound_procedure_input_contract_requires_attachment_input(
+                input_contract,
+            );
+        }
+
         [
             policy.procedure_input_schema.as_deref(),
-            policy.procedure_input_contract.as_deref(),
             policy.procedure_sop.as_deref(),
             policy.procedure_summary.as_deref(),
             policy.goal.as_deref(),
@@ -5701,6 +5753,7 @@ impl Channel for WhatsAppWebChannel {
                                         group_is_main_channel,
                                         conversation_policy.as_ref(),
                                         &observed_group_trigger,
+                                        content_has_media_marker,
                                     );
                                     if !should_invoke {
                                         if policy_requires_media_bundle
@@ -5813,6 +5866,7 @@ impl Channel for WhatsAppWebChannel {
                                             Self::should_invoke_observed_direct_agent(
                                                 policy,
                                                 &observed_group_trigger,
+                                                content_has_media_marker,
                                             )
                                         });
                                     if !should_invoke {
@@ -6518,6 +6572,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -6792,6 +6848,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -6867,6 +6925,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491159297734".to_string()),
             rotate_after_bytes: 1024,
@@ -6904,6 +6964,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -6944,6 +7006,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -6984,6 +7048,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -7243,6 +7309,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -7259,6 +7327,7 @@ mod tests {
             &observed_group,
             false,
             &empty_trigger,
+            false,
         ));
 
         let mention_trigger = ObservedGroupTrigger {
@@ -7270,6 +7339,7 @@ mod tests {
             &observed_group,
             false,
             &mention_trigger,
+            false,
         ));
 
         let passive_group = ObservedGroupConfig {
@@ -7280,6 +7350,7 @@ mod tests {
             &passive_group,
             false,
             &mention_trigger,
+            false,
         ));
 
         let paused_group = ObservedGroupConfig {
@@ -7290,6 +7361,7 @@ mod tests {
             &paused_group,
             false,
             &mention_trigger,
+            false,
         ));
     }
 
@@ -7312,6 +7384,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -7328,6 +7402,7 @@ mod tests {
             &observed_group,
             true,
             &ObservedGroupTrigger::default(),
+            false,
         ));
     }
 
@@ -7349,6 +7424,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -7370,10 +7447,12 @@ mod tests {
         assert!(!WhatsAppWebChannel::should_invoke_observed_direct_agent(
             &direct_policy,
             &empty_trigger,
+            false,
         ));
         assert!(WhatsAppWebChannel::should_invoke_observed_direct_agent(
             &direct_policy,
             &mention_trigger,
+            false,
         ));
     }
 
@@ -7396,6 +7475,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -7412,6 +7493,112 @@ mod tests {
             &policy,
             false,
             &no_mention,
+            false,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn bound_media_procedure_invokes_on_media_without_reply_to_all_or_wake_token() {
+        let policy = ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Los Pibes".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::MentionReply,
+            status: ConversationPolicyStatus::Active,
+            skill_name: Some("whatsapp_mention_reply".to_string()),
+            goal: None,
+            procedure_job_slug: Some("upload-attachments".to_string()),
+            procedure_summary: Some("Upload current-turn attachments.".to_string()),
+            procedure_input_schema: None,
+            procedure_input_contract: Some(
+                r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["attachments[]"],"on_invalid_input":"Send attachments."}"#
+                    .to_string(),
+            ),
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
+            procedure_sop: None,
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+            reply_to_all: false,
+            policy_tools: vec!["whatsapp_run_policy_procedure".to_string()],
+        };
+        let no_mention = ObservedGroupTrigger::default();
+
+        assert!(WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &policy,
+            false,
+            &no_mention,
+            true,
+        ));
+        assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &policy,
+            false,
+            &no_mention,
+            false,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn bound_media_procedure_does_not_use_reply_to_all_for_invalid_input_turns() {
+        let policy = ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Los Pibes".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::ManagedGroup,
+            status: ConversationPolicyStatus::Active,
+            skill_name: Some("whatsapp_managed_group".to_string()),
+            goal: None,
+            procedure_job_slug: Some("upload-attachments".to_string()),
+            procedure_summary: Some("Upload current-turn attachments.".to_string()),
+            procedure_input_schema: None,
+            procedure_input_contract: Some(
+                r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["attachments[]"],"on_invalid_input":"Send attachments."}"#
+                    .to_string(),
+            ),
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
+            procedure_sop: None,
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+            reply_to_all: true,
+            policy_tools: vec!["whatsapp_run_policy_procedure".to_string()],
+        };
+        let no_mention = ObservedGroupTrigger::default();
+        let mention_trigger = ObservedGroupTrigger {
+            mentions_agent: true,
+            replied_to_agent: false,
+            quoted_message_id: None,
+        };
+
+        assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &policy,
+            false,
+            &no_mention,
+            false,
+        ));
+        assert!(WhatsAppWebChannel::should_invoke_observed_group_agent(
+            &policy,
+            false,
+            &mention_trigger,
+            false,
         ));
     }
 
@@ -7569,6 +7756,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: Some("+5491170742021".to_string()),
             rotate_after_bytes: 1024,
@@ -7584,6 +7773,7 @@ mod tests {
         assert!(WhatsAppWebChannel::should_invoke_observed_direct_agent(
             &policy,
             &no_mention,
+            false,
         ));
     }
 
@@ -7606,6 +7796,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -7627,6 +7819,7 @@ mod tests {
             &observe_only,
             false,
             &no_mention,
+            false,
         ));
 
         let paused = ObservedGroupConfig {
@@ -7637,6 +7830,7 @@ mod tests {
             &paused,
             false,
             &no_mention,
+            false,
         ));
     }
 
@@ -7682,6 +7876,8 @@ mod tests {
             procedure_summary: None,
             procedure_input_schema: None,
             procedure_input_contract: None,
+            procedure_output_contract: None,
+            procedure_claim_contract: None,
             procedure_sop: None,
             canonical_phone: None,
             rotate_after_bytes: 1024,
@@ -7699,6 +7895,7 @@ mod tests {
             false,
             Some(&observed_group),
             &empty_trigger,
+            false,
         ));
 
         let managed_group_policy = ObservedGroupConfig {
@@ -7710,6 +7907,7 @@ mod tests {
             false,
             Some(&managed_group_policy),
             &empty_trigger,
+            false,
         ));
 
         let mention_trigger = ObservedGroupTrigger {
@@ -7722,6 +7920,7 @@ mod tests {
             false,
             Some(&managed_group_policy),
             &mention_trigger,
+            false,
         ));
 
         let observe_only_policy = ObservedGroupConfig {
@@ -7733,6 +7932,7 @@ mod tests {
             false,
             Some(&observe_only_policy),
             &empty_trigger,
+            false,
         ));
 
         assert!(!WhatsAppWebChannel::should_invoke_group_agent(
@@ -7740,6 +7940,7 @@ mod tests {
             false,
             None,
             &empty_trigger,
+            false,
         ));
 
         assert!(WhatsAppWebChannel::should_invoke_group_agent(
@@ -7747,6 +7948,7 @@ mod tests {
             false,
             None,
             &mention_trigger,
+            false,
         ));
     }
 

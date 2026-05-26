@@ -108,7 +108,10 @@ impl WhatsAppObjectiveDmTool {
             let normalized_phone = Self::normalize_phone_token(chat_jid)
                 .ok_or_else(|| anyhow::anyhow!("`chat_jid` must contain digits or a valid JID"))?;
             return Ok((
-                format!("{}@s.whatsapp.net", normalized_phone.trim_start_matches('+')),
+                format!(
+                    "{}@s.whatsapp.net",
+                    normalized_phone.trim_start_matches('+')
+                ),
                 Some(normalized_phone),
                 contact_name
                     .map(str::trim)
@@ -117,7 +120,10 @@ impl WhatsAppObjectiveDmTool {
             ));
         }
 
-        if let Some(contact_phone) = contact_phone.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(contact_phone) = contact_phone
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             let normalized_phone = Self::normalize_phone_token(contact_phone).ok_or_else(|| {
                 anyhow::anyhow!("`contact_phone` must contain a valid phone number")
             })?;
@@ -129,7 +135,10 @@ impl WhatsAppObjectiveDmTool {
                 ));
             }
             return Ok((
-                format!("{}@s.whatsapp.net", normalized_phone.trim_start_matches('+')),
+                format!(
+                    "{}@s.whatsapp.net",
+                    normalized_phone.trim_start_matches('+')
+                ),
                 Some(normalized_phone),
                 contact_name
                     .map(str::trim)
@@ -141,15 +150,11 @@ impl WhatsAppObjectiveDmTool {
         let contact_name = contact_name
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!(
-                "Provide `chat_jid`, `contact_phone`, or `contact_name`"
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Provide `chat_jid`, `contact_phone`, or `contact_name`")
+            })?;
         let chat = service.resolve_visible_direct_chat(None, Some(contact_name), None)?;
-        Ok((
-            chat.chat_jid,
-            chat.canonical_phone,
-            Some(chat.display_name),
-        ))
+        Ok((chat.chat_jid, chat.canonical_phone, Some(chat.display_name)))
     }
 }
 
@@ -252,7 +257,9 @@ impl Tool for WhatsAppObjectiveDmTool {
         let existing = service.conversation_policy_for_target(&chat_jid);
         let skill_name = match service.resolve_workspace_skill_name(
             args.get("skill_name").and_then(|value| value.as_str()),
-            existing.as_ref().and_then(|policy| policy.skill_name.as_deref()),
+            existing
+                .as_ref()
+                .and_then(|policy| policy.skill_name.as_deref()),
         ) {
             Ok(skill_name) => skill_name,
             Err(err) => {
@@ -342,8 +349,14 @@ mod tests {
         let observed = service
             .conversation_policy_for_target("5491159297734@s.whatsapp.net")
             .unwrap();
-        assert_eq!(observed.chat_kind, crate::channels::whatsapp_observation::ConversationChatKind::Direct);
-        assert_eq!(observed.mode, crate::channels::whatsapp_observation::ConversationMode::ObjectiveDm);
+        assert_eq!(
+            observed.chat_kind,
+            crate::channels::whatsapp_observation::ConversationChatKind::Direct
+        );
+        assert_eq!(
+            observed.mode,
+            crate::channels::whatsapp_observation::ConversationMode::ObjectiveDm
+        );
         assert_eq!(
             observed.goal.as_deref(),
             Some("Cerrar el acuerdo y validar pendientes.")
@@ -430,5 +443,4 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("control chat cannot be the same WhatsApp 1:1")));
     }
-
 }

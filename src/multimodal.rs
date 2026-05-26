@@ -1,4 +1,6 @@
-use crate::config::{build_runtime_proxy_client_with_timeouts, MultimodalConfig, ReliabilityConfig};
+use crate::config::{
+    build_runtime_proxy_client_with_timeouts, MultimodalConfig, ReliabilityConfig,
+};
 use crate::providers::{self, ChatMessage, ChatRequest};
 use crate::remote_budget::RemoteBudgetClient;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -102,13 +104,42 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImagePreprocessOptions {
+    pub force_latest_user_storage_only: bool,
+    pub force_all_user_storage_only: bool,
+}
+
 pub async fn preprocess_images_to_text_context(
     messages: &mut Vec<ChatMessage>,
     config: &MultimodalConfig,
     reliability: &ReliabilityConfig,
     workspace_dir: Option<&Path>,
 ) -> anyhow::Result<bool> {
-    if !config.processor.enabled || !contains_image_markers(messages) {
+    preprocess_images_to_text_context_with_options(
+        messages,
+        config,
+        reliability,
+        workspace_dir,
+        ImagePreprocessOptions::default(),
+    )
+    .await
+}
+
+pub async fn preprocess_images_to_text_context_with_options(
+    messages: &mut Vec<ChatMessage>,
+    config: &MultimodalConfig,
+    reliability: &ReliabilityConfig,
+    workspace_dir: Option<&Path>,
+    options: ImagePreprocessOptions,
+) -> anyhow::Result<bool> {
+    if !contains_image_markers(messages) {
+        return Ok(false);
+    }
+    if !config.processor.enabled
+        && !options.force_latest_user_storage_only
+        && !options.force_all_user_storage_only
+    {
         return Ok(false);
     }
 
@@ -117,8 +148,16 @@ pub async fn preprocess_images_to_text_context(
     let mut next_attachment_requires_visual_analysis = false;
     let mut policy_requires_visual_analysis = false;
     let mut last_skipped_image_refs: Vec<String> = Vec::new();
+    let forced_storage_only_user_index = options
+        .force_latest_user_storage_only
+        .then(|| {
+            messages.iter().rposition(|message| {
+                message.role == "user" && !parse_image_markers(&message.content).1.is_empty()
+            })
+        })
+        .flatten();
 
-    for message in messages.iter() {
+    for (message_index, message) in messages.iter().enumerate() {
         if message.role != "user" {
             next_messages.push(message.clone());
             continue;
@@ -166,11 +205,19 @@ pub async fn preprocess_images_to_text_context(
             continue;
         }
 
-        let visual_intent = should_analyze_image_attachments(
-            &cleaned_text,
-            next_attachment_requires_visual_analysis,
-            policy_requires_visual_analysis,
-        );
+        let force_storage_only = options.force_all_user_storage_only
+            || forced_storage_only_user_index == Some(message_index);
+        if !config.processor.enabled && !force_storage_only {
+            next_messages.push(message.clone());
+            continue;
+        }
+
+        let visual_intent = !force_storage_only
+            && should_analyze_image_attachments(
+                &cleaned_text,
+                next_attachment_requires_visual_analysis,
+                policy_requires_visual_analysis,
+            );
         next_attachment_requires_visual_analysis = false;
         if !visual_intent {
             last_skipped_image_refs = image_refs.clone();
@@ -202,12 +249,7 @@ pub async fn preprocess_images_to_text_context(
 
         next_messages.push(ChatMessage {
             role: message.role.clone(),
-            content: compose_visual_analysis_context(
-                request_text,
-                &image_refs,
-                &analysis,
-                config,
-            ),
+            content: compose_visual_analysis_context(request_text, &image_refs, &analysis, config),
         });
         changed = true;
     }
@@ -487,7 +529,9 @@ pub async fn analyze_image_refs_to_visual_analysis(
         if !check.allowed {
             anyhow::bail!(
                 "multimodal processor budget check denied: {}",
-                check.reason.unwrap_or_else(|| "budget exhausted".to_string())
+                check
+                    .reason
+                    .unwrap_or_else(|| "budget exhausted".to_string())
             );
         }
         check.quote_id
@@ -669,7 +713,9 @@ fn ensure_string_field(
             object.insert(key.to_string(), Value::String(String::new()));
         }
         Some(_) => {
-            warnings.push(format!("Processor returned non-string {key}; reset to empty string."));
+            warnings.push(format!(
+                "Processor returned non-string {key}; reset to empty string."
+            ));
             object.insert(key.to_string(), Value::String(String::new()));
         }
     }
@@ -678,7 +724,8 @@ fn ensure_string_field(
 fn ensure_structured_data(object: &mut Map<String, Value>, warnings: &mut Vec<String>) {
     if !object.get("structured_data").is_some_and(Value::is_object) {
         if object.contains_key("structured_data") {
-            warnings.push("Processor returned non-object structured_data; reset to defaults.".into());
+            warnings
+                .push("Processor returned non-object structured_data; reset to defaults.".into());
         }
         object.insert("structured_data".to_string(), default_structured_data());
         return;
@@ -733,7 +780,9 @@ fn ensure_string_array_field(
             object.insert(key.to_string(), json!([]));
         }
         Some(_) => {
-            warnings.push(format!("Processor returned non-array {key}; reset to empty array."));
+            warnings.push(format!(
+                "Processor returned non-array {key}; reset to empty array."
+            ));
             object.insert(key.to_string(), json!([]));
         }
     }
@@ -752,10 +801,13 @@ fn ensure_images_array(
             for (index, item) in items.iter_mut().enumerate() {
                 if !item.is_object() {
                     *item = default_image_entry(index + 1);
-                    warnings.push("Processor returned a non-object images[] item; reset it.".into());
+                    warnings
+                        .push("Processor returned a non-object images[] item; reset it.".into());
                     continue;
                 }
-                let image = item.as_object_mut().expect("image item was checked as object");
+                let image = item
+                    .as_object_mut()
+                    .expect("image item was checked as object");
                 if !image.get("index").is_some_and(Value::is_number) {
                     image.insert("index".to_string(), json!(index + 1));
                 }
@@ -815,7 +867,11 @@ fn append_uncertainties(object: &mut Map<String, Value>, warnings: Vec<String>) 
     }
 }
 
-fn fallback_visual_analysis(raw_analysis: &str, image_refs: &[String], request_text: &str) -> Value {
+fn fallback_visual_analysis(
+    raw_analysis: &str,
+    image_refs: &[String],
+    request_text: &str,
+) -> Value {
     let trimmed = raw_analysis.trim();
     let uncertainty = if trimmed.is_empty() {
         "The visual processor returned no analysis."
@@ -1407,6 +1463,89 @@ mod tests {
             .content
             .contains("/workspace/attachments/whatsapp/invoice.jpg"));
         assert!(!messages[0].content.contains("VisualAnalysisV1"));
+    }
+
+    #[tokio::test]
+    async fn preprocess_images_can_force_latest_user_storage_only_context() {
+        let mut messages = vec![
+            ChatMessage::user("cuando te mencionen analizá cada imagen que llegue".to_string()),
+            ChatMessage::user("[IMAGE:/workspace/attachments/whatsapp/current.png]".to_string()),
+        ];
+
+        let config = MultimodalConfig {
+            processor: MultimodalProcessorConfig {
+                enabled: true,
+                include_image_paths: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let changed = preprocess_images_to_text_context_with_options(
+            &mut messages,
+            &config,
+            &ReliabilityConfig::default(),
+            None,
+            ImagePreprocessOptions {
+                force_latest_user_storage_only: true,
+                force_all_user_storage_only: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(count_image_markers(&messages), 0);
+        assert!(messages[1].content.contains("[Image attachment]"));
+        assert!(messages[1]
+            .content
+            .contains("/workspace/attachments/whatsapp/current.png"));
+        assert!(!messages[1].content.contains("VisualAnalysisV1"));
+    }
+
+    #[tokio::test]
+    async fn preprocess_images_can_force_all_user_storage_only_context() {
+        let mut messages = vec![
+            ChatMessage::user(
+                "cuando te mencionen analizá cada imagen que llegue".to_string(),
+            ),
+            ChatMessage::user("[IMAGE:/workspace/attachments/old.png]".to_string()),
+            ChatMessage::assistant("done".to_string()),
+            ChatMessage::user(
+                "[DOCUMENT:/workspace/attachments/current.pdf]\n[IMAGE:/workspace/attachments/current.png]"
+                    .to_string(),
+            ),
+        ];
+
+        let config = MultimodalConfig {
+            processor: MultimodalProcessorConfig {
+                enabled: true,
+                include_image_paths: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let changed = preprocess_images_to_text_context_with_options(
+            &mut messages,
+            &config,
+            &ReliabilityConfig::default(),
+            None,
+            ImagePreprocessOptions {
+                force_latest_user_storage_only: false,
+                force_all_user_storage_only: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(count_image_markers(&messages), 0);
+        assert!(messages[1].content.contains("[Image attachment]"));
+        assert!(messages[3].content.contains("[Image attachment]"));
+        assert!(messages[3]
+            .content
+            .contains("/workspace/attachments/current.png"));
+        assert!(!messages[1].content.contains("VisualAnalysisV1"));
+        assert!(!messages[3].content.contains("VisualAnalysisV1"));
     }
 
     #[tokio::test]

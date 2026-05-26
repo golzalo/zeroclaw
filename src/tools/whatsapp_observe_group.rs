@@ -127,7 +127,9 @@ impl Tool for WhatsAppObserveGroupTool {
         let existing = service.observed_group_config(&group.group_jid);
         let skill_name = match service.resolve_workspace_skill_name(
             args.get("skill_name").and_then(|value| value.as_str()),
-            existing.as_ref().and_then(|policy| policy.skill_name.as_deref()),
+            existing
+                .as_ref()
+                .and_then(|policy| policy.skill_name.as_deref()),
         ) {
             Ok(skill_name) => skill_name,
             Err(err) => {

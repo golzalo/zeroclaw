@@ -1106,10 +1106,7 @@ async fn run_gateway_chat_with_tools(
     let config = state.config.lock().clone();
     let _ = runtime_context;
     Box::pin(crate::agent::process_message(
-        config,
-        message,
-        session_id,
-        None,
+        config, message, session_id, None,
     ))
     .await
 }

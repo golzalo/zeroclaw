@@ -516,10 +516,8 @@ struct ChannelRemoteBudgetContext {
 const WHATSAPP_MAIN_RUNTIME_CHANNEL: &str = "whatsapp:main";
 const WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL: &str = "whatsapp:third_party";
 const THIRD_PARTY_WHATSAPP_AGENT_NAME: &str = "whatsapp_third_party";
-const THIRD_PARTY_EMPTY_TOOL_ALLOWLIST_SENTINEL: &str =
-    "__whatsapp_third_party_no_tools__";
-const THIRD_PARTY_EMPTY_SKILL_ALLOWLIST_SENTINEL: &str =
-    "__whatsapp_third_party_no_skills__";
+const THIRD_PARTY_EMPTY_TOOL_ALLOWLIST_SENTINEL: &str = "__whatsapp_third_party_no_tools__";
+const THIRD_PARTY_EMPTY_SKILL_ALLOWLIST_SENTINEL: &str = "__whatsapp_third_party_no_skills__";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChannelExecutionLane {
@@ -1104,9 +1102,7 @@ fn build_channel_system_prompt(
                                 ));
                             }
                             if !skill.prompts.is_empty() {
-                                policy_context.push_str(
-                                    "\n\nConversation skill instructions:\n",
-                                );
+                                policy_context.push_str("\n\nConversation skill instructions:\n");
                                 for instruction in &skill.prompts {
                                     let trimmed = instruction.trim();
                                     if trimmed.is_empty() {
@@ -1169,7 +1165,7 @@ fn build_channel_system_prompt(
                         .filter(|value| !value.is_empty())
                     {
                         let mut procedure_context = format!(
-                            "\n\nConversation policy procedure: This {policy_channel} conversation has a bound on-demand tenant job `{procedure_job_slug}` scoped only to this {} chat. Before your final reply for a message that requires this policy's procedural check, call the channel-specific policy procedure tool. For WhatsApp today, call `whatsapp_run_policy_procedure` with exactly one structured `input` object shaped by the policy SOP; the runtime binds the current reply_target as `chat_jid`. Do not copy chat ids, do not put sender/message/visual_analysis as top-level arguments, do not invent or request another job name, do not use shell, and do not delegate. After the procedure returns, always send a final user-facing reply based on its result.",
+                            "\n\nConversation policy procedure: This {policy_channel} conversation has a bound on-demand tenant job `{procedure_job_slug}` scoped only to this {} chat. Before your final reply for a message that requires this policy's procedural check, call the channel-specific policy procedure tool exposed in this runtime with exactly one structured `input` object shaped by the policy SOP. In the current WhatsApp runtime, that tool is `whatsapp_run_policy_procedure` and the runtime binds the current reply_target as `chat_jid`. Do not copy chat ids, do not put sender/message/visual_analysis as top-level arguments, do not invent or request another job name, do not use shell, and do not delegate. After the procedure returns, always send a final user-facing reply based on its result.",
                             policy.chat_kind.as_str()
                         );
                         {
@@ -1190,9 +1186,8 @@ fn build_channel_system_prompt(
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                         {
-                            procedure_context.push_str(&format!(
-                                "\n\nProcedure summary:\n{summary}"
-                            ));
+                            procedure_context
+                                .push_str(&format!("\n\nProcedure summary:\n{summary}"));
                         }
                         if let Some(input_schema) = policy
                             .procedure_input_schema
@@ -1200,9 +1195,8 @@ fn build_channel_system_prompt(
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                         {
-                            procedure_context.push_str(&format!(
-                                "\n\nProcedure input schema:\n{input_schema}"
-                            ));
+                            procedure_context
+                                .push_str(&format!("\n\nProcedure input schema:\n{input_schema}"));
                         }
                         if let Some(input_contract) = policy
                             .procedure_input_contract
@@ -1211,10 +1205,36 @@ fn build_channel_system_prompt(
                             .filter(|value| !value.is_empty())
                         {
                             procedure_context.push_str(&format!(
-                                "\n\nProcedure input/output contract:\n{input_contract}"
+                                "\n\nProcedure input contract:\n{input_contract}"
                             ));
                             procedure_context.push_str(
                                 "\n\nBefore calling the procedure, validate the current turn against this contract. If required current-turn inputs are missing or invalid, do not call the procedure; reply with the contract's requested correction or missing-input message.",
+                            );
+                        }
+                        if let Some(output_contract) = policy
+                            .procedure_output_contract
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            procedure_context.push_str(&format!(
+                                "\n\nProcedure output contract:\n{output_contract}"
+                            ));
+                            procedure_context.push_str(
+                                "\n\nUse this contract to understand the shape and meaning of the procedure result. The separate procedure_claim_contract is still the executable authority for any success, partial, blocked, or failure claim.",
+                            );
+                        }
+                        if let Some(claim_contract) = policy
+                            .procedure_claim_contract
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            procedure_context.push_str(&format!(
+                                "\n\nProcedure claim contract:\n{claim_contract}"
+                            ));
+                            procedure_context.push_str(
+                                "\n\nAfter the procedure returns, validate any success, partial, blocked, or failure claim against this contract. Do not tell the user that an external side effect succeeded or failed unless the procedure result satisfies the matching claim condition.",
                             );
                         }
                         if let Some(sop) = policy
@@ -1266,6 +1286,85 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     }
 
     normalized
+}
+
+fn current_channel_user_turn_index(turns: &[ChatMessage], current_content: &str) -> Option<usize> {
+    let current_content = current_content.trim();
+    if current_content.is_empty() {
+        return None;
+    }
+
+    turns.iter().rposition(|turn| {
+        turn.role == "user"
+            && (turn.content.trim() == current_content || turn.content.contains(current_content))
+    })
+}
+
+async fn preprocess_current_turn_images_as_storage_only(
+    turns: &mut [ChatMessage],
+    current_turn_index: usize,
+    config: &crate::config::MultimodalConfig,
+    reliability: &crate::config::ReliabilityConfig,
+    workspace_dir: &std::path::Path,
+) -> anyhow::Result<bool> {
+    if turns
+        .get(current_turn_index)
+        .filter(|turn| turn.role == "user")
+        .is_none_or(|turn| {
+            crate::multimodal::parse_image_markers(&turn.content)
+                .1
+                .is_empty()
+        })
+    {
+        return Ok(false);
+    }
+
+    let mut current_turn = vec![turns[current_turn_index].clone()];
+    let changed = crate::multimodal::preprocess_images_to_text_context_with_options(
+        &mut current_turn,
+        config,
+        reliability,
+        Some(workspace_dir),
+        crate::multimodal::ImagePreprocessOptions {
+            force_latest_user_storage_only: true,
+            force_all_user_storage_only: false,
+        },
+    )
+    .await?;
+
+    if changed {
+        if let Some(processed) = current_turn.into_iter().next() {
+            turns[current_turn_index] = processed;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn strip_historical_image_markers_for_current_turn_policy(
+    turns: &mut Vec<ChatMessage>,
+    current_turn_index: usize,
+) -> bool {
+    let mut changed = false;
+    for (index, turn) in turns.iter_mut().enumerate() {
+        if index == current_turn_index || turn.role != "user" {
+            continue;
+        }
+
+        let (cleaned, refs) = crate::multimodal::parse_image_markers(&turn.content);
+        if refs.is_empty() {
+            continue;
+        }
+
+        turn.content = cleaned;
+        changed = true;
+    }
+
+    if changed {
+        turns.retain(|turn| turn.role != "user" || !turn.content.trim().is_empty());
+    }
+
+    changed
 }
 
 /// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
@@ -3484,9 +3583,8 @@ async fn build_whatsapp_third_party_runtime_context(
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
-    let message_timeout_secs = effective_channel_message_timeout_secs(
-        worker_config.channels_config.message_timeout_secs,
-    );
+    let message_timeout_secs =
+        effective_channel_message_timeout_secs(worker_config.channels_config.message_timeout_secs);
     let interrupt_on_new_message = worker_config
         .channels_config
         .telegram
@@ -3564,9 +3662,7 @@ async fn build_whatsapp_third_party_runtime_context(
             match session_store::SessionStore::new(&worker_config.workspace_dir) {
                 Ok(store) => Some(Arc::new(store)),
                 Err(error) => {
-                    tracing::warn!(
-                        "Restricted conversation session persistence disabled: {error}"
-                    );
+                    tracing::warn!("Restricted conversation session persistence disabled: {error}");
                     None
                 }
             }
@@ -3859,9 +3955,9 @@ async fn process_channel_message(
     };
     if whatsapp_conversation_policy.is_some() {
         let current_content = msg.content.trim();
-        let should_append_current_turn = prior_turns_raw.last().is_none_or(|turn| {
-            turn.role != "user" || turn.content.trim() != current_content
-        });
+        let should_append_current_turn = prior_turns_raw
+            .last()
+            .is_none_or(|turn| turn.role != "user" || turn.content.trim() != current_content);
         if should_append_current_turn {
             prior_turns_raw.push(ChatMessage::user(&msg.content));
         }
@@ -3874,6 +3970,50 @@ async fn process_channel_message(
         ctx.tools_registry.as_ref(),
         &skill_activations,
     );
+    let procedure_requires_attachment_storage_only = whatsapp_conversation_policy
+        .as_ref()
+        .and_then(|policy| policy.procedure_input_contract.as_deref())
+        .is_some_and(
+            crate::agent::loop_::bound_procedure_input_contract_requires_attachment_storage_only,
+        );
+    if procedure_requires_attachment_storage_only {
+        if let Some(current_turn_index) =
+            current_channel_user_turn_index(&prior_turns_raw, &msg.content)
+        {
+            match preprocess_current_turn_images_as_storage_only(
+                &mut prior_turns_raw,
+                current_turn_index,
+                &ctx.multimodal,
+                ctx.reliability.as_ref(),
+                ctx.workspace_dir.as_ref(),
+            )
+            .await
+            {
+                Ok(true) => tracing::info!(
+                    channel = %msg.channel,
+                    reply_target = %msg.reply_target,
+                    "Preprocessed current bound procedure image attachments into storage-only context"
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    channel = %msg.channel,
+                    reply_target = %msg.reply_target,
+                    "Failed to preprocess current bound procedure image attachments as storage-only: {err}"
+                ),
+            }
+
+            if strip_historical_image_markers_for_current_turn_policy(
+                &mut prior_turns_raw,
+                current_turn_index,
+            ) {
+                tracing::debug!(
+                channel = %msg.channel,
+                reply_target = %msg.reply_target,
+                    "Stripped historical image markers before current-turn bound procedure execution"
+                );
+            }
+        }
+    }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
     let i18n_locale = ctx
         .prompt_config
@@ -6382,14 +6522,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    if config.channels_config.whatsapp.is_some() && !config.memory.backend.eq_ignore_ascii_case("none")
+    if config.channels_config.whatsapp.is_some()
+        && !config.memory.backend.eq_ignore_ascii_case("none")
     {
         let journal_memory = Arc::clone(&mem);
         let journal_workspace = config.workspace_dir.clone();
         tokio::spawn(async move {
             let service = WhatsAppObservationService::new(journal_workspace);
-            let interval =
-                tokio::time::Duration::from_secs(WHATSAPP_JOURNAL_INDEX_INTERVAL_SECS);
+            let interval = tokio::time::Duration::from_secs(WHATSAPP_JOURNAL_INDEX_INTERVAL_SECS);
             loop {
                 match service
                     .index_all_conversation_journals_to_memory(journal_memory.as_ref())
@@ -6550,7 +6690,13 @@ mod tests {
                     .to_string(),
             ),
             procedure_input_contract: Some(
-                "Accept attachments[] with path/localPath/contentBase64; no image analysis."
+                r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["attachments[]"],"on_invalid_input":"Send one or more attachments in the current turn."}"#.to_string(),
+            ),
+            procedure_output_contract: Some(
+                r#"{"schema_version":"procedure_output_contract.v1","result_fields":["ok","status","uploadedCount","failedCount"],"outcomes":{"success":"All attachments uploaded.","failure":"No confirmed upload."}}"#.to_string(),
+            ),
+            procedure_claim_contract: Some(
+                r#"{"schema_version":"procedure_claim_contract.v1","outcomes":{"success":{"all":[{"path":"ok","equals":true},{"path":"status","in":["ok","success"]},{"path":"failedCount","equals":0},{"path":"uploadedCount","gte":1}]},"failure":{"any":[{"path":"ok","equals":false},{"path":"status","in":["error","failed","blocked"]}]}}}"#
                     .to_string(),
             ),
             procedure_sop: Some("Pass every bundled attachment reference.".to_string()),
@@ -6668,6 +6814,74 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    #[test]
+    fn current_turn_policy_strips_historical_images_before_normalization() {
+        let current = "[DOCUMENT:/workspace/attachments/whatsapp/current.txt]";
+        let mut turns = vec![
+            ChatMessage::user("[IMAGE:/workspace/attachments/whatsapp/old.jpg]"),
+            ChatMessage::assistant("previous failure"),
+            ChatMessage::user("Es solo en el vision ehh"),
+            ChatMessage::user(current),
+        ];
+
+        let current_index = current_channel_user_turn_index(&turns, current).unwrap();
+        assert!(strip_historical_image_markers_for_current_turn_policy(
+            &mut turns,
+            current_index
+        ));
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert!(!crate::multimodal::contains_image_markers(&normalized));
+        assert!(normalized
+            .last()
+            .is_some_and(|turn| turn.content.contains(current)));
+        assert!(normalized
+            .iter()
+            .any(|turn| turn.content.contains("vision")));
+        assert!(!normalized
+            .iter()
+            .any(|turn| turn.content.contains("old.jpg")));
+    }
+
+    #[tokio::test]
+    async fn current_turn_policy_preprocesses_only_current_image_storage() {
+        let current = "[IMAGE:/workspace/attachments/whatsapp/current.png]";
+        let mut turns = vec![
+            ChatMessage::user("[IMAGE:/workspace/attachments/whatsapp/old.png]"),
+            ChatMessage::assistant("previous failure"),
+            ChatMessage::user(current),
+        ];
+        let current_index = current_channel_user_turn_index(&turns, current).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::MultimodalConfig::default();
+        config.processor.enabled = true;
+        config.processor.include_image_paths = true;
+
+        let changed = preprocess_current_turn_images_as_storage_only(
+            &mut turns,
+            current_index,
+            &config,
+            &crate::config::ReliabilityConfig::default(),
+            workspace.path(),
+        )
+        .await
+        .unwrap();
+        assert!(changed);
+        assert!(strip_historical_image_markers_for_current_turn_policy(
+            &mut turns,
+            current_index
+        ));
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert!(!crate::multimodal::contains_image_markers(&normalized));
+        let latest = normalized.last().unwrap();
+        assert!(latest.content.contains("[Image attachment]"));
+        assert!(latest.content.contains("current.png"));
+        assert!(!normalized
+            .iter()
+            .any(|turn| turn.content.contains("old.png")));
     }
 
     /// Verify that an orphan user turn followed by a failure-marker assistant
@@ -9559,7 +9773,7 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
         );
 
-        assert!(prompt.contains("objective-driven direct conversation"));
+        assert!(prompt.contains("objective-driven whatsapp direct conversation"));
         assert!(prompt.contains("Cerrar el acuerdo y validar el trabajo realizado."));
         assert!(prompt.contains("120363408016257691@g.us"));
         assert!(prompt.contains("workspace skill `whatsapp_objective_dm`"));
@@ -9585,12 +9799,19 @@ BTC is currently around $65,000 based on latest tool output."#
                         "{\"type\":\"object\",\"additionalProperties\":true}".to_string(),
                     ),
                     procedure_input_contract: Some(
-                        "Only call the procedure when the current turn contains valid spend data; otherwise ask for the missing spend details.".to_string(),
+                        r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["text"],"on_invalid_input":"Send the spend details in this message."}"#.to_string(),
+                    ),
+                    procedure_output_contract: Some(
+                        r#"{"schema_version":"procedure_output_contract.v1","result_fields":["ok","status","validation"],"outcomes":{"success":"Spend data validated.","blocked":"Spend data missing or invalid."}}"#.to_string(),
+                    ),
+                    procedure_claim_contract: Some(
+                        r#"{"schema_version":"procedure_claim_contract.v1","outcomes":{"success":{"all":[{"path":"ok","equals":true},{"path":"status","in":["ok","success"]}]},"blocked":{"any":[{"path":"status","equals":"blocked"},{"path":"ok","equals":false}]}}}"#.to_string(),
                     ),
                     procedure_sop: Some(
                         "Extract only valid spend data and call the bound procedure.".to_string(),
                     ),
                     clear_procedure: false,
+                    policy_tools: Vec::new(),
                 }),
                 false,
             )
@@ -9609,8 +9830,15 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("bound on-demand tenant job `spend-guard`"));
         assert!(prompt.contains("whatsapp_run_policy_procedure"));
         assert!(prompt.contains("Procedure input schema:"));
-        assert!(prompt.contains("Procedure input/output contract:"));
+        assert!(prompt.contains("Procedure input contract:"));
         assert!(prompt.contains("validate the current turn against this contract"));
+        assert!(prompt.contains("Procedure output contract:"));
+        assert!(
+            prompt.contains("separate procedure_claim_contract is still the executable authority")
+        );
+        assert!(prompt.contains("Procedure claim contract:"));
+        assert!(prompt.contains("procedure_claim_contract.v1"));
+        assert!(prompt.contains("validate any success, partial, blocked, or failure claim"));
         assert!(prompt.contains("Procedure SOP:"));
         assert!(!prompt.contains("Conversation skill instructions:"));
     }
@@ -9634,12 +9862,19 @@ BTC is currently around $65,000 based on latest tool output."#
                         "{\"type\":\"object\",\"additionalProperties\":true}".to_string(),
                     ),
                     procedure_input_contract: Some(
-                        "Only call the procedure when the current turn contains valid spend data; otherwise ask for the missing spend details.".to_string(),
+                        r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["text"],"on_invalid_input":"Send the spend details in this message."}"#.to_string(),
+                    ),
+                    procedure_output_contract: Some(
+                        r#"{"schema_version":"procedure_output_contract.v1","result_fields":["ok","status","validation"],"outcomes":{"success":"Spend data validated.","blocked":"Spend data missing or invalid."}}"#.to_string(),
+                    ),
+                    procedure_claim_contract: Some(
+                        r#"{"schema_version":"procedure_claim_contract.v1","outcomes":{"success":{"all":[{"path":"ok","equals":true},{"path":"status","in":["ok","success"]}]},"blocked":{"any":[{"path":"status","equals":"blocked"},{"path":"ok","equals":false}]}}}"#.to_string(),
                     ),
                     procedure_sop: Some(
                         "Extract valid data and call the bound procedure.".to_string(),
                     ),
                     clear_procedure: false,
+                    policy_tools: Vec::new(),
                 }),
                 false,
             )
@@ -9651,11 +9886,13 @@ BTC is currently around $65,000 based on latest tool output."#
                 "120363408016257691@g.us",
                 Some(crate::channels::whatsapp_observation::ConversationMode::MentionReply),
                 Some("whatsapp_mention_reply"),
-                Some(&crate::channels::whatsapp_observation::ConversationProcedureMetadata {
-                    goal: Some("Share lightweight jokes when summoned".to_string()),
-                    clear_procedure: true,
-                    ..Default::default()
-                }),
+                Some(
+                    &crate::channels::whatsapp_observation::ConversationProcedureMetadata {
+                        goal: Some("Share lightweight jokes when summoned".to_string()),
+                        clear_procedure: true,
+                        ..Default::default()
+                    },
+                ),
                 false,
             )
             .unwrap();

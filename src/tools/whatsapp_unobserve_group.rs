@@ -82,15 +82,21 @@ impl Tool for WhatsAppUnobserveGroupTool {
 
         match service.unregister_conversation_policy(&observed) {
             Ok(removed) if !removed.is_empty() => {
-                if observed.chat_kind == crate::channels::whatsapp_observation::ConversationChatKind::Group {
-                    let _ = service.suppress_group_fallback(&observed.group_jid, &observed.group_name);
+                if observed.chat_kind
+                    == crate::channels::whatsapp_observation::ConversationChatKind::Group
+                {
+                    let _ =
+                        service.suppress_group_fallback(&observed.group_jid, &observed.group_name);
                 }
 
                 let alias_note = if observed.chat_kind
                     == crate::channels::whatsapp_observation::ConversationChatKind::Direct
                     && removed.len() > 1
                 {
-                    format!(" Removed {} alias policies for the same direct chat.", removed.len() - 1)
+                    format!(
+                        " Removed {} alias policies for the same direct chat.",
+                        removed.len() - 1
+                    )
                 } else {
                     String::new()
                 };
@@ -209,9 +215,6 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(service.is_group_fallback_suppressed(
-            "120363025123456789@g.us",
-            Some("Los Pibes")
-        ));
+        assert!(service.is_group_fallback_suppressed("120363025123456789@g.us", Some("Los Pibes")));
     }
 }

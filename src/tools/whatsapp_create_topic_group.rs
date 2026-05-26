@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+#[cfg(feature = "whatsapp-web")]
 use crate::channels::WhatsAppWebChannel;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;

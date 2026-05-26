@@ -570,6 +570,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         agents.insert(
@@ -588,6 +589,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
         agents

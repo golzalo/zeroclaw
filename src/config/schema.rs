@@ -9631,6 +9631,7 @@ tool_dispatcher = "xml"
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             },
         );
 

@@ -2409,10 +2409,8 @@ impl Channel for SlackChannel {
                         channel_id,
                         cursor_ts
                     );
-                    let bootstrap_params = vec![
-                        ("channel", channel_id.clone()),
-                        ("limit", "10".to_string()),
-                    ];
+                    let bootstrap_params =
+                        vec![("channel", channel_id.clone()), ("limit", "10".to_string())];
                     if let Some(data) = self
                         .fetch_history_with_retry(&channel_id, &bootstrap_params)
                         .await
