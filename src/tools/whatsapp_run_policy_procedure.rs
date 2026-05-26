@@ -377,7 +377,6 @@ mod tests {
                     chat_kind: ConversationChatKind::Group,
                     mode,
                     status: ConversationPolicyStatus::Active,
-                    objective: None,
                     skill_name: Some("whatsapp_mention_reply".to_string()),
                     goal: Some("Process messages".to_string()),
                     procedure_job_slug: procedure_job_slug.map(str::to_string),
@@ -393,6 +392,7 @@ mod tests {
                     initial_outreach_sent_at: None,
                     initial_outreach_preview: None,
                     reply_to_all: false,
+                    policy_tools: Vec::new(),
                 },
             )]))
             .unwrap();

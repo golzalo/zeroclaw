@@ -7634,6 +7634,7 @@ pub async fn run(
         native_tools,
         config.skills.prompt_injection_mode,
         &config.agent.context_files,
+        false,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -8319,6 +8320,7 @@ async fn run_single_turn_with_report(
         native_tools,
         config.skills.prompt_injection_mode,
         &config.agent.context_files,
+        false,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&active_tool_specs));
@@ -8742,6 +8744,7 @@ pub async fn process_message(
         native_tools,
         config.skills.prompt_injection_mode,
         &config.agent.context_files,
+        false,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&active_tool_specs));

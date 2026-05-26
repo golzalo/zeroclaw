@@ -519,6 +519,11 @@ pub struct DelegateAgentConfig {
     /// at spawn time (e.g. "MEMORY.md"). Eliminates bootstrap file_read calls.
     #[serde(default)]
     pub context_files: Vec<String>,
+    /// When true, skip the global OpenClaw bootstrap files (AGENTS.md, SOUL.md,
+    /// TOOLS.md, IDENTITY.md, USER.md, MEMORY.md) and inject only `context_files`.
+    /// Use for restricted workers that do not need workspace identity context.
+    #[serde(default)]
+    pub skip_bootstrap: bool,
 }
 
 fn default_delegate_timeout_secs() -> u64 {

@@ -709,6 +709,7 @@ impl ModelRoutingConfigTool {
                 agentic_timeout_secs: None,
                 skills: Vec::new(),
                 context_files: Vec::new(),
+                skip_bootstrap: false,
             });
 
         next_agent.provider = provider;

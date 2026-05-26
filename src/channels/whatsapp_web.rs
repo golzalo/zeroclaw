@@ -29,10 +29,8 @@
 //! This channel is automatically selected when `session_path` is set in the config.
 //! The Cloud API channel is used when `phone_number_id` is set.
 
+use super::conversation_policy::{should_invoke_restricted_worker, RestrictedConversationTrigger};
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use super::conversation_policy::{
-    should_invoke_restricted_worker, RestrictedConversationTrigger,
-};
 use super::whatsapp_observation::{
     ConversationChatKind, ConversationMode, ConversationPolicyStatus, ObservedGroupConfig,
     ObservedGroupMessageMetadata, VisibleGroupRecord, WhatsAppObservationService,
@@ -48,10 +46,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 #[cfg(feature = "whatsapp-web")]
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "whatsapp-web")]
 use std::time::{Duration, Instant};
-use std::sync::{Arc, OnceLock};
 use tokio::{fs, select};
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_binary::builder::NodeBuilder;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_binary::jid::GROUP_SERVER;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_binary::node::{Node, NodeContent};
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_core::download::MediaType;
 #[cfg(feature = "whatsapp-web")]
@@ -62,12 +66,6 @@ use wa_rs_core::iq::spec::IqSpec;
 use wa_rs_core::proto_helpers::MessageExt;
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_core::request::InfoQuery;
-#[cfg(feature = "whatsapp-web")]
-use wa_rs_binary::builder::NodeBuilder;
-#[cfg(feature = "whatsapp-web")]
-use wa_rs_binary::jid::GROUP_SERVER;
-#[cfg(feature = "whatsapp-web")]
-use wa_rs_binary::node::{Node, NodeContent};
 
 #[cfg(feature = "whatsapp-web")]
 const WHATSAPP_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
@@ -218,14 +216,12 @@ impl IqSpec for GroupParticipatingExtendedIq {
         InfoQuery::get(
             GROUP_IQ_NAMESPACE,
             wa_rs_binary::jid::Jid::new("", GROUP_SERVER),
-            Some(NodeContent::Nodes(vec![
-                NodeBuilder::new("participating")
-                    .children([
-                        NodeBuilder::new("participants").build(),
-                        NodeBuilder::new("description").build(),
-                    ])
-                    .build(),
-            ])),
+            Some(NodeContent::Nodes(vec![NodeBuilder::new("participating")
+                .children([
+                    NodeBuilder::new("participants").build(),
+                    NodeBuilder::new("description").build(),
+                ])
+                .build()])),
         )
     }
 
@@ -285,15 +281,17 @@ impl IqSpec for GroupParticipatingExtendedIq {
                     }
                     "participants" => {
                         for participant in child.get_children_by_tag("participant") {
-                            if let Some(participant_jid) = participant.attrs.get("jid").map(|value| {
-                                let raw = value.to_string_value();
-                                if raw.contains('@') {
-                                    raw
-                                } else {
-                                    wa_rs_binary::jid::Jid::new(&raw, "s.whatsapp.net")
-                                        .to_string()
-                                }
-                            }) {
+                            if let Some(participant_jid) =
+                                participant.attrs.get("jid").map(|value| {
+                                    let raw = value.to_string_value();
+                                    if raw.contains('@') {
+                                        raw
+                                    } else {
+                                        wa_rs_binary::jid::Jid::new(&raw, "s.whatsapp.net")
+                                            .to_string()
+                                    }
+                                })
+                            {
                                 participant_jids.push(participant_jid);
                             }
                         }
@@ -599,8 +597,10 @@ impl WhatsAppWebChannel {
             official_group_verify_backoff_until: Arc::new(Mutex::new(None)),
             pending_media_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
-        let restored =
-            Self::rehydrate_managed_groups(Some(&channel.official_group_jid), &channel.managed_groups);
+        let restored = Self::rehydrate_managed_groups(
+            Some(&channel.official_group_jid),
+            &channel.managed_groups,
+        );
         if restored > 0 {
             tracing::info!(
                 restored_groups = restored,
@@ -711,7 +711,12 @@ impl WhatsAppWebChannel {
             .unwrap_or(trimmed)
             .split_once(':')
             .map(|(user, _)| user)
-            .unwrap_or_else(|| trimmed.split_once('@').map(|(user, _)| user).unwrap_or(trimmed))
+            .unwrap_or_else(|| {
+                trimmed
+                    .split_once('@')
+                    .map(|(user, _)| user)
+                    .unwrap_or(trimmed)
+            })
             .trim();
         push_token(user_part.to_string());
 
@@ -784,7 +789,10 @@ impl WhatsAppWebChannel {
         let Some(self_number) = self_phone else {
             return Vec::new();
         };
-        if !sender_candidates.iter().any(|candidate| candidate == self_number) {
+        if !sender_candidates
+            .iter()
+            .any(|candidate| candidate == self_number)
+        {
             return Vec::new();
         }
 
@@ -981,7 +989,10 @@ impl WhatsAppWebChannel {
                         ConversationMode::ObserveOnly | ConversationMode::ObjectiveDm
                     )
                     && policy.status == ConversationPolicyStatus::Active
-                    && matches!(rejection_reason, "direct_disabled" | "sender_not_in_allowlist")
+                    && matches!(
+                        rejection_reason,
+                        "direct_disabled" | "sender_not_in_allowlist"
+                    )
             }),
             WhatsAppChatKind::SelfChat => false,
         }
@@ -1144,8 +1155,7 @@ impl WhatsAppWebChannel {
 
         let record = Self::managed_group_record_by_jid(group_jid)?;
         if let Some(official_group_jid) = official_group_jid {
-            if record.key == Self::managed_group_key_for_subject(WHATSAPP_BOOTSTRAP_GROUP_SUBJECT)
-            {
+            if record.key == Self::managed_group_key_for_subject(WHATSAPP_BOOTSTRAP_GROUP_SUBJECT) {
                 *official_group_jid.lock() = Some(record.group_jid.clone());
             }
         }
@@ -1176,9 +1186,7 @@ impl WhatsAppWebChannel {
         }
 
         match *self.official_group_last_verified_at.lock() {
-            Some(instant) => {
-                now.duration_since(instant) >= WHATSAPP_OFFICIAL_GROUP_VERIFY_INTERVAL
-            }
+            Some(instant) => now.duration_since(instant) >= WHATSAPP_OFFICIAL_GROUP_VERIFY_INTERVAL,
             None => true,
         }
     }
@@ -1308,7 +1316,9 @@ impl WhatsAppWebChannel {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
-            .ok_or_else(|| anyhow!("WhatsApp Web control bridge is not initialized in this runtime"))
+            .ok_or_else(|| {
+                anyhow!("WhatsApp Web control bridge is not initialized in this runtime")
+            })
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1423,8 +1433,12 @@ impl WhatsAppWebChannel {
         let serialized = serde_json::to_string_pretty(groups)
             .map_err(|e| anyhow!("Failed to serialize managed groups config: {e}"))?;
         let path = Self::managed_groups_index_path();
-        std::fs::write(&path, serialized)
-            .map_err(|e| anyhow!("Failed to write managed groups index {}: {e}", path.display()))
+        std::fs::write(&path, serialized).map_err(|e| {
+            anyhow!(
+                "Failed to write managed groups index {}: {e}",
+                path.display()
+            )
+        })
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1463,12 +1477,7 @@ impl WhatsAppWebChannel {
         else {
             return Ok(None);
         };
-        Self::activate_managed_group(
-            group_name,
-            &group_jid,
-            official_group_jid,
-            managed_groups,
-        )?;
+        Self::activate_managed_group(group_name, &group_jid, official_group_jid, managed_groups)?;
         let jid = group_jid
             .parse()
             .map_err(|e| anyhow!("Invalid recovered WhatsApp JID `{group_jid}`: {e}"))?;
@@ -1515,7 +1524,8 @@ impl WhatsAppWebChannel {
         visible_groups
             .iter()
             .find(|group| {
-                group.linked_parent_jid.as_deref() == Some(community_jid) && group.subject == subject
+                group.linked_parent_jid.as_deref() == Some(community_jid)
+                    && group.subject == subject
             })
             .map(|group| group.jid.clone())
     }
@@ -1569,7 +1579,9 @@ impl WhatsAppWebChannel {
             client
                 .execute(CommunityCreateIq::new(&community_name))
                 .await
-                .map_err(|e| anyhow!("Failed to create WhatsApp community `{community_name}`: {e}"))?
+                .map_err(|e| {
+                    anyhow!("Failed to create WhatsApp community `{community_name}`: {e}")
+                })?
                 .to_string()
         };
 
@@ -1640,7 +1652,11 @@ impl WhatsAppWebChannel {
             })
             .cloned()
             .collect::<Vec<_>>();
-        groups.sort_by(|left, right| left.subject.cmp(&right.subject).then(left.jid.cmp(&right.jid)));
+        groups.sort_by(|left, right| {
+            left.subject
+                .cmp(&right.subject)
+                .then(left.jid.cmp(&right.jid))
+        });
         groups.dedup_by(|left, right| left.jid == right.jid);
         groups
     }
@@ -1651,14 +1667,11 @@ impl WhatsAppWebChannel {
         community_jid: &str,
         managed_groups: &Arc<Mutex<std::collections::HashMap<String, String>>>,
     ) -> Vec<String> {
-        let mut outside = Self::managed_groups_outside_community(
-            visible_groups,
-            community_jid,
-            managed_groups,
-        )
-        .into_iter()
-        .map(|group| group.subject)
-        .collect::<Vec<_>>();
+        let mut outside =
+            Self::managed_groups_outside_community(visible_groups, community_jid, managed_groups)
+                .into_iter()
+                .map(|group| group.subject)
+                .collect::<Vec<_>>();
         outside.sort();
         outside.dedup();
         outside
@@ -1753,17 +1766,14 @@ impl WhatsAppWebChannel {
                     .iter()
                     .find(|group| {
                         group.jid == record.group_jid
-                            && group.linked_parent_jid.as_deref() == Some(community_jid_str.as_str())
+                            && group.linked_parent_jid.as_deref()
+                                == Some(community_jid_str.as_str())
                             && group.subject == group_name
                     })
                     .map(|group| group.jid.clone())
             })
             .or_else(|| {
-                Self::find_visible_linked_group_jid(
-                    &visible_groups,
-                    &community_jid_str,
-                    group_name,
-                )
+                Self::find_visible_linked_group_jid(&visible_groups, &community_jid_str, group_name)
             });
 
         let (group_jid, created) = if let Some(group_jid) = maybe_existing_jid {
@@ -1966,7 +1976,11 @@ impl WhatsAppWebChannel {
             .execute(GroupParticipatingExtendedIq::new())
             .await
             .map_err(|e| anyhow!("Failed to fetch WhatsApp participating groups: {e}"))?;
-        groups.sort_by(|left, right| left.subject.cmp(&right.subject).then(left.jid.cmp(&right.jid)));
+        groups.sort_by(|left, right| {
+            left.subject
+                .cmp(&right.subject)
+                .then(left.jid.cmp(&right.jid))
+        });
         let cached_at = chrono::Utc::now().to_rfc3339();
         let cache_records: Vec<VisibleGroupRecord> = groups
             .iter()
@@ -2063,12 +2077,9 @@ impl WhatsAppWebChannel {
             anyhow::bail!("WhatsApp support provisioning requires a configured support phone");
         };
 
-        format!(
-            "{}@s.whatsapp.net",
-            support_phone.trim_start_matches('+')
-        )
-        .parse()
-        .map_err(|e| anyhow!("Invalid support WhatsApp JID for `{support_phone}`: {e}"))
+        format!("{}@s.whatsapp.net", support_phone.trim_start_matches('+'))
+            .parse()
+            .map_err(|e| anyhow!("Invalid support WhatsApp JID for `{support_phone}`: {e}"))
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2300,10 +2311,8 @@ impl WhatsAppWebChannel {
             }
         }
 
-        let restored = Self::rehydrate_managed_groups(
-            Some(&self.official_group_jid),
-            &self.managed_groups,
-        );
+        let restored =
+            Self::rehydrate_managed_groups(Some(&self.official_group_jid), &self.managed_groups);
         if restored > 0 {
             if let Some(current) = self.official_group_jid.lock().clone() {
                 if let Ok(jid) = current.parse::<wa_rs_binary::jid::Jid>() {
@@ -2394,12 +2403,7 @@ impl WhatsAppWebChannel {
             anyhow::bail!("Configured self phone `{self_phone}` does not contain digits");
         }
         let to = wa_rs_binary::jid::Jid::pn(digits);
-        Self::send_agent_text_message(
-            client,
-            &to,
-            &Self::greeting_with_runtime_name("Hola"),
-        )
-        .await
+        Self::send_agent_text_message(client, &to, &Self::greeting_with_runtime_name("Hola")).await
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2409,19 +2413,17 @@ impl WhatsAppWebChannel {
         managed_groups: Arc<Mutex<std::collections::HashMap<String, String>>>,
     ) -> Result<WhatsAppTopicGroupToolResult> {
         let group_name = Self::topic_group_name(subject);
-        let (group_jid, created_now) = Self::ensure_managed_group(
-            client.clone(),
-            &group_name,
-            None,
-            managed_groups,
-        )
-        .await?;
+        let (group_jid, created_now) =
+            Self::ensure_managed_group(client.clone(), &group_name, None, managed_groups).await?;
 
         let greeting_text = format!(
             "{}, {} el topico {group_name}. Seguimos por aca.",
-            Self::greeting_with_runtime_name("Hola")
-            ,
-            if created_now { "ya cree" } else { "ya encontre" }
+            Self::greeting_with_runtime_name("Hola"),
+            if created_now {
+                "ya cree"
+            } else {
+                "ya encontre"
+            }
         );
         let greeting = wa_rs_proto::whatsapp::Message {
             conversation: Some(Self::apply_agent_message_prefix(&greeting_text)),
@@ -2513,11 +2515,11 @@ impl WhatsAppWebChannel {
     ) -> Result<WhatsAppCommunityModeToolResult> {
         let context = Self::load_control_context()?;
         let client = Self::active_control_client()?;
-        let requested_name =
-            Self::sanitize_community_subject(community_name.unwrap_or(WHATSAPP_BOOTSTRAP_COMMUNITY_SUBJECT));
+        let requested_name = Self::sanitize_community_subject(
+            community_name.unwrap_or(WHATSAPP_BOOTSTRAP_COMMUNITY_SUBJECT),
+        );
         let community_jid =
-            Self::ensure_bootstrap_community_with_subject(client.clone(), &requested_name)
-                .await?;
+            Self::ensure_bootstrap_community_with_subject(client.clone(), &requested_name).await?;
         Self::persist_community_settings(true, &requested_name)?;
         let community_jid_str = community_jid.to_string();
         let visible_groups = Self::fetch_all_visible_groups_extended(&client).await?;
@@ -3052,13 +3054,52 @@ impl WhatsAppWebChannel {
         conversation_policy: Option<&ObservedGroupConfig>,
         trigger: &ObservedGroupTrigger,
     ) -> bool {
-        if let Some(policy) = conversation_policy
-            .filter(|policy| policy.chat_kind == ConversationChatKind::Group)
+        if let Some(policy) =
+            conversation_policy.filter(|policy| policy.chat_kind == ConversationChatKind::Group)
         {
             return Self::should_invoke_observed_group_agent(policy, is_main_channel, trigger);
         }
 
         (group_is_managed || is_main_channel) && trigger.should_invoke()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_runtime_route(
+        chat_kind: WhatsAppChatKind,
+        sender_is_owner: bool,
+        conversation_policy: Option<&ObservedGroupConfig>,
+        group_is_managed: bool,
+        group_is_main_channel: bool,
+    ) -> WhatsAppInboundRuntimeRoute {
+        let policy_matches_chat = conversation_policy.is_some_and(|policy| {
+            matches!(
+                (chat_kind, policy.chat_kind),
+                (WhatsAppChatKind::Group, ConversationChatKind::Group)
+                    | (WhatsAppChatKind::Direct, ConversationChatKind::Direct)
+            )
+        });
+        if policy_matches_chat {
+            return WhatsAppInboundRuntimeRoute::Dispatch(
+                super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL,
+            );
+        }
+
+        match chat_kind {
+            WhatsAppChatKind::Group if group_is_managed || group_is_main_channel => {
+                if sender_is_owner {
+                    WhatsAppInboundRuntimeRoute::Dispatch(super::WHATSAPP_MAIN_RUNTIME_CHANNEL)
+                } else {
+                    WhatsAppInboundRuntimeRoute::CaptureOnly
+                }
+            }
+            WhatsAppChatKind::SelfChat if !sender_is_owner => {
+                WhatsAppInboundRuntimeRoute::CaptureOnly
+            }
+            WhatsAppChatKind::SelfChat | WhatsAppChatKind::Direct if sender_is_owner => {
+                WhatsAppInboundRuntimeRoute::Dispatch(super::WHATSAPP_MAIN_RUNTIME_CHANNEL)
+            }
+            _ => WhatsAppInboundRuntimeRoute::Dispatch(super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL),
+        }
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3085,7 +3126,13 @@ impl WhatsAppWebChannel {
         let Some(policy) = conversation_policy else {
             return false;
         };
-        if policy.procedure_job_slug.as_deref().unwrap_or("").trim().is_empty() {
+        if policy
+            .procedure_job_slug
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return false;
         }
 
@@ -3094,7 +3141,6 @@ impl WhatsAppWebChannel {
             policy.procedure_input_contract.as_deref(),
             policy.procedure_sop.as_deref(),
             policy.procedure_summary.as_deref(),
-            policy.objective.as_deref(),
             policy.goal.as_deref(),
         ]
         .into_iter()
@@ -3115,7 +3161,13 @@ impl WhatsAppWebChannel {
         let Some(policy) = conversation_policy else {
             return false;
         };
-        if policy.procedure_job_slug.as_deref().unwrap_or("").trim().is_empty() {
+        if policy
+            .procedure_job_slug
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return false;
         }
 
@@ -3124,7 +3176,6 @@ impl WhatsAppWebChannel {
             policy.procedure_input_contract.as_deref(),
             policy.procedure_sop.as_deref(),
             policy.procedure_summary.as_deref(),
-            policy.objective.as_deref(),
             policy.goal.as_deref(),
         ]
         .into_iter()
@@ -3239,15 +3290,14 @@ impl WhatsAppWebChannel {
         tokio::spawn(async move {
             tokio::time::sleep(WHATSAPP_MEDIA_BUNDLE_DEBOUNCE).await;
             let pending = {
-                pending_media_turns
-                    .lock()
-                    .ok()
-                    .and_then(|mut pending| match pending.get(&bundle_key) {
+                pending_media_turns.lock().ok().and_then(|mut pending| {
+                    match pending.get(&bundle_key) {
                         Some(current) if current.message.id == message_id => {
                             pending.remove(&bundle_key)
                         }
                         _ => None,
-                    })
+                    }
+                })
             };
             if let Some(pending) = pending {
                 tracing::debug!(
@@ -3316,6 +3366,10 @@ impl WhatsAppWebChannel {
                     pending_has_media,
                     message_has_media,
                 );
+                pending.message.channel = message.channel.clone();
+                pending.message.reply_target = message.reply_target.clone();
+                pending.message.thread_ts = message.thread_ts.clone();
+                pending.message.interruption_scope_id = message.interruption_scope_id.clone();
                 pending.message.timestamp = message.timestamp;
                 pending.message.id = message.id.clone();
                 pending.created_at = Instant::now();
@@ -3636,8 +3690,11 @@ impl WhatsAppWebChannel {
             return None;
         }
 
-        let target_path =
-            Self::unique_attachment_path(&attachments_dir, original_name.unwrap_or(source), Some(mime));
+        let target_path = Self::unique_attachment_path(
+            &attachments_dir,
+            original_name.unwrap_or(source),
+            Some(mime),
+        );
         if let Err(err) = fs::write(&target_path, &bytes).await {
             tracing::warn!("WhatsApp Web: failed to persist image attachment: {err}");
             return None;
@@ -4671,7 +4728,11 @@ impl WhatsAppWebChannel {
             return WHATSAPP_OFFICIAL_GROUP_DELIVERY_TARGET.to_string();
         }
 
-        if chat_is_lid && matches!(chat_kind, WhatsAppChatKind::SelfChat | WhatsAppChatKind::Direct)
+        if chat_is_lid
+            && matches!(
+                chat_kind,
+                WhatsAppChatKind::SelfChat | WhatsAppChatKind::Direct
+            )
         {
             let fallback_phone = if matches!(chat_kind, WhatsAppChatKind::SelfChat) {
                 self_phone
@@ -4807,6 +4868,13 @@ enum WhatsAppChatKind {
     SelfChat,
     Direct,
     Group,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatsAppInboundRuntimeRoute {
+    Dispatch(&'static str),
+    CaptureOnly,
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -4994,8 +5062,8 @@ impl Channel for WhatsAppWebChannel {
                         return Err(err.into());
                     }
                 }
-                if let Some(conversation_policy) = observation_service
-                    .conversation_policy_for_target(&message.recipient)
+                if let Some(conversation_policy) =
+                    observation_service.conversation_policy_for_target(&message.recipient)
                 {
                     let _ = observation_service.append_observed_group_message_with_metadata(
                         &conversation_policy.group_jid,
@@ -5024,8 +5092,8 @@ impl Channel for WhatsAppWebChannel {
             }
 
             if clean_content.is_empty() {
-                if let Some(conversation_policy) = observation_service
-                    .conversation_policy_for_target(&message.recipient)
+                if let Some(conversation_policy) =
+                    observation_service.conversation_policy_for_target(&message.recipient)
                 {
                     let _ = observation_service.append_observed_group_message_with_metadata(
                         &conversation_policy.group_jid,
@@ -5058,8 +5126,8 @@ impl Channel for WhatsAppWebChannel {
                     return Err(err);
                 }
             }
-            if let Some(conversation_policy) = observation_service
-                .conversation_policy_for_target(&message.recipient)
+            if let Some(conversation_policy) =
+                observation_service.conversation_policy_for_target(&message.recipient)
             {
                 let _ = observation_service.append_observed_group_message_with_metadata(
                     &conversation_policy.group_jid,
@@ -5102,8 +5170,8 @@ impl Channel for WhatsAppWebChannel {
                 }
             }
         };
-        if let Some(conversation_policy) = observation_service
-            .conversation_policy_for_target(&message.recipient)
+        if let Some(conversation_policy) =
+            observation_service.conversation_policy_for_target(&message.recipient)
         {
             let message_id_string = message_id.to_string();
             let _ = observation_service.append_observed_group_message_with_metadata(
@@ -5646,10 +5714,23 @@ impl Channel for WhatsAppWebChannel {
                                                 self_phone.as_deref(),
                                                 &official_group_jid,
                                             );
-                                            let runtime_channel = if sender_is_owner {
-                                                super::WHATSAPP_MAIN_RUNTIME_CHANNEL
-                                            } else {
-                                                super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
+                                            let runtime_channel = match Self::inbound_runtime_route(
+                                                decision.chat_kind,
+                                                sender_is_owner,
+                                                conversation_policy.as_ref(),
+                                                group_is_managed,
+                                                group_is_main_channel,
+                                            ) {
+                                                WhatsAppInboundRuntimeRoute::Dispatch(channel) => {
+                                                    channel
+                                                }
+                                                WhatsAppInboundRuntimeRoute::CaptureOnly => {
+                                                    tracing::debug!(
+                                                        chat = %chat,
+                                                        "WhatsApp Web group message captured without routing a media bundle"
+                                                    );
+                                                    return;
+                                                }
                                             };
                                             Self::store_pending_media_bundle(
                                                 &pending_media_turns,
@@ -5746,10 +5827,23 @@ impl Channel for WhatsAppWebChannel {
                                                 self_phone.as_deref(),
                                                 &official_group_jid,
                                             );
-                                            let runtime_channel = if sender_is_owner {
-                                                super::WHATSAPP_MAIN_RUNTIME_CHANNEL
-                                            } else {
-                                                super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
+                                            let runtime_channel = match Self::inbound_runtime_route(
+                                                decision.chat_kind,
+                                                sender_is_owner,
+                                                conversation_policy.as_ref(),
+                                                group_is_managed,
+                                                group_is_main_channel,
+                                            ) {
+                                                WhatsAppInboundRuntimeRoute::Dispatch(channel) => {
+                                                    channel
+                                                }
+                                                WhatsAppInboundRuntimeRoute::CaptureOnly => {
+                                                    tracing::debug!(
+                                                        chat = %chat,
+                                                        "WhatsApp Web direct message captured without routing a media bundle"
+                                                    );
+                                                    return;
+                                                }
                                             };
                                             Self::store_pending_media_bundle(
                                                 &pending_media_turns,
@@ -5782,9 +5876,9 @@ impl Channel for WhatsAppWebChannel {
                                     if direct_objective_policy_active {
                                         tracing::debug!(
                                             chat = %chat,
-                                            objective = conversation_policy
+                                            goal = conversation_policy
                                                 .as_ref()
-                                                .and_then(|policy| policy.objective.as_deref())
+                                                .and_then(|policy| policy.goal.as_deref())
                                                 .unwrap_or(""),
                                             mentions_agent = observed_group_trigger.mentions_agent,
                                             replied_to_agent = observed_group_trigger.replied_to_agent,
@@ -5869,10 +5963,24 @@ impl Channel for WhatsAppWebChannel {
                                     self_phone.as_deref(),
                                     &official_group_jid,
                                 );
-                                let runtime_channel = if sender_is_owner && !direct_objective_policy_active && !group_is_observed {
-                                    super::WHATSAPP_MAIN_RUNTIME_CHANNEL
-                                } else {
-                                    super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
+                                let runtime_channel = match Self::inbound_runtime_route(
+                                    decision.chat_kind,
+                                    sender_is_owner,
+                                    conversation_policy.as_ref(),
+                                    group_is_managed,
+                                    group_is_main_channel,
+                                ) {
+                                    WhatsAppInboundRuntimeRoute::Dispatch(channel) => channel,
+                                    WhatsAppInboundRuntimeRoute::CaptureOnly => {
+                                        tracing::debug!(
+                                            chat = %chat,
+                                            sender_is_owner,
+                                            group_is_managed,
+                                            group_is_main_channel,
+                                            "WhatsApp Web managed group message captured without invoking the agent"
+                                        );
+                                        return;
+                                    }
                                 };
 
                                 let should_bundle_media = Self::should_defer_media_bundle(
@@ -6243,8 +6351,9 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let (to, official_target_delivery) =
-            self.resolve_recipient_for_send(client.clone(), recipient).await?;
+        let (to, official_target_delivery) = self
+            .resolve_recipient_for_send(client.clone(), recipient)
+            .await?;
         if let Err(err) = client.chatstate().send_composing(&to).await {
             if official_target_delivery {
                 tracing::debug!(
@@ -6278,8 +6387,9 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let (to, official_target_delivery) =
-            self.resolve_recipient_for_send(client.clone(), recipient).await?;
+        let (to, official_target_delivery) = self
+            .resolve_recipient_for_send(client.clone(), recipient)
+            .await?;
         if let Err(err) = client.chatstate().send_paused(&to).await {
             if official_target_delivery {
                 tracing::debug!(
@@ -6389,6 +6499,36 @@ mod tests {
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn test_observed_group_policy() -> ObservedGroupConfig {
+        ObservedGroupConfig {
+            group_jid: "120363025123456789@g.us".to_string(),
+            group_name: "Los Pibes".to_string(),
+            enabled_at: chrono::Utc::now().to_rfc3339(),
+            delivery_chat_jid: "120363408016257691@g.us".to_string(),
+            channel: "whatsapp".to_string(),
+            chat_kind: ConversationChatKind::Group,
+            mode: ConversationMode::MentionReply,
+            status: ConversationPolicyStatus::Active,
+            skill_name: Some("whatsapp_mention_reply".to_string()),
+            goal: None,
+            procedure_job_slug: Some("remitos-drive-upload".to_string()),
+            procedure_summary: None,
+            procedure_input_schema: None,
+            procedure_input_contract: None,
+            procedure_sop: None,
+            canonical_phone: None,
+            rotate_after_bytes: 1024,
+            keep_log_segments: 2,
+            last_message_at: None,
+            last_rotated_at: None,
+            initial_outreach_sent_at: None,
+            initial_outreach_preview: None,
+            reply_to_all: false,
+            policy_tools: vec!["whatsapp_run_policy_procedure".to_string()],
+        }
     }
 
     #[test]
@@ -6645,7 +6785,7 @@ mod tests {
             chat_kind: ConversationChatKind::Group,
             mode: ConversationMode::ObserveOnly,
             status: ConversationPolicyStatus::Active,
-            objective: None,
+
             skill_name: None,
             goal: None,
             procedure_job_slug: None,
@@ -6661,6 +6801,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
         assert!(WhatsAppWebChannel::allows_conversation_policy_override(
             &decision,
@@ -6720,9 +6861,8 @@ mod tests {
             chat_kind: ConversationChatKind::Direct,
             mode: ConversationMode::ObjectiveDm,
             status: ConversationPolicyStatus::Active,
-            objective: Some("Cerrar acuerdo comercial".to_string()),
             skill_name: Some("whatsapp_objective_dm".to_string()),
-            goal: None,
+            goal: Some("Cerrar acuerdo comercial".to_string()),
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
@@ -6736,6 +6876,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
         assert!(WhatsAppWebChannel::allows_conversation_policy_override(
             &decision,
@@ -6757,9 +6898,8 @@ mod tests {
             chat_kind: ConversationChatKind::Direct,
             mode: ConversationMode::ObjectiveDm,
             status: ConversationPolicyStatus::Active,
-            objective: Some("Coordinar idioma".to_string()),
             skill_name: None,
-            goal: None,
+            goal: Some("Coordinar idioma".to_string()),
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
@@ -6773,14 +6913,17 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
 
-        assert!(WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
-            Some(&direct_policy),
-            &["+128789057143037".to_string(), "+5491140853388".to_string()],
-            Some("+5491140853388"),
-            &ObservedGroupTrigger::default(),
-        ));
+        assert!(
+            WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
+                Some(&direct_policy),
+                &["+128789057143037".to_string(), "+5491140853388".to_string()],
+                Some("+5491140853388"),
+                &ObservedGroupTrigger::default(),
+            )
+        );
     }
 
     #[test]
@@ -6795,9 +6938,8 @@ mod tests {
             chat_kind: ConversationChatKind::Direct,
             mode: ConversationMode::ObjectiveDm,
             status: ConversationPolicyStatus::Active,
-            objective: Some("Coordinar idioma".to_string()),
             skill_name: None,
-            goal: None,
+            goal: Some("Coordinar idioma".to_string()),
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
@@ -6811,14 +6953,17 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
 
-        assert!(!WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
-            Some(&direct_policy),
-            &["+5491170742021".to_string()],
-            Some("+5491140853388"),
-            &ObservedGroupTrigger::default(),
-        ));
+        assert!(
+            !WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
+                Some(&direct_policy),
+                &["+5491170742021".to_string()],
+                Some("+5491140853388"),
+                &ObservedGroupTrigger::default(),
+            )
+        );
     }
 
     #[test]
@@ -6833,9 +6978,8 @@ mod tests {
             chat_kind: ConversationChatKind::Direct,
             mode: ConversationMode::ObjectiveDm,
             status: ConversationPolicyStatus::Active,
-            objective: Some("Coordinar idioma".to_string()),
             skill_name: None,
-            goal: None,
+            goal: Some("Coordinar idioma".to_string()),
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
@@ -6849,6 +6993,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
 
         let wake_trigger = ObservedGroupTrigger {
@@ -6857,12 +7002,14 @@ mod tests {
             quoted_message_id: None,
         };
 
-        assert!(!WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
-            Some(&direct_policy),
-            &["+128789057143037".to_string(), "+5491140853388".to_string()],
-            Some("+5491140853388"),
-            &wake_trigger,
-        ));
+        assert!(
+            !WhatsAppWebChannel::should_suppress_self_authored_direct_invocation(
+                Some(&direct_policy),
+                &["+128789057143037".to_string(), "+5491140853388".to_string()],
+                Some("+5491140853388"),
+                &wake_trigger,
+            )
+        );
     }
 
     #[test]
@@ -6916,12 +7063,10 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_observed_group_trigger_detects_image_caption_wake_token() {
         let msg = wa_rs_proto::whatsapp::Message {
-            image_message: Some(Box::new(
-                wa_rs_proto::whatsapp::message::ImageMessage {
-                    caption: Some("@s86 extrae esta imagen".to_string()),
-                    ..Default::default()
-                },
-            )),
+            image_message: Some(Box::new(wa_rs_proto::whatsapp::message::ImageMessage {
+                caption: Some("@s86 extrae esta imagen".to_string()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let text = WhatsAppWebChannel::extract_visible_message_text(&msg);
@@ -7091,7 +7236,7 @@ mod tests {
             chat_kind: ConversationChatKind::Group,
             mode: ConversationMode::MentionReply,
             status: ConversationPolicyStatus::Active,
-            objective: None,
+
             skill_name: Some("whatsapp_mention_reply".to_string()),
             goal: None,
             procedure_job_slug: None,
@@ -7107,6 +7252,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
         let empty_trigger = ObservedGroupTrigger::default();
         assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
@@ -7159,7 +7305,7 @@ mod tests {
             chat_kind: ConversationChatKind::Group,
             mode: ConversationMode::MentionReply,
             status: ConversationPolicyStatus::Active,
-            objective: None,
+
             skill_name: Some("whatsapp_mention_reply".to_string()),
             goal: None,
             procedure_job_slug: None,
@@ -7175,6 +7321,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
 
         assert!(!WhatsAppWebChannel::should_invoke_observed_group_agent(
@@ -7196,9 +7343,8 @@ mod tests {
             chat_kind: ConversationChatKind::Direct,
             mode: ConversationMode::ObjectiveDm,
             status: ConversationPolicyStatus::Active,
-            objective: Some("Cerrar el acuerdo".to_string()),
             skill_name: Some("whatsapp_objective_dm".to_string()),
-            goal: None,
+            goal: Some("Cerrar el acuerdo".to_string()),
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
@@ -7212,6 +7358,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
         let empty_trigger = ObservedGroupTrigger::default();
         let mention_trigger = ObservedGroupTrigger {
@@ -7242,7 +7389,7 @@ mod tests {
             chat_kind: ConversationChatKind::Group,
             mode: ConversationMode::MentionReply,
             status: ConversationPolicyStatus::Active,
-            objective: None,
+
             skill_name: Some("whatsapp_mention_reply".to_string()),
             goal: None,
             procedure_job_slug: None,
@@ -7258,6 +7405,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: true,
+            policy_tools: Vec::new(),
         };
         let no_mention = ObservedGroupTrigger::default();
         assert!(WhatsAppWebChannel::should_invoke_observed_group_agent(
@@ -7294,11 +7442,113 @@ mod tests {
         );
 
         assert_eq!(
-            merged.matches("[IMAGE:/workspace/attachments/whatsapp/a.jpg]").count(),
+            merged
+                .matches("[IMAGE:/workspace/attachments/whatsapp/a.jpg]")
+                .count(),
             1
         );
         assert!(merged.contains("[IMAGE:/workspace/attachments/whatsapp/b.jpg]"));
         assert!(merged.contains("[IMAGE:/workspace/attachments/whatsapp/c.jpg]"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_observed_group_routes_to_third_party_even_for_owner() {
+        let observed_group = test_observed_group_policy();
+
+        assert_eq!(
+            WhatsAppWebChannel::inbound_runtime_route(
+                WhatsAppChatKind::Group,
+                true,
+                Some(&observed_group),
+                true,
+                false,
+            ),
+            WhatsAppInboundRuntimeRoute::Dispatch(
+                super::super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_managed_group_routes_only_owner_to_main() {
+        assert_eq!(
+            WhatsAppWebChannel::inbound_runtime_route(
+                WhatsAppChatKind::Group,
+                true,
+                None,
+                true,
+                false,
+            ),
+            WhatsAppInboundRuntimeRoute::Dispatch(super::super::WHATSAPP_MAIN_RUNTIME_CHANNEL)
+        );
+        assert_eq!(
+            WhatsAppWebChannel::inbound_runtime_route(
+                WhatsAppChatKind::Group,
+                false,
+                None,
+                true,
+                false,
+            ),
+            WhatsAppInboundRuntimeRoute::CaptureOnly
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn media_bundle_merge_uses_current_invoking_channel() {
+        let pending_media_turns = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let bundle_key = "120363025123456789@g.us|+5491170742021".to_string();
+
+        WhatsAppWebChannel::store_pending_media_bundle(
+            &pending_media_turns,
+            bundle_key.clone(),
+            ChannelMessage {
+                id: "pending".to_string(),
+                channel: super::super::WHATSAPP_MAIN_RUNTIME_CHANNEL.to_string(),
+                sender: "+5491170742021".to_string(),
+                reply_target: "120363025123456789@g.us".to_string(),
+                content: "[IMAGE:/workspace/attachments/whatsapp/a.jpg]".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+            },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        WhatsAppWebChannel::send_or_defer_media_bundle(
+            tx,
+            pending_media_turns.clone(),
+            bundle_key.clone(),
+            ChannelMessage {
+                id: "current".to_string(),
+                channel: super::super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL.to_string(),
+                sender: "+5491170742021".to_string(),
+                reply_target: "120363025123456789@g.us".to_string(),
+                content: "@s86\n\n[IMAGE:/workspace/attachments/whatsapp/b.jpg]".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+
+        let pending = pending_media_turns
+            .lock()
+            .unwrap()
+            .get(&bundle_key)
+            .unwrap()
+            .message
+            .clone();
+        assert_eq!(
+            pending.channel,
+            super::super::WHATSAPP_THIRD_PARTY_RUNTIME_CHANNEL
+        );
+        assert!(pending.content.contains("/a.jpg]"));
+        assert!(pending.content.contains("/b.jpg]"));
     }
 
     #[test]
@@ -7313,9 +7563,8 @@ mod tests {
             chat_kind: ConversationChatKind::Direct,
             mode: ConversationMode::ObjectiveDm,
             status: ConversationPolicyStatus::Active,
-            objective: Some("Cerrar el acuerdo".to_string()),
             skill_name: Some("whatsapp_objective_dm".to_string()),
-            goal: None,
+            goal: Some("Cerrar el acuerdo".to_string()),
             procedure_job_slug: None,
             procedure_summary: None,
             procedure_input_schema: None,
@@ -7329,6 +7578,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: true,
+            policy_tools: Vec::new(),
         };
         let no_mention = ObservedGroupTrigger::default();
         assert!(WhatsAppWebChannel::should_invoke_observed_direct_agent(
@@ -7349,7 +7599,7 @@ mod tests {
             chat_kind: ConversationChatKind::Group,
             mode: ConversationMode::MentionReply,
             status: ConversationPolicyStatus::Active,
-            objective: None,
+
             skill_name: None,
             goal: None,
             procedure_job_slug: None,
@@ -7365,6 +7615,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: true,
+            policy_tools: Vec::new(),
         };
         let no_mention = ObservedGroupTrigger::default();
 
@@ -7424,7 +7675,7 @@ mod tests {
             chat_kind: ConversationChatKind::Group,
             mode: ConversationMode::MentionReply,
             status: ConversationPolicyStatus::Active,
-            objective: None,
+
             skill_name: Some("whatsapp_mention_reply".to_string()),
             goal: None,
             procedure_job_slug: None,
@@ -7440,6 +7691,7 @@ mod tests {
             initial_outreach_sent_at: None,
             initial_outreach_preview: None,
             reply_to_all: false,
+            policy_tools: Vec::new(),
         };
         let empty_trigger = ObservedGroupTrigger::default();
         assert!(!WhatsAppWebChannel::should_invoke_group_agent(
@@ -7598,7 +7850,10 @@ mod tests {
             Some("120363425113008737@g.us".to_string())
         );
         assert_eq!(
-            managed_groups.lock().get("120363425113008737@g.us").cloned(),
+            managed_groups
+                .lock()
+                .get("120363425113008737@g.us")
+                .cloned(),
             Some(WHATSAPP_BOOTSTRAP_GROUP_SUBJECT.to_string())
         );
         assert_eq!(
@@ -8054,9 +8309,7 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_resolve_reply_target_uses_official_group_alias() {
-        let official_group_jid = Arc::new(Mutex::new(Some(
-            "120363425113008737@g.us".to_string(),
-        )));
+        let official_group_jid = Arc::new(Mutex::new(Some("120363425113008737@g.us".to_string())));
         let reply_target = WhatsAppWebChannel::resolve_reply_target(
             "120363425113008737@g.us",
             WhatsAppChatKind::Group,
@@ -8294,7 +8547,11 @@ mod tests {
             .trim_end_matches(']')
             .to_string();
         let target_path = std::path::PathBuf::from(&target);
-        assert!(target_path.exists(), "expected persisted file at {}", target);
+        assert!(
+            target_path.exists(),
+            "expected persisted file at {}",
+            target
+        );
         assert!(target_path.starts_with(workspace.path().join("attachments/whatsapp")));
         assert_eq!(std::fs::read(&target_path).unwrap(), png_bytes);
         assert_eq!(

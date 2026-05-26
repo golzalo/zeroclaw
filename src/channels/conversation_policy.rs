@@ -85,6 +85,7 @@ pub struct ConversationProcedureMetadata {
     pub procedure_input_contract: Option<String>,
     pub procedure_sop: Option<String>,
     pub clear_procedure: bool,
+    pub policy_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -59,10 +59,8 @@ pub struct ObservedGroupConfig {
     #[serde(default)]
     pub status: ConversationPolicyStatus,
     #[serde(default)]
-    pub objective: Option<String>,
-    #[serde(default)]
     pub skill_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "objective")]
     pub goal: Option<String>,
     #[serde(default)]
     pub procedure_job_slug: Option<String>,
@@ -90,6 +88,8 @@ pub struct ObservedGroupConfig {
     pub initial_outreach_preview: Option<String>,
     #[serde(default)]
     pub reply_to_all: bool,
+    #[serde(default)]
+    pub policy_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,7 +372,6 @@ impl WhatsAppObservationService {
                 chat_kind: ConversationChatKind::Group,
                 mode: mode.unwrap_or(ConversationMode::ObserveOnly),
                 status: ConversationPolicyStatus::Active,
-                objective: None,
                 skill_name: skill_name.and_then(Self::normalize_skill_name),
                 goal: None,
                 procedure_job_slug: None,
@@ -388,12 +387,12 @@ impl WhatsAppObservationService {
                 initial_outreach_sent_at: None,
                 initial_outreach_preview: None,
                 reply_to_all,
+                policy_tools: Vec::new(),
             });
         entry.group_name = group_name.to_string();
         entry.delivery_chat_jid = delivery_chat_jid.to_string();
         entry.channel = default_channel();
         entry.chat_kind = ConversationChatKind::Group;
-        entry.objective = None;
         if let Some(skill_name) = skill_name.and_then(Self::normalize_skill_name) {
             entry.skill_name = Some(skill_name);
         }
@@ -427,7 +426,7 @@ impl WhatsAppObservationService {
         chat_jid: &str,
         chat_name: &str,
         delivery_chat_jid: &str,
-        objective: &str,
+        goal: &str,
         canonical_phone: Option<&str>,
     ) -> Result<ObservedGroupConfig> {
         self.register_direct_chat_policy_with_skill(
@@ -435,7 +434,7 @@ impl WhatsAppObservationService {
             chat_name,
             delivery_chat_jid,
             ConversationMode::ObjectiveDm,
-            objective,
+            goal,
             canonical_phone,
             None,
             false,
@@ -448,7 +447,7 @@ impl WhatsAppObservationService {
         chat_name: &str,
         delivery_chat_jid: &str,
         mode: ConversationMode,
-        objective: &str,
+        goal: &str,
         canonical_phone: Option<&str>,
         skill_name: Option<&str>,
         reply_to_all: bool,
@@ -458,7 +457,7 @@ impl WhatsAppObservationService {
             chat_name,
             delivery_chat_jid,
             mode,
-            objective,
+            goal,
             canonical_phone,
             skill_name,
             None,
@@ -472,7 +471,7 @@ impl WhatsAppObservationService {
         chat_name: &str,
         delivery_chat_jid: &str,
         mode: ConversationMode,
-        objective: &str,
+        goal: &str,
         canonical_phone: Option<&str>,
         skill_name: Option<&str>,
         procedure: Option<&ConversationProcedureMetadata>,
@@ -486,13 +485,13 @@ impl WhatsAppObservationService {
             anyhow::bail!("Direct chat policies cannot target WhatsApp group JIDs");
         }
 
-        let objective = objective.trim();
-        if mode == ConversationMode::ObjectiveDm && objective.is_empty() {
-            anyhow::bail!("Direct chat objective cannot be empty");
+        let goal = goal.trim();
+        if mode == ConversationMode::ObjectiveDm && goal.is_empty() {
+            anyhow::bail!("Direct chat goal cannot be empty");
         }
-        if mode != ConversationMode::ObjectiveDm && !objective.is_empty() {
+        if mode != ConversationMode::ObjectiveDm && !goal.is_empty() {
             anyhow::bail!(
-                "Direct chat objective is only supported when mode is `objective_dm`"
+                "Direct chat goal is only supported when mode is `objective_dm`"
             );
         }
 
@@ -537,9 +536,8 @@ impl WhatsAppObservationService {
                 chat_kind: ConversationChatKind::Direct,
                 mode,
                 status: ConversationPolicyStatus::Active,
-                objective: Self::normalize_optional_text(objective),
                 skill_name: skill_name.and_then(Self::normalize_skill_name),
-                goal: None,
+                goal: Self::normalize_optional_text(goal),
                 procedure_job_slug: None,
                 procedure_summary: None,
                 procedure_input_schema: None,
@@ -553,6 +551,7 @@ impl WhatsAppObservationService {
                 initial_outreach_sent_at: None,
                 initial_outreach_preview: None,
                 reply_to_all,
+                policy_tools: Vec::new(),
             });
         entry.group_jid = policy_jid;
         entry.group_name = chat_name.to_string();
@@ -561,7 +560,7 @@ impl WhatsAppObservationService {
         entry.chat_kind = ConversationChatKind::Direct;
         entry.mode = mode;
         entry.status = ConversationPolicyStatus::Active;
-        entry.objective = Self::normalize_optional_text(objective);
+        entry.goal = Self::normalize_optional_text(goal);
         if let Some(skill_name) = skill_name.and_then(Self::normalize_skill_name) {
             entry.skill_name = Some(skill_name);
         }
@@ -1378,16 +1377,6 @@ pub fn render_observed_groups(groups: &[ObservedGroupConfig], workspace_dir: &Pa
     let service = WhatsAppObservationService::new(workspace_dir.to_path_buf());
     let mut output = format!("WhatsApp conversation policies ({}):\n", groups.len());
     for group in groups {
-        let objective_flag = if group
-            .objective
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        {
-            " | objective=set"
-        } else {
-            ""
-        };
         let skill_flag = group
             .skill_name
             .as_deref()
@@ -1415,7 +1404,7 @@ pub fn render_observed_groups(groups: &[ObservedGroupConfig], workspace_dir: &Pa
             .map(|sent_at| format!(" | initial_outreach_sent_at={sent_at}"))
             .unwrap_or_default();
         output.push_str(&format!(
-            "- {} | kind={} | jid={} | mode={} | control_chat={} | log={}{}{}{}{}{}\n",
+            "- {} | kind={} | jid={} | mode={} | control_chat={} | log={}{}{}{}{}\n",
             group.group_name,
             group.chat_kind.as_str(),
             group.group_jid,
@@ -1423,7 +1412,6 @@ pub fn render_observed_groups(groups: &[ObservedGroupConfig], workspace_dir: &Pa
             group.delivery_chat_jid,
             service.observed_group_log_path(&group.group_jid).display(),
             skill_flag,
-            objective_flag,
             goal_flag,
             procedure_flag,
             outreach_flag,
@@ -1462,6 +1450,15 @@ impl WhatsAppObservationService {
             .and_then(Self::normalize_optional_text)
         {
             entry.goal = Some(goal);
+        }
+
+        if !procedure.policy_tools.is_empty() {
+            entry.policy_tools = procedure
+                .policy_tools
+                .iter()
+                .map(|tool| tool.trim().to_string())
+                .filter(|tool| !tool.is_empty())
+                .collect();
         }
 
         if let Some(job_slug) = procedure
@@ -2277,7 +2274,7 @@ mod tests {
                 &["+15551234567".to_string()],
             )
             .unwrap();
-        assert_eq!(by_candidates.objective.as_deref(), Some("Cerrar el acuerdo de entrega y validar pendientes."));
+        assert_eq!(by_candidates.goal.as_deref(), Some("Cerrar el acuerdo de entrega y validar pendientes."));
     }
 
     #[test]
@@ -2328,9 +2325,8 @@ mod tests {
                         chat_kind: ConversationChatKind::Direct,
                         mode: ConversationMode::ObjectiveDm,
                         status: ConversationPolicyStatus::Active,
-                        objective: Some("Ayudar con temporada baja".to_string()),
                         skill_name: Some("whatsapp_objective_dm".to_string()),
-                        goal: None,
+                        goal: Some("Ayudar con temporada baja".to_string()),
                         procedure_job_slug: None,
                         procedure_summary: None,
                         procedure_input_schema: None,
@@ -2344,6 +2340,7 @@ mod tests {
                         initial_outreach_sent_at: None,
                         initial_outreach_preview: None,
                         reply_to_all: false,
+                        policy_tools: Vec::new(),
                     },
                 ),
                 (
@@ -2357,9 +2354,8 @@ mod tests {
                         chat_kind: ConversationChatKind::Direct,
                         mode: ConversationMode::ObjectiveDm,
                         status: ConversationPolicyStatus::Active,
-                        objective: Some("Ayudar con temporada baja".to_string()),
                         skill_name: Some("whatsapp_objective_dm".to_string()),
-                        goal: None,
+                        goal: Some("Ayudar con temporada baja".to_string()),
                         procedure_job_slug: None,
                         procedure_summary: None,
                         procedure_input_schema: None,
@@ -2373,6 +2369,7 @@ mod tests {
                         initial_outreach_sent_at: None,
                         initial_outreach_preview: None,
                         reply_to_all: false,
+                        policy_tools: Vec::new(),
                     },
                 ),
             ]))
@@ -2415,7 +2412,7 @@ mod tests {
 
         assert_eq!(observed.chat_kind, ConversationChatKind::Direct);
         assert_eq!(observed.mode, ConversationMode::ObserveOnly);
-        assert_eq!(observed.objective, None);
+        assert_eq!(observed.goal, None);
         assert_eq!(
             observed.skill_name.as_deref(),
             Some("whatsapp_direct_observer")

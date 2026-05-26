@@ -183,7 +183,7 @@ impl Tool for WhatsAppObjectiveDmTool {
                     "type": "string",
                     "description": "Chat JID that controls this policy. Use the current reply_target when configuring from a control conversation."
                 },
-                "objective": {
+                "goal": {
                     "type": "string",
                     "description": "Concrete outcome for the 1:1 conversation, such as validating work completed, collecting missing inputs, or reaching agreement on next steps."
                 },
@@ -192,7 +192,7 @@ impl Tool for WhatsAppObjectiveDmTool {
                     "description": "Optional workspace skill name from workspace/skills. If omitted, the existing policy skill is preserved when present."
                 }
             },
-            "required": ["delivery_chat_jid", "objective"]
+            "required": ["delivery_chat_jid", "goal"]
         })
     }
 
@@ -214,12 +214,12 @@ impl Tool for WhatsAppObjectiveDmTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing 'delivery_chat_jid' parameter"))?;
-        let objective = args
-            .get("objective")
+        let goal = args
+            .get("goal")
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'objective' parameter"))?;
+            .ok_or_else(|| anyhow::anyhow!("Missing 'goal' parameter"))?;
         let service = WhatsAppObservationService::new(self.workspace_dir.clone());
         let (chat_jid, canonical_phone, resolved_name) = Self::resolve_target(
             &service,
@@ -273,7 +273,7 @@ impl Tool for WhatsAppObjectiveDmTool {
             &contact_name,
             delivery_chat_jid,
             crate::channels::whatsapp_observation::ConversationMode::ObjectiveDm,
-            objective,
+            goal,
             canonical_phone.as_deref(),
             skill_name.as_deref(),
             reply_to_all,
@@ -291,13 +291,13 @@ impl Tool for WhatsAppObjectiveDmTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "WhatsApp direct conversation '{}' (jid={}) is now configured in mode `objective_dm`. Skill: {}. Control chat: {}. Log path: {}. Objective: {}. To begin proactively, call `whatsapp_start_direct_conversation` with the first outreach message.",
+                "WhatsApp direct conversation '{}' (jid={}) is now configured in mode `objective_dm`. Skill: {}. Control chat: {}. Log path: {}. Goal: {}. To begin proactively, call `whatsapp_start_direct_conversation` with the first outreach message.",
                 observed.group_name,
                 observed.group_jid,
                 observed.skill_name.as_deref().unwrap_or("none"),
                 observed.delivery_chat_jid,
                 service.observed_group_log_path(&observed.group_jid).display(),
-                observed.objective.as_deref().unwrap_or(objective),
+                observed.goal.as_deref().unwrap_or(goal),
             ),
             error: None,
         })
@@ -329,7 +329,7 @@ mod tests {
                 "contact_phone": "+54 9 11 5929 7734",
                 "contact_name": "Cliente Demo",
                 "delivery_chat_jid": "120363408016257691@g.us",
-                "objective": "Cerrar el acuerdo y validar pendientes.",
+                "goal": "Cerrar el acuerdo y validar pendientes.",
                 "skill_name": "whatsapp_objective_dm"
             }))
             .await
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(observed.chat_kind, crate::channels::whatsapp_observation::ConversationChatKind::Direct);
         assert_eq!(observed.mode, crate::channels::whatsapp_observation::ConversationMode::ObjectiveDm);
         assert_eq!(
-            observed.objective.as_deref(),
+            observed.goal.as_deref(),
             Some("Cerrar el acuerdo y validar pendientes.")
         );
         assert_eq!(
@@ -382,7 +382,7 @@ mod tests {
             .execute(json!({
                 "contact_name": "Gonzalo TIENDAMIA",
                 "delivery_chat_jid": "120363408016257691@g.us",
-                "objective": "Confirmar horario de encuentro despues de las 9:30.",
+                "goal": "Confirmar horario de encuentro despues de las 9:30.",
                 "skill_name": "whatsapp_objective_dm"
             }))
             .await
@@ -395,7 +395,7 @@ mod tests {
             .unwrap();
         assert_eq!(observed.group_name, "Gonzalo TIENDAMIA");
         assert_eq!(
-            observed.objective.as_deref(),
+            observed.goal.as_deref(),
             Some("Confirmar horario de encuentro despues de las 9:30.")
         );
     }
@@ -419,7 +419,7 @@ mod tests {
             .execute(json!({
                 "contact_phone": "+54 9 11 3411 5686",
                 "delivery_chat_jid": "5491134115686@s.whatsapp.net",
-                "objective": "Ayudar con estrategias de temporada baja."
+                "goal": "Ayudar con estrategias de temporada baja."
             }))
             .await
             .unwrap();

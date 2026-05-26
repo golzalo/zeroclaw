@@ -93,6 +93,18 @@ impl WhatsAppConfigureConversationPolicyTool {
         let procedure_input_contract =
             Self::normalize_optional_json_or_text_arg(args, "procedure_input_contract");
         let procedure_sop = Self::normalize_optional_text_arg(args, "procedure_sop");
+        let policy_tools: Vec<String> = args
+            .get("policy_tools")
+            .and_then(|value| value.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let has_metadata = clear_procedure
             || goal.is_some()
@@ -100,7 +112,8 @@ impl WhatsAppConfigureConversationPolicyTool {
             || procedure_summary.is_some()
             || procedure_input_schema.is_some()
             || procedure_input_contract.is_some()
-            || procedure_sop.is_some();
+            || procedure_sop.is_some()
+            || !policy_tools.is_empty();
         if !has_metadata {
             return Ok(None);
         }
@@ -144,6 +157,7 @@ impl WhatsAppConfigureConversationPolicyTool {
             procedure_input_contract,
             procedure_sop,
             clear_procedure,
+            policy_tools,
         }))
     }
 
@@ -296,13 +310,9 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     "type": "string",
                     "description": "Visible contact name when target_kind='direct'. Use after whatsapp_list_direct_chats when you want name-based resolution or disambiguation."
                 },
-                "objective": {
-                    "type": "string",
-                    "description": "Concrete direct-conversation objective. Required for mode='objective_dm'."
-                },
                 "goal": {
                     "type": "string",
-                    "description": "Owner-facing goal for this observed-with-reply conversation policy."
+                    "description": "Required for mention_reply and managed_group modes without a bound procedure. Describe how the agent should reply: tone, style, language, topic, or any behavioral constraint. The tool will reject the call if this is absent for those modes."
                 },
                 "procedure_job_slug": {
                     "type": "string",
@@ -325,6 +335,11 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                 "clear_procedure": {
                     "type": "boolean",
                     "description": "When true, remove any existing procedure binding from this policy."
+                },
+                "policy_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Explicit list of tool names the restricted worker may use in this conversation. When set, only tools in this list are active — the worker is directed not to use any other tool. Omit to keep whatever tools are currently configured. For plain-reply policies, pass an empty array or omit. For procedure-bound policies, include 'whatsapp_run_policy_procedure' plus any others needed."
                 },
                 "reply_to_all": {
                     "type": "boolean",
@@ -381,6 +396,29 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
             .get("reply_to_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // For plain-reply mention_reply / managed_group policies (no bound procedure job),
+        // goal is required so the restricted worker knows how to behave.
+        if matches!(mode, ConversationMode::MentionReply | ConversationMode::ManagedGroup)
+            && procedure
+                .as_ref()
+                .and_then(|p| p.procedure_job_slug.as_deref())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_none()
+            && Self::normalize_optional_text_arg(&args, "goal").is_none()
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Missing 'goal' for a plain-reply mention_reply/managed_group policy. \
+                     Describe how the agent should reply in this group (tone, style, language, \
+                     topic, or any behavioral constraint) and pass it as 'goal'."
+                        .to_string(),
+                ),
+            });
+        }
 
         let service = WhatsAppObservationService::new(self.workspace_dir.clone());
 
@@ -471,14 +509,31 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     });
                 }
 
-                let objective = if mode == ConversationMode::ObjectiveDm {
-                    args.get("objective")
-                        .and_then(|value| value.as_str())
+                let goal_str: String;
+                let goal_param: &str = if mode == ConversationMode::ObjectiveDm {
+                    let g = procedure
+                        .as_ref()
+                        .and_then(|p| p.goal.as_deref())
                         .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "Missing 'objective' parameter for mode `objective_dm`"
-                        ))?
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| {
+                            args.get("goal")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty())
+                        });
+                    match g {
+                        Some(v) => { goal_str = v.to_string(); &goal_str }
+                        None => return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "Missing 'goal' parameter for mode `objective_dm`. \
+                                 Describe the objective of this direct conversation."
+                                    .to_string(),
+                            ),
+                        }),
+                    }
                 } else {
                     ""
                 };
@@ -539,7 +594,7 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     &contact_name,
                     delivery_chat_jid,
                     mode,
-                    objective,
+                    goal_param,
                     canonical_phone.as_deref(),
                     skill_name.as_deref(),
                     procedure.as_ref(),
@@ -567,7 +622,7 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                             observed.procedure_job_slug.as_deref().unwrap_or("none"),
                             observed.delivery_chat_jid,
                             service.observed_group_log_path(&observed.group_jid).display(),
-                            observed.objective.as_deref().unwrap_or(objective),
+                            observed.goal.as_deref().unwrap_or(goal_param),
                         )
                     } else {
                         format!(
@@ -939,7 +994,7 @@ mod tests {
                 "contact_name": "Cliente Demo",
                 "mode": "objective_dm",
                 "delivery_chat_jid": "120363408016257691@g.us",
-                "objective": "Cerrar el acuerdo y validar pendientes.",
+                "goal": "Cerrar el acuerdo y validar pendientes.",
                 "skill_name": "whatsapp_objective_dm",
                 "reply_to_all": false
             }))

@@ -250,7 +250,7 @@ impl Tool for WhatsAppStartDirectConversationTool {
                 "Started the WhatsApp direct conversation '{}' (jid={}) with an initial outreach message. Objective: {}. Control chat: {}. Initial outreach recorded at {}.",
                 observed.group_name,
                 observed.group_jid,
-                observed.objective.as_deref().unwrap_or("none"),
+                observed.goal.as_deref().unwrap_or("none"),
                 observed.delivery_chat_jid,
                 observed.initial_outreach_sent_at.as_deref().unwrap_or("now"),
             ),
