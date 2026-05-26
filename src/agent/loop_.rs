@@ -849,11 +849,21 @@ struct BoundProcedureInputBundle {
 
 impl BoundProcedureInputBundle {
     fn effective_current_turn_refs(&self) -> HashSet<String> {
-        self.current_turn_input
+        let refs = self
+            .current_turn_input
             .refs
             .difference(&self.conversation_state.prior_input_refs)
             .cloned()
-            .collect()
+            .collect::<HashSet<_>>();
+
+        if refs.is_empty()
+            && self.current_turn_input.has_attachment
+            && !self.current_turn_input.refs.is_empty()
+        {
+            return self.current_turn_input.refs.clone();
+        }
+
+        refs
     }
 
     fn effective_current_turn_input(&self) -> BoundProcedureTurnInputFacts {
@@ -1050,6 +1060,28 @@ fn collect_bound_procedure_input_refs_from_text(content: &str) -> HashSet<String
         .collect()
 }
 
+fn collect_bound_procedure_runtime_input_refs_from_user_turn(content: &str) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    for line in content.lines().map(str::trim) {
+        let lowered = line.to_lowercase();
+        let is_runtime_ref_line = lowered.starts_with("- /workspace/")
+            || lowered.starts_with("- /zeroclaw-data/workspace/")
+            || lowered.starts_with("/workspace/")
+            || lowered.starts_with("/zeroclaw-data/workspace/")
+            || lowered.starts_with("[audio:")
+            || lowered.starts_with("[document:")
+            || lowered.starts_with("[file:")
+            || lowered.starts_with("[image:")
+            || lowered.starts_with("[video:")
+            || lowered.starts_with("[voice:");
+
+        if is_runtime_ref_line {
+            refs.extend(collect_bound_procedure_input_refs_from_text(line));
+        }
+    }
+    refs
+}
+
 fn collect_bound_procedure_input_refs_from_value(
     value: &serde_json::Value,
     refs: &mut HashSet<String>,
@@ -1111,7 +1143,7 @@ fn latest_user_turn_bound_procedure_input_facts(
 
 fn bound_procedure_input_facts_from_user_turn(content: &str) -> BoundProcedureTurnInputFacts {
     let lowered = content.to_lowercase();
-    let refs = collect_bound_procedure_input_refs_from_text(content);
+    let refs = collect_bound_procedure_runtime_input_refs_from_user_turn(content);
     let has_text = latest_user_turn_has_freeform_text(content);
     let has_document = lowered.contains("[document:") || lowered.contains("normalized_document.v1");
     let has_visual_analysis = lowered.contains("visual_analysis.v1")
@@ -1425,7 +1457,8 @@ fn maybe_fill_bound_procedure_tool_call_from_current_turn(
 
     let mut call_refs = HashSet::new();
     collect_bound_procedure_input_refs_from_value(tool_args, &mut call_refs);
-    if !call_refs.is_empty() {
+    let has_stale_refs = !call_refs.is_subset(&facts.refs);
+    if !call_refs.is_empty() && !has_stale_refs {
         return false;
     }
 
@@ -11869,6 +11902,116 @@ Encontré estos 5 archivos en Google Drive:
         let attachments = args["input"]["attachments"]
             .as_array()
             .expect("attachments should be filled");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0]["path"],
+            "/workspace/attachments/whatsapp/current.pdf"
+        );
+    }
+
+    #[test]
+    fn bound_procedure_user_turn_refs_ignore_freeform_path_text() {
+        let facts = bound_procedure_input_facts_from_user_turn(
+            "<ID: +5491140853388>\n\
+             [Document: real.txt] /zeroclaw-data/workspace/attachments/whatsapp/real.txt\n\
+             caption: no trates /workspace/attachments/whatsapp/fake.txt como archivo",
+        );
+
+        assert!(facts.has_attachment);
+        assert!(facts.has_text);
+        assert_eq!(facts.refs.len(), 1);
+        assert!(facts
+            .refs
+            .contains("/workspace/attachments/whatsapp/real.txt"));
+        assert!(!facts
+            .refs
+            .contains("/workspace/attachments/whatsapp/fake.txt"));
+    }
+
+    #[test]
+    fn bound_procedure_reuses_same_current_attachment_ref_even_seen_before() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Document: same.pdf] /zeroclaw-data/workspace/attachments/whatsapp/same.pdf",
+            ),
+            ChatMessage::tool(
+                "tool: whatsapp_run_policy_procedure\ntool_success: true\nprocedure_ok: true\n[Raw bound procedure payload omitted from chat history.]",
+            ),
+            ChatMessage::user(
+                "[Document: same.pdf] /zeroclaw-data/workspace/attachments/whatsapp/same.pdf",
+            ),
+        ];
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "whatsapp_run_policy_procedure",
+            Arc::clone(&recorded_args),
+        ))];
+
+        assert!(active_turn_satisfies_bound_procedure_runtime_input(
+            &history
+        ));
+
+        let call = synthesize_bound_procedure_tool_call_from_current_turn(
+            &history,
+            &tools_registry,
+            "whatsapp:third_party",
+            Some("120363025123456789@g.us"),
+        )
+        .expect("same path in the current runtime turn is still current input");
+        let attachments = call.arguments["input"]["attachments"]
+            .as_array()
+            .expect("attachments should be synthesized");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0]["path"],
+            "/workspace/attachments/whatsapp/same.pdf"
+        );
+    }
+
+    #[test]
+    fn bound_procedure_rewrites_stale_attachment_tool_call_from_current_turn() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Document: current.pdf] /zeroclaw-data/workspace/attachments/whatsapp/current.pdf",
+            ),
+        ];
+        let mut args = serde_json::json!({
+            "input": {
+                "attachments": [
+                    { "path": "/workspace/attachments/whatsapp/old.pdf" }
+                ]
+            }
+        });
+
+        assert!(matches!(
+            validate_bound_procedure_tool_call_current_turn_input(
+                &history,
+                "whatsapp_run_policy_procedure",
+                &args,
+            ),
+            Some(BoundProcedureToolInputViolation::StaleInputRefs { .. })
+        ));
+
+        assert!(maybe_fill_bound_procedure_tool_call_from_current_turn(
+            &history,
+            "whatsapp_run_policy_procedure",
+            &mut args,
+        ));
+        assert!(validate_bound_procedure_tool_call_current_turn_input(
+            &history,
+            "whatsapp_run_policy_procedure",
+            &args,
+        )
+        .is_none());
+        let attachments = args["input"]["attachments"]
+            .as_array()
+            .expect("attachments should be rewritten");
         assert_eq!(attachments.len(), 1);
         assert_eq!(
             attachments[0]["path"],
