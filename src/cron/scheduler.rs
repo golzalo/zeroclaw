@@ -901,9 +901,7 @@ fn configure_agent_job_run(config: &Config, job: &CronJob, model_name: String) -
     run_config
 }
 
-fn hard_agent_tool_failure(
-    report: &crate::agent::loop_::ProcessMessageReport,
-) -> Option<String> {
+fn hard_agent_tool_failure(report: &crate::agent::loop_::ProcessMessageReport) -> Option<String> {
     report
         .tool_failures
         .iter()
@@ -1584,12 +1582,10 @@ mod tests {
             .await
             .unwrap();
 
-        let resolved = resolve_agent_job_prompt(
-            &config,
-            &format!("@file {}", prompt_path.display()),
-        )
-        .await
-        .unwrap();
+        let resolved =
+            resolve_agent_job_prompt(&config, &format!("@file {}", prompt_path.display()))
+                .await
+                .unwrap();
 
         assert_eq!(
             resolved.tenant_service.kind,
@@ -1618,14 +1614,9 @@ mod tests {
             ),
         };
 
-        let normalized = normalize_tenant_service_cron_output(
-            &config,
-            &metadata,
-            "OK",
-            Utc::now(),
-        )
-        .await
-        .unwrap();
+        let normalized = normalize_tenant_service_cron_output(&config, &metadata, "OK", Utc::now())
+            .await
+            .unwrap();
 
         assert_eq!(normalized, "OK");
     }
@@ -1674,14 +1665,10 @@ mod tests {
             delivery_command: None,
         };
 
-        let normalized = normalize_tenant_service_cron_output(
-            &config,
-            &metadata,
-            "NO_DELIVERY",
-            Utc::now(),
-        )
-        .await
-        .unwrap();
+        let normalized =
+            normalize_tenant_service_cron_output(&config, &metadata, "NO_DELIVERY", Utc::now())
+                .await
+                .unwrap();
 
         assert_eq!(normalized, "");
     }

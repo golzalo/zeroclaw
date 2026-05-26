@@ -8,6 +8,10 @@ const WHATSAPP_GROUP_POLICY_SUCCESS_HINTS: &[&str] = &[
     "ya deje configurado el grupo",
     "ya lo tenés configurado así",
     "ya lo tenes configurado asi",
+    "grupo está configurado",
+    "grupo esta configurado",
+    "grupo quedó configurado",
+    "grupo quedo configurado",
 ];
 
 const WHATSAPP_POLICY_SUCCESS_HINTS: &[&str] = &[
@@ -23,6 +27,14 @@ const WHATSAPP_POLICY_SUCCESS_HINTS: &[&str] = &[
     "modo `objective_dm`",
     "mode `mention_reply`",
     "mode `objective_dm`",
+    "policy del grupo está configurada",
+    "policy del grupo esta configurada",
+    "política del grupo está configurada",
+    "politica del grupo esta configurada",
+    "procedimiento vinculado",
+    "job vinculado",
+    "verificado end-to-end",
+    "verified end-to-end",
 ];
 
 const WHATSAPP_POLICY_REMOVAL_HINTS: &[&str] = &[
@@ -178,9 +190,7 @@ impl ChannelPolicySideEffectState {
             let verified_existing_group = claimed_group_name.as_ref().is_some_and(|group_name| {
                 self.policy_listing_outputs
                     .iter()
-                    .any(|output| {
-                        (self.spec.list_output_confirms_group_policy)(output, group_name)
-                    })
+                    .any(|output| (self.spec.list_output_confirms_group_policy)(output, group_name))
             });
 
             if !self.group_policy_written && !verified_existing_group {
@@ -289,8 +299,15 @@ fn response_claims_whatsapp_group_policy_success(display_text: &str) -> bool {
     WHATSAPP_GROUP_POLICY_SUCCESS_HINTS
         .iter()
         .any(|hint| lowered.contains(hint))
-        || (lowered.contains("solo voy a responder cuando me arroben")
-            && lowered.contains("grupo"))
+        || (lowered.contains("solo voy a responder cuando me arroben") && lowered.contains("grupo"))
+        || (lowered.contains("estado actual")
+            && lowered.contains("grupo")
+            && (lowered.contains("mode:")
+                || lowered.contains("modo:")
+                || lowered.contains("managed_group")
+                || lowered.contains("mention_reply")
+                || lowered.contains("respondo a")
+                || lowered.contains("responde a")))
 }
 
 fn response_claims_whatsapp_policy_success(display_text: &str) -> bool {
@@ -401,8 +418,7 @@ mod tests {
             "S86 - FoCA"
         ));
         assert!(!whatsapp_list_output_confirms_group_policy(
-            output,
-            "Nosotros"
+            output, "Nosotros"
         ));
         assert!(whatsapp_list_output_confirms_any_policy(output));
     }
@@ -428,6 +444,21 @@ mod tests {
 
         assert_eq!(claim.event, "final_response_unverified_whatsapp_policy");
         assert!(claim.repair_prompt.contains("objective_dm"));
+    }
+
+    #[test]
+    fn tracker_rejects_unverified_group_policy_status_summary() {
+        let tracker = SideEffectClaimTracker::default();
+        let response = "Todo listo y verificado con prueba real desde el grupo.\n\nEstado actual:\n- Grupo: S86 - XXXX\n- Modo: managed_group - respondo a todos los mensajes\n- Job vinculado: s86-xxxx-drive-uploader verificado end-to-end";
+
+        let claim = tracker
+            .unverified_final_response_claim(response)
+            .expect("unverified policy claim");
+
+        assert_eq!(
+            claim.event,
+            "final_response_unverified_whatsapp_group_policy"
+        );
     }
 
     #[test]

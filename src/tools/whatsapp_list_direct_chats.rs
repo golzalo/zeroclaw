@@ -53,10 +53,7 @@ impl Tool for WhatsAppListDirectChatsTool {
                 chat.display_name
                     .to_ascii_lowercase()
                     .contains(query.as_str())
-                    || chat
-                        .chat_jid
-                        .to_ascii_lowercase()
-                        .contains(query.as_str())
+                    || chat.chat_jid.to_ascii_lowercase().contains(query.as_str())
                     || chat
                         .canonical_phone
                         .as_deref()

@@ -12,8 +12,7 @@ struct PendingToolBlock {
 
 fn is_runtime_user_message(content: &str) -> bool {
     let trimmed = content.trim_start();
-    trimmed.starts_with("[Tool results]")
-        || trimmed.starts_with("[Autonomous continuation]")
+    trimmed.starts_with("[Tool results]") || trimmed.starts_with("[Autonomous continuation]")
 }
 
 fn is_legacy_resume_user_message(content: &str) -> bool {
@@ -159,8 +158,7 @@ pub fn save_history(
     history: &[ChatMessage],
 ) -> anyhow::Result<String> {
     let dir = history_dir(workspace_dir);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
     let persisted = canonicalize_history(
         history
@@ -181,28 +179,30 @@ pub fn save_history(
     let relative_path = format!("subagent_history/{safe}.json");
 
     let json = serde_json::to_string(&kept).context("failed to serialize subagent history")?;
-    std::fs::write(&full_path, json)
-        .with_context(|| format!("failed to write subagent history to {}", full_path.display()))?;
+    std::fs::write(&full_path, json).with_context(|| {
+        format!(
+            "failed to write subagent history to {}",
+            full_path.display()
+        )
+    })?;
 
     Ok(relative_path)
 }
 
 /// Loads a previously saved history file and drops any legacy internal artifacts
 /// that may still exist in older snapshots.
-pub fn load_history(
-    workspace_dir: &Path,
-    relative_path: &str,
-) -> anyhow::Result<Vec<ChatMessage>> {
+pub fn load_history(workspace_dir: &Path, relative_path: &str) -> anyhow::Result<Vec<ChatMessage>> {
     let full_path = workspace_dir.join(relative_path);
-    let json = std::fs::read_to_string(&full_path)
-        .with_context(|| format!("failed to read subagent history from {}", full_path.display()))?;
+    let json = std::fs::read_to_string(&full_path).with_context(|| {
+        format!(
+            "failed to read subagent history from {}",
+            full_path.display()
+        )
+    })?;
     let loaded: Vec<ChatMessage> =
         serde_json::from_str(&json).context("failed to deserialize subagent history")?;
     Ok(canonicalize_history(
-        loaded
-            .into_iter()
-            .filter(should_persist_message)
-            .collect(),
+        loaded.into_iter().filter(should_persist_message).collect(),
     ))
 }
 

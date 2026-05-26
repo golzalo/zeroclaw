@@ -1,6 +1,6 @@
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::agent::side_effect_claims::{SideEffectClaimTracker, UnverifiedSideEffectClaim};
 use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
+use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -399,103 +399,15 @@ const SCHEDULING_FAILURE_HINTS: &[&str] = &[
     "unable",
 ];
 
-const POLICY_PROCEDURE_INPUT_HINTS: &[&str] = &[
-    "[audio:",
-    "[document:",
-    "[file:",
-    "[image attachment]",
-    "[image:",
-    "[video:",
-    "normalized_document.v1",
-    "visual_analysis.v1",
-    "visualanalysisv1",
-];
+const BOUND_PROCEDURE_TOOL_NAMES: &[&str] = &["whatsapp_run_policy_procedure"];
+const BOUND_PROCEDURE_TOOL_NAME_SUFFIX: &str = "_run_policy_procedure";
 
-const POLICY_PROCEDURE_SUCCESS_CLAIM_HINTS: &[&str] = &[
-    "actualicé",
-    "actualice",
-    "actualiz",
-    "append",
-    "appended",
-    "cread",
-    "creé",
-    "cree",
-    "created",
-    "enviad",
-    "envié",
-    "envie",
-    "guardad",
-    "guardé",
-    "guarde",
-    "procesad",
-    "procesé",
-    "procese",
-    "processed",
-    "recorded",
-    "registrad",
-    "registré",
-    "registre",
-    "saved",
-    "sent",
-    "subí",
-    "subi",
-    "subid",
-    "subió",
-    "subio",
-    "subieron",
-    "uploaded",
-    "wrote",
-    "written",
-];
+const MAX_BOUND_PROCEDURE_CONTRACT_REPAIRS_PER_TURN: usize = 3;
 
-const POLICY_PROCEDURE_FAILURE_CLAIM_HINTS: &[&str] = &[
-    "blocked",
-    "could not",
-    "error",
-    "failed",
-    "fallo",
-    "falló",
-    "falta",
-    "faltan",
-    "invalid",
-    "missing",
-    "need",
-    "needs",
-    "necesit",
-    "no hay",
-    "no pude",
-    "no puedo",
-    "no se pudo",
-    "no subí",
-    "no subi",
-    "no trae",
-    "sin adjuntos",
-    "unable",
-    "requier",
-    "require",
-    "requires",
-    "required",
-];
-
-const POLICY_PROCEDURE_NON_FAILURE_ERROR_PHRASES: &[&str] = &[
-    "sin errores",
-    "sin error",
-    "0 errores",
-    "0 error",
-    "cero errores",
-    "ningún error",
-    "ningun error",
-    "no hubo errores",
-    "no hubo error",
-    "no errors",
-    "no error",
-    "without errors",
-    "without error",
-    "zero errors",
-    "error-free",
-];
-
-const MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN: usize = 3;
+static BOUND_PROCEDURE_LOCAL_INPUT_REF_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(/(?:zeroclaw-data/workspace|workspace)/[^\]\r\n"'<>]+)"#)
+        .expect("valid bound procedure local input ref regex")
+});
 
 const SERVICE_BUILDER_COMPLETION_HINTS: &[&str] = &[
     "cada 5 minutos",
@@ -711,7 +623,10 @@ fn strip_service_job_signal_lines(text: &str) -> String {
         .to_string()
 }
 
-fn build_delegate_resume_instruction(full_prompt: &str, checkpoint: &ContinuationCheckpoint) -> String {
+fn build_delegate_resume_instruction(
+    full_prompt: &str,
+    checkpoint: &ContinuationCheckpoint,
+) -> String {
     let trimmed_prompt = full_prompt.trim();
     let original_request = checkpoint.original_request.trim();
 
@@ -866,59 +781,738 @@ fn response_claims_service_builder_completion(display_text: &str) -> bool {
             .any(|hint| lowered.contains(hint))
 }
 
-fn latest_user_turn_has_policy_procedure_input(history: &[ChatMessage]) -> bool {
-    let Some(last_user) = latest_human_user_message(history) else {
-        return false;
-    };
-    let lowered = last_user.to_lowercase();
-    POLICY_PROCEDURE_INPUT_HINTS
-        .iter()
-        .any(|hint| lowered.contains(hint))
+fn is_bound_procedure_tool_name(tool_name: &str) -> bool {
+    BOUND_PROCEDURE_TOOL_NAMES.contains(&tool_name)
+        || tool_name.ends_with(BOUND_PROCEDURE_TOOL_NAME_SUFFIX)
 }
 
-fn active_turn_has_bound_policy_procedure_input(history: &[ChatMessage]) -> bool {
-    let has_bound_procedure = history.iter().any(|message| {
-        message.role == "system"
-            && message.content.contains("Conversation policy procedure:")
-            && message.content.contains("bound on-demand tenant job")
-            && message.content.contains("whatsapp_run_policy_procedure")
-    });
-
-    has_bound_procedure && latest_user_turn_has_policy_procedure_input(history)
+#[derive(Debug, Clone, Default)]
+struct BoundProcedureTurnInputFacts {
+    refs: HashSet<String>,
+    has_text: bool,
+    has_attachment: bool,
+    has_document: bool,
+    has_visual_analysis: bool,
+    has_normalized_document: bool,
 }
 
-fn response_claims_policy_procedure_success(display_text: &str) -> bool {
-    let lowered = display_text.to_lowercase();
-    let mut failure_scan_text = lowered.clone();
-    for phrase in POLICY_PROCEDURE_NON_FAILURE_ERROR_PHRASES {
-        failure_scan_text = failure_scan_text.replace(phrase, "");
+impl BoundProcedureTurnInputFacts {
+    fn has_any_runtime_input(&self) -> bool {
+        self.has_attachment
+            || self.has_document
+            || self.has_visual_analysis
+            || self.has_normalized_document
+            || !self.refs.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BoundProcedureRuntimeInputRequirement {
+    text: bool,
+    attachment: bool,
+    visual_analysis: bool,
+    normalized_document: bool,
+}
+
+impl BoundProcedureRuntimeInputRequirement {
+    fn has_any_requirement(self) -> bool {
+        self.text || self.attachment || self.visual_analysis || self.normalized_document
     }
 
-    POLICY_PROCEDURE_SUCCESS_CLAIM_HINTS
-        .iter()
-        .any(|hint| lowered.contains(hint))
-        && !POLICY_PROCEDURE_FAILURE_CLAIM_HINTS
-            .iter()
-            .any(|hint| failure_scan_text.contains(hint))
+    fn is_satisfied_by(self, facts: &BoundProcedureTurnInputFacts) -> bool {
+        (!self.text || facts.has_text)
+            && (!self.attachment || facts.has_attachment || !facts.refs.is_empty())
+            && (!self.visual_analysis || facts.has_visual_analysis)
+            && (!self.normalized_document || facts.has_normalized_document)
+    }
 }
 
-fn policy_procedure_claim_limit_message(history: &[ChatMessage], attempts: usize) -> String {
+#[derive(Debug, Clone, Default)]
+struct BoundProcedurePolicyState {
+    active: bool,
+    job_slug: Option<String>,
+    requirement: Option<BoundProcedureRuntimeInputRequirement>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BoundProcedureConversationState {
+    prior_bound_procedure_decision: bool,
+    prior_input_refs: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BoundProcedureInputBundle {
+    current_turn_input: BoundProcedureTurnInputFacts,
+    policy_state: BoundProcedurePolicyState,
+    conversation_state: BoundProcedureConversationState,
+}
+
+impl BoundProcedureInputBundle {
+    fn effective_current_turn_refs(&self) -> HashSet<String> {
+        self.current_turn_input
+            .refs
+            .difference(&self.conversation_state.prior_input_refs)
+            .cloned()
+            .collect()
+    }
+
+    fn effective_current_turn_input(&self) -> BoundProcedureTurnInputFacts {
+        let mut facts = self.current_turn_input.clone();
+        let raw_ref_count = facts.refs.len();
+        facts.refs = self.effective_current_turn_refs();
+
+        if self
+            .policy_state
+            .requirement
+            .is_some_and(|requirement| requirement.attachment)
+            && raw_ref_count > facts.refs.len()
+            && facts.refs.is_empty()
+        {
+            facts.has_attachment = false;
+            facts.has_document = false;
+        }
+
+        facts
+    }
+
+    fn current_turn_satisfies_policy(&self) -> bool {
+        if !self.policy_state.active {
+            return false;
+        }
+
+        let Some(requirement) = self.policy_state.requirement else {
+            return false;
+        };
+
+        requirement.is_satisfied_by(&self.effective_current_turn_input())
+    }
+
+    fn trace_payload(&self) -> serde_json::Value {
+        let effective_current_turn_input = self.effective_current_turn_input();
+        serde_json::json!({
+            "policy_state": {
+                "active": self.policy_state.active,
+                "job_slug": self.policy_state.job_slug.as_deref(),
+                "requirement": self.policy_state.requirement.map(|requirement| serde_json::json!({
+                    "text": requirement.text,
+                    "attachment": requirement.attachment,
+                    "visual_analysis": requirement.visual_analysis,
+                    "normalized_document": requirement.normalized_document,
+                })),
+            },
+            "current_turn_input": {
+                "has_text": self.current_turn_input.has_text,
+                "has_attachment": self.current_turn_input.has_attachment,
+                "has_document": self.current_turn_input.has_document,
+                "has_visual_analysis": self.current_turn_input.has_visual_analysis,
+                "has_normalized_document": self.current_turn_input.has_normalized_document,
+                "ref_count": self.current_turn_input.refs.len(),
+                "effective_ref_count": effective_current_turn_input.refs.len(),
+            },
+            "conversation_state": {
+                "prior_bound_procedure_decision": self.conversation_state.prior_bound_procedure_decision,
+                "prior_input_ref_count": self.conversation_state.prior_input_refs.len(),
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum BoundProcedureToolInputViolation {
+    MissingRequiredCurrentTurnInput {
+        requirement: BoundProcedureRuntimeInputRequirement,
+    },
+    StaleInputRefs {
+        stale_refs: Vec<String>,
+        current_refs: Vec<String>,
+    },
+}
+
+fn active_bound_procedure_context(history: &[ChatMessage]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == "system"
+                && message.content.contains("Conversation policy procedure:")
+                && message.content.contains("bound on-demand tenant job")
+        })
+        .map(|message| message.content.as_str())
+}
+
+fn has_active_bound_procedure(history: &[ChatMessage]) -> bool {
+    active_bound_procedure_context(history).is_some()
+}
+
+fn bound_procedure_input_contract_slice(context: &str) -> Option<&str> {
+    let marker = "Procedure input contract:\n";
+    let start = context.find(marker)? + marker.len();
+    let tail = &context[start..];
+    let mut end = tail.len();
+    for stop in [
+        "\n\nBefore calling the procedure",
+        "\n\nProcedure output contract:",
+        "\n\nProcedure claim contract:",
+        "\n\nProcedure SOP:",
+        "\n\nConversation policy:",
+        "\n\n## Tools",
+        "\n\n## Tool Use Protocol",
+    ] {
+        if let Some(index) = tail.find(stop) {
+            end = end.min(index);
+        }
+    }
+    Some(tail[..end].trim()).filter(|value| !value.is_empty())
+}
+
+fn parse_bound_procedure_input_contract(contract: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(contract)
+        .ok()
+        .or_else(|| {
+            serde_yaml::from_str::<serde_yaml::Value>(contract)
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok())
+        })
+        .and_then(|value| {
+            let contract = value
+                .get("procedure_input_contract")
+                .or_else(|| value.get("input_contract"))
+                .cloned()
+                .unwrap_or(value);
+            contract.as_object().is_some().then_some(contract)
+        })
+}
+
+fn bound_procedure_runtime_input_requirement_from_contract(
+    contract: &serde_json::Value,
+) -> Option<BoundProcedureRuntimeInputRequirement> {
+    let schema_version = contract
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)?;
+    if schema_version != "procedure_input_contract.v1" {
+        return None;
+    }
+
+    let required_inputs = contract
+        .get("required_current_turn_inputs")
+        .and_then(serde_json::Value::as_array)?;
+    let mut requirement = BoundProcedureRuntimeInputRequirement::default();
+
+    for input in required_inputs
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+    {
+        match input {
+            "text" => requirement.text = true,
+            "attachments[]" => requirement.attachment = true,
+            "visual_analysis.v1" => requirement.visual_analysis = true,
+            "normalized_document.v1" => requirement.normalized_document = true,
+            _ => return None,
+        }
+    }
+
+    requirement.has_any_requirement().then_some(requirement)
+}
+
+fn extract_bound_procedure_job_slug(context: &str) -> Option<String> {
+    let marker = "tenant job `";
+    let start = context.find(marker)? + marker.len();
+    let end = context[start..].find('`')?;
+    let slug = context[start..start + end].trim();
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
+fn normalize_bound_procedure_input_ref(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_end_matches(|ch: char| ch == ',' || ch == ';')
+        .trim();
+
+    if let Some(rest) = trimmed.strip_prefix("/zeroclaw-data/workspace/") {
+        return Some(format!("/workspace/{rest}"));
+    }
+
+    trimmed
+        .starts_with("/workspace/")
+        .then(|| trimmed.to_string())
+}
+
+fn collect_bound_procedure_input_refs_from_text(content: &str) -> HashSet<String> {
+    BOUND_PROCEDURE_LOCAL_INPUT_REF_REGEX
+        .captures_iter(content)
+        .filter_map(|captures| captures.get(1))
+        .filter_map(|matched| normalize_bound_procedure_input_ref(matched.as_str()))
+        .collect()
+}
+
+fn collect_bound_procedure_input_refs_from_value(
+    value: &serde_json::Value,
+    refs: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            refs.extend(collect_bound_procedure_input_refs_from_text(text));
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_bound_procedure_input_refs_from_value(item, refs);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_bound_procedure_input_refs_from_value(value, refs);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn line_is_bound_procedure_runtime_marker(line: &str) -> bool {
+    let lowered = line.trim().to_lowercase();
+    lowered.is_empty()
+        || lowered == "sources:"
+        || lowered.starts_with("[audio:")
+        || lowered.starts_with("[document:")
+        || lowered.starts_with("[file:")
+        || lowered.starts_with("[image:")
+        || lowered.starts_with("[image attachment]")
+        || lowered.starts_with("[/image attachment]")
+        || lowered.starts_with("[video:")
+        || lowered.starts_with("[voice:")
+        || lowered.starts_with("<id:")
+        || lowered.starts_with("- /workspace/")
+        || lowered.starts_with("- /zeroclaw-data/workspace/")
+        || lowered.starts_with("/workspace/")
+        || lowered.starts_with("/zeroclaw-data/workspace/")
+        || lowered.starts_with("visual analysis:")
+        || lowered.starts_with("visualanalysisv1")
+        || lowered.starts_with("visual_analysis.v1")
+        || lowered.starts_with("normalized_document.v1")
+}
+
+fn latest_user_turn_has_freeform_text(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| !line_is_bound_procedure_runtime_marker(line))
+}
+
+fn latest_user_turn_bound_procedure_input_facts(
+    history: &[ChatMessage],
+) -> BoundProcedureTurnInputFacts {
+    latest_human_user_message(history)
+        .map(bound_procedure_input_facts_from_user_turn)
+        .unwrap_or_default()
+}
+
+fn bound_procedure_input_facts_from_user_turn(content: &str) -> BoundProcedureTurnInputFacts {
+    let lowered = content.to_lowercase();
+    let refs = collect_bound_procedure_input_refs_from_text(content);
+    let has_text = latest_user_turn_has_freeform_text(content);
+    let has_document = lowered.contains("[document:") || lowered.contains("normalized_document.v1");
+    let has_visual_analysis = lowered.contains("visual_analysis.v1")
+        || lowered.contains("visualanalysisv1")
+        || lowered.contains("visual analysis v1");
+    let has_normalized_document = lowered.contains("normalized_document.v1");
+    let has_attachment = has_document
+        || lowered.contains("[audio:")
+        || lowered.contains("[file:")
+        || lowered.contains("[image attachment]")
+        || lowered.contains("[image:")
+        || lowered.contains("[video:")
+        || lowered.contains("[voice:")
+        || refs.iter().any(|value| value.contains("/attachments/"));
+
+    BoundProcedureTurnInputFacts {
+        refs,
+        has_text,
+        has_attachment,
+        has_document,
+        has_visual_analysis,
+        has_normalized_document,
+    }
+}
+
+fn bound_procedure_runtime_input_requirement_from_context(
+    context: &str,
+) -> Option<BoundProcedureRuntimeInputRequirement> {
+    let input_contract = bound_procedure_input_contract_slice(context)?;
+    let contract = parse_bound_procedure_input_contract(input_contract)?;
+    bound_procedure_runtime_input_requirement_from_contract(&contract)
+}
+
+pub(crate) fn bound_procedure_input_contract_requires_attachment_storage_only(
+    input_contract: &str,
+) -> bool {
+    parse_bound_procedure_input_contract(input_contract)
+        .as_ref()
+        .and_then(bound_procedure_runtime_input_requirement_from_contract)
+        .is_some_and(|requirement| {
+            requirement.attachment
+                && !requirement.visual_analysis
+                && !requirement.normalized_document
+        })
+}
+
+pub(crate) fn bound_procedure_input_contract_requires_attachment_input(
+    input_contract: &str,
+) -> bool {
+    parse_bound_procedure_input_contract(input_contract)
+        .as_ref()
+        .and_then(bound_procedure_runtime_input_requirement_from_contract)
+        .is_some_and(|requirement| requirement.attachment)
+}
+
+pub(crate) fn bound_procedure_input_contract_requires_visual_analysis_input(
+    input_contract: &str,
+) -> bool {
+    parse_bound_procedure_input_contract(input_contract)
+        .as_ref()
+        .and_then(bound_procedure_runtime_input_requirement_from_contract)
+        .is_some_and(|requirement| requirement.visual_analysis)
+}
+
+fn bound_procedure_runtime_input_requirement(
+    history: &[ChatMessage],
+) -> Option<BoundProcedureRuntimeInputRequirement> {
+    active_bound_procedure_context(history)
+        .and_then(bound_procedure_runtime_input_requirement_from_context)
+}
+
+fn bound_procedure_policy_state(history: &[ChatMessage]) -> BoundProcedurePolicyState {
+    let Some(context) = active_bound_procedure_context(history) else {
+        return BoundProcedurePolicyState::default();
+    };
+
+    BoundProcedurePolicyState {
+        active: true,
+        job_slug: extract_bound_procedure_job_slug(context),
+        requirement: bound_procedure_runtime_input_requirement_from_context(context),
+    }
+}
+
+fn bound_procedure_conversation_state(history: &[ChatMessage]) -> BoundProcedureConversationState {
+    let history_before_current_turn = history
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map(|last_user_index| &history[..last_user_index])
+        .unwrap_or(history);
+    let mut prior_input_refs = HashSet::new();
+
+    for message in history_before_current_turn {
+        if message.role == "user" {
+            prior_input_refs.extend(collect_bound_procedure_input_refs_from_text(
+                &message.content,
+            ));
+        }
+    }
+
+    let prior_bound_procedure_decision = history_before_current_turn.iter().any(|message| {
+        (message.role == "tool" || message.role == "assistant")
+            && (message.content.contains("_run_policy_procedure")
+                || message.content.contains("procedure_ok:")
+                || message
+                    .content
+                    .contains("[Raw bound procedure payload omitted from chat history.]"))
+    });
+
+    BoundProcedureConversationState {
+        prior_bound_procedure_decision,
+        prior_input_refs,
+    }
+}
+
+fn bound_procedure_input_bundle(history: &[ChatMessage]) -> BoundProcedureInputBundle {
+    BoundProcedureInputBundle {
+        current_turn_input: latest_user_turn_bound_procedure_input_facts(history),
+        policy_state: bound_procedure_policy_state(history),
+        conversation_state: bound_procedure_conversation_state(history),
+    }
+}
+
+fn latest_user_turn_has_bound_procedure_input(history: &[ChatMessage]) -> bool {
+    let bundle = bound_procedure_input_bundle(history);
+    let current_turn_input = bundle.effective_current_turn_input();
+    current_turn_input.has_any_runtime_input()
+        || bundle
+            .policy_state
+            .requirement
+            .is_some_and(|requirement| requirement.text && current_turn_input.has_text)
+}
+
+fn active_turn_has_bound_procedure_input(history: &[ChatMessage]) -> bool {
+    bound_procedure_input_bundle(history).policy_state.active
+        && latest_user_turn_has_bound_procedure_input(history)
+}
+
+fn active_turn_satisfies_bound_procedure_runtime_input(history: &[ChatMessage]) -> bool {
+    bound_procedure_input_bundle(history).current_turn_satisfies_policy()
+}
+
+fn should_force_storage_only_image_context_for_bound_procedure(history: &[ChatMessage]) -> bool {
+    let Some(requirement) = bound_procedure_runtime_input_requirement(history) else {
+        return false;
+    };
+    requirement.attachment
+        && !requirement.visual_analysis
+        && !requirement.normalized_document
+        && latest_human_user_message(history).is_some_and(|content| {
+            multimodal::parse_image_markers(content)
+                .1
+                .iter()
+                .any(|reference| !reference.trim().is_empty())
+        })
+}
+
+fn validate_bound_procedure_tool_call_current_turn_input(
+    history: &[ChatMessage],
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+) -> Option<BoundProcedureToolInputViolation> {
+    if !is_bound_procedure_tool_name(tool_name) {
+        return None;
+    }
+
+    let bundle = bound_procedure_input_bundle(history);
+    let facts = bundle.effective_current_turn_input();
+    let mut call_refs = HashSet::new();
+    collect_bound_procedure_input_refs_from_value(tool_args, &mut call_refs);
+
+    let mut stale_refs = call_refs
+        .difference(&facts.refs)
+        .cloned()
+        .collect::<Vec<_>>();
+    stale_refs.sort();
+    if !stale_refs.is_empty() {
+        let mut current_refs = facts.refs.iter().cloned().collect::<Vec<_>>();
+        current_refs.sort();
+        return Some(BoundProcedureToolInputViolation::StaleInputRefs {
+            stale_refs,
+            current_refs,
+        });
+    }
+
+    if let Some(requirement) = bundle.policy_state.requirement {
+        if requirement.attachment && !facts.refs.is_empty() && call_refs.is_empty() {
+            return Some(
+                BoundProcedureToolInputViolation::MissingRequiredCurrentTurnInput { requirement },
+            );
+        }
+        if !requirement.is_satisfied_by(&facts) {
+            return Some(
+                BoundProcedureToolInputViolation::MissingRequiredCurrentTurnInput { requirement },
+            );
+        }
+    }
+
+    None
+}
+
+fn bound_procedure_tool_available(tools_registry: &[Box<dyn Tool>]) -> Option<&str> {
+    tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .find(|tool_name| is_bound_procedure_tool_name(tool_name))
+}
+
+fn mime_type_for_attachment_ref(path: &str) -> String {
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string()
+}
+
+fn build_bound_procedure_attachment_input(refs: &HashSet<String>) -> Vec<serde_json::Value> {
+    let mut refs = refs.iter().cloned().collect::<Vec<_>>();
+    refs.sort();
+    refs.into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let filename = Path::new(&path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("attachment-{}", index + 1));
+            let mime_type = mime_type_for_attachment_ref(&path);
+            serde_json::json!({
+                "filename": filename.clone(),
+                "fileName": filename.clone(),
+                "name": filename,
+                "mimeType": mime_type,
+                "path": path.clone(),
+                "localPath": path,
+            })
+        })
+        .collect()
+}
+
+fn synthesize_bound_procedure_tool_call_from_current_turn(
+    history: &[ChatMessage],
+    tools_registry: &[Box<dyn Tool>],
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+) -> Option<ParsedToolCall> {
+    let bundle = bound_procedure_input_bundle(history);
+    if !bundle.current_turn_satisfies_policy() {
+        return None;
+    }
+
+    let requirement = bundle.policy_state.requirement?;
+    if !requirement.attachment || requirement.visual_analysis || requirement.normalized_document {
+        return None;
+    }
+
+    let facts = bundle.effective_current_turn_input();
+    if facts.refs.is_empty() {
+        return None;
+    }
+
+    let tool_name = bound_procedure_tool_available(tools_registry)?;
+    let mut arguments = serde_json::json!({
+        "input": {
+            "attachments": build_bound_procedure_attachment_input(&facts.refs),
+        }
+    });
+    maybe_normalize_bound_policy_procedure_call(
+        tool_name,
+        &mut arguments,
+        channel_name,
+        channel_reply_target,
+    );
+
+    validate_bound_procedure_tool_call_current_turn_input(history, tool_name, &arguments)
+        .is_none()
+        .then(|| ParsedToolCall {
+            name: tool_name.to_string(),
+            arguments,
+            tool_call_id: Some(format!(
+                "call_auto_bound_procedure_{}",
+                Uuid::new_v4().simple()
+            )),
+        })
+}
+
+fn maybe_fill_bound_procedure_tool_call_from_current_turn(
+    history: &[ChatMessage],
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+) -> bool {
+    if !is_bound_procedure_tool_name(tool_name) {
+        return false;
+    }
+
+    let bundle = bound_procedure_input_bundle(history);
+    if !bundle.current_turn_satisfies_policy() {
+        return false;
+    }
+
+    let Some(requirement) = bundle.policy_state.requirement else {
+        return false;
+    };
+    if !requirement.attachment || requirement.visual_analysis || requirement.normalized_document {
+        return false;
+    }
+
+    let facts = bundle.effective_current_turn_input();
+    if facts.refs.is_empty() {
+        return false;
+    }
+
+    let mut call_refs = HashSet::new();
+    collect_bound_procedure_input_refs_from_value(tool_args, &mut call_refs);
+    if !call_refs.is_empty() {
+        return false;
+    }
+
+    if !tool_args.is_object() {
+        *tool_args = serde_json::json!({});
+    }
+    if let Some(args) = tool_args.as_object_mut() {
+        let input = args
+            .entry("input".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !input.is_object() {
+            *input = serde_json::json!({});
+        }
+        if let Some(input) = input.as_object_mut() {
+            input.insert(
+                "attachments".to_string(),
+                serde_json::Value::Array(build_bound_procedure_attachment_input(&facts.refs)),
+            );
+            return true;
+        }
+    }
+
+    false
+}
+
+fn bound_procedure_contract_limit_message(history: &[ChatMessage], attempts: usize) -> String {
     if prefers_spanish_for_user_message(history, None, None) {
         format!(
-            "No pude confirmar la ejecución del procedimiento: el asistente intentó reclamar éxito {attempts} veces sin un resultado exitoso de `whatsapp_run_policy_procedure` en este turno. Corté los reintentos para evitar un falso positivo."
+            "No pude confirmar esta acción después de {attempts} intentos con la evidencia disponible. Corté los reintentos para evitar un falso positivo."
         )
     } else {
         format!(
-            "I could not confirm the procedure execution: the assistant tried to claim success {attempts} times without a successful `whatsapp_run_policy_procedure` result in this turn. I stopped retrying to avoid a false positive."
+            "I could not confirm this action after {attempts} attempts with the available evidence. I stopped retrying to avoid a false positive."
         )
+    }
+}
+
+fn tool_failure_is_incomplete_procedure_handoff(tool_name: &str, reason: &str) -> bool {
+    let lowered = reason.to_ascii_lowercase();
+    tool_name == "whatsapp_configure_conversation_policy"
+        && (lowered.contains("missing procedure artifact")
+            || lowered.contains("procedure_input_schema")
+            || lowered.contains("procedure_input_contract")
+            || lowered.contains("procedure_output_contract")
+            || lowered.contains("procedure_claim_contract")
+            || lowered.contains("procedure_minimum_valid_call")
+            || lowered.contains("procedure_sop"))
+}
+
+fn user_facing_tool_failure_reason(tool_name: &str, reason: &str, prefer_spanish: bool) -> String {
+    if tool_failure_is_incomplete_procedure_handoff(tool_name, reason) {
+        return if prefer_spanish {
+            "No pude terminar la configuración porque el proceso quedó con información interna incompleta. Hay que regenerar o reparar el handoff del proceso y reintentar la activación."
+                .to_string()
+        } else {
+            "I could not finish the configuration because the process handoff is incomplete. The process handoff must be regenerated or repaired before activation is retried."
+                .to_string()
+        };
+    }
+
+    scrub_credentials(reason)
+}
+
+fn bound_procedure_tool_input_violation_repair_prompt(
+    violation: &BoundProcedureToolInputViolation,
+) -> String {
+    match violation {
+        BoundProcedureToolInputViolation::MissingRequiredCurrentTurnInput { requirement } => {
+            format!(
+                "The bound procedure tool call is invalid for the current turn: the procedure input/output contract requires current-turn runtime input ({requirement:?}), but the latest user turn does not contain it. Do not run the procedure with historical input. Reply briefly with the contract's missing/invalid-input blocker, or wait for a new valid input turn."
+            )
+        }
+        BoundProcedureToolInputViolation::StaleInputRefs {
+            stale_refs,
+            current_refs,
+        } => {
+            format!(
+                "The bound procedure tool call is invalid: it used local input references that are not present in the latest user turn. Stale refs: {stale_refs:?}. Current-turn refs: {current_refs:?}. Rebuild the tool call using only current-turn input references, or if the current turn does not satisfy the contract, reply briefly with that blocker. Do not reuse historical attachments."
+            )
+        }
     }
 }
 
 fn looks_like_service_contract_confirmation(content: &str) -> bool {
     let normalized = normalize_resume_instruction_for_comparison(content);
-    let trimmed = normalized.trim_matches(|ch: char| {
-        ch.is_ascii_punctuation() || ch == '¡' || ch == '¿'
-    });
+    let trimmed =
+        normalized.trim_matches(|ch: char| ch.is_ascii_punctuation() || ch == '¡' || ch == '¿');
 
     matches!(
         trimmed,
@@ -1023,21 +1617,33 @@ fn is_placeholder_service_job_slug(slug: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         normalized.as_str(),
-        "" | "job" | "slug" | "target" | "target-id" | "target_id" | "existing-job"
-            | "existing_job" | "slug-if-known"
+        "" | "job"
+            | "slug"
+            | "target"
+            | "target-id"
+            | "target_id"
+            | "existing-job"
+            | "existing_job"
+            | "slug-if-known"
     )
 }
 
 fn extract_service_builder_job_slug(content: &str) -> Option<String> {
     for capture in SERVICE_BUILDER_TARGET_SIGNAL_REGEX.captures_iter(content) {
-        let slug = capture.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+        let slug = capture
+            .get(1)
+            .map(|m| m.as_str().trim())
+            .unwrap_or_default();
         if !is_placeholder_service_job_slug(slug) {
             return Some(slug.to_string());
         }
     }
 
     for capture in SERVICE_BUILDER_INLINE_SLUG_REGEX.captures_iter(content) {
-        let slug = capture.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+        let slug = capture
+            .get(1)
+            .map(|m| m.as_str().trim())
+            .unwrap_or_default();
         if !is_placeholder_service_job_slug(slug) {
             return Some(slug.to_string());
         }
@@ -1049,7 +1655,10 @@ fn extract_service_builder_job_slug(content: &str) -> Option<String> {
         &*SERVICE_JOB_COMMAND_REGEX,
     ] {
         for capture in regex.captures_iter(content) {
-            let slug = capture.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+            let slug = capture
+                .get(1)
+                .map(|m| m.as_str().trim())
+                .unwrap_or_default();
             if !is_placeholder_service_job_slug(slug) {
                 return Some(slug.to_string());
             }
@@ -1066,12 +1675,11 @@ fn pending_service_builder_contract_before(
     let mut pending_contract: Option<PendingServiceBuilderContract> = None;
     for message in history.iter().take(end_index) {
         if is_service_builder_pending_contract_message(message) {
-            let proposed_slug = extract_service_builder_job_slug(&message.content)
-                .or_else(|| {
-                    pending_contract
-                        .as_ref()
-                        .and_then(|contract| contract.proposed_slug.clone())
-                });
+            let proposed_slug = extract_service_builder_job_slug(&message.content).or_else(|| {
+                pending_contract
+                    .as_ref()
+                    .and_then(|contract| contract.proposed_slug.clone())
+            });
             pending_contract = Some(PendingServiceBuilderContract {
                 proposed_slug,
                 contract_text: truncate_with_ellipsis(&message.content, 7000),
@@ -1087,11 +1695,8 @@ fn pending_service_builder_contract_before(
 fn latest_confirmed_pending_service_builder_contract(
     history: &[ChatMessage],
 ) -> Option<PendingServiceBuilderContract> {
-    let (latest_user_index, latest_user) = history
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, message)| {
+    let (latest_user_index, latest_user) =
+        history.iter().enumerate().rev().find(|(_, message)| {
             message.role == "user" && !is_runtime_user_message(&message.content)
         })?;
 
@@ -1099,13 +1704,9 @@ fn latest_confirmed_pending_service_builder_contract(
         return None;
     }
 
-    if history
-        .iter()
-        .skip(latest_user_index + 1)
-        .any(|message| {
-            is_service_builder_done_message(message) || is_service_builder_blocked_message(message)
-        })
-    {
+    if history.iter().skip(latest_user_index + 1).any(|message| {
+        is_service_builder_done_message(message) || is_service_builder_blocked_message(message)
+    }) {
         return None;
     }
 
@@ -1152,7 +1753,10 @@ fn build_confirmed_service_builder_delegate_prompt(
     let original_prompt = original_prompt.trim();
     if !original_prompt.is_empty() {
         let _ = writeln!(prompt);
-        let _ = writeln!(prompt, "Original delegate prompt from main, for context only:");
+        let _ = writeln!(
+            prompt,
+            "Original delegate prompt from main, for context only:"
+        );
         let _ = writeln!(prompt, "{}", truncate_with_ellipsis(original_prompt, 3000));
     }
     let _ = writeln!(prompt);
@@ -1182,7 +1786,8 @@ fn maybe_normalize_confirmed_service_builder_delegate_prompt(
         .get("prompt")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    let normalized_prompt = build_confirmed_service_builder_delegate_prompt(history, original_prompt)?;
+    let normalized_prompt =
+        build_confirmed_service_builder_delegate_prompt(history, original_prompt)?;
     args.insert(
         "prompt".to_string(),
         serde_json::Value::String(normalized_prompt.clone()),
@@ -1312,11 +1917,28 @@ fn side_effect_claim_trace_payload(
     }
 }
 
+fn can_enforce_side_effect_claim_repairs_from_tool_names<'a>(
+    tool_names: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    tool_names.into_iter().any(|name| {
+        matches!(
+            name,
+            "whatsapp_configure_conversation_policy"
+                | "whatsapp_list_observed_groups"
+                | "whatsapp_unobserve_group"
+        )
+    })
+}
+
+fn can_enforce_side_effect_claim_repairs(tools_registry: &[Box<dyn Tool>]) -> bool {
+    can_enforce_side_effect_claim_repairs_from_tool_names(
+        tools_registry.iter().map(|tool| tool.name()),
+    )
+}
+
 pub(crate) fn render_continuation_checkpoint_block(checkpoint: &ContinuationCheckpoint) -> String {
     let payload = serde_json::to_string(checkpoint).unwrap_or_else(|_| "{}".to_string());
-    format!(
-        "{CONTINUATION_CHECKPOINT_OPEN_TAG}\n{payload}\n{CONTINUATION_CHECKPOINT_CLOSE_TAG}"
-    )
+    format!("{CONTINUATION_CHECKPOINT_OPEN_TAG}\n{payload}\n{CONTINUATION_CHECKPOINT_CLOSE_TAG}")
 }
 
 fn render_continuation_checkpoint_reference_block(scope_key: &str, agent_name: &str) -> String {
@@ -1374,17 +1996,19 @@ fn looks_like_continue_request(message: &str) -> bool {
         .map(str::trim)
         .unwrap_or_else(|| message.trim())
         .to_ascii_lowercase()
-        .replace(['\n', '\r', '\t', ',', '.', '!', '?', ';', ':', '¿', '¡'], " ");
+        .replace(
+            ['\n', '\r', '\t', ',', '.', '!', '?', ';', ':', '¿', '¡'],
+            " ",
+        );
     if normalized.is_empty() || normalized.chars().count() > 80 {
         return false;
     }
 
-    let normalized = normalized
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    CONTINUE_REQUEST_HINTS.iter().any(|hint| normalized == *hint)
+    CONTINUE_REQUEST_HINTS
+        .iter()
+        .any(|hint| normalized == *hint)
 }
 
 fn resume_directive_already_injected(
@@ -1483,7 +2107,9 @@ fn latest_effective_original_request(history: &[ChatMessage]) -> Option<String> 
                 None
             }
         })
-        .or_else(|| latest_continuation_checkpoint(history).map(|checkpoint| checkpoint.original_request))
+        .or_else(|| {
+            latest_continuation_checkpoint(history).map(|checkpoint| checkpoint.original_request)
+        })
         .or_else(|| latest_human_user_message(history).map(|message| message.trim().to_string()))
 }
 
@@ -1577,15 +2203,11 @@ fn parse_response_language_policy_value(raw: &str) -> Option<ResponseLanguagePol
 }
 
 fn system_message_runtime_policy(message: &str) -> ConversationRuntimePolicy {
-    let autonomous_continuation = extract_policy_attribute_value(
-        message,
-        "autonomous_continuation",
-    )
-    .or_else(|| extract_policy_tag_value(message, "autonomous_continuation"))
-    .or_else(|| {
-        extract_policy_setting_value(message, "zeroclaw.autonomous_continuation")
-    })
-    .and_then(|value| parse_autonomous_policy_value(&value));
+    let autonomous_continuation =
+        extract_policy_attribute_value(message, "autonomous_continuation")
+            .or_else(|| extract_policy_tag_value(message, "autonomous_continuation"))
+            .or_else(|| extract_policy_setting_value(message, "zeroclaw.autonomous_continuation"))
+            .and_then(|value| parse_autonomous_policy_value(&value));
 
     let response_language = extract_policy_attribute_value(message, "response_language")
         .or_else(|| extract_policy_tag_value(message, "response_language"))
@@ -1636,13 +2258,12 @@ fn autonomous_continuation_authorized(history: &[ChatMessage]) -> bool {
         || latest_autonomous_continuation_approval(history).unwrap_or(false)
 }
 
-pub(crate) fn build_resume_from_checkpoint_message(checkpoint: &ContinuationCheckpoint) -> ChatMessage {
-    let original_request =
-        truncate_resume_directive_original_request(&checkpoint.original_request);
-    let completed_work =
-        truncate_resume_directive_progress_field(&checkpoint.completed_work);
-    let pending_work =
-        truncate_resume_directive_progress_field(&checkpoint.pending_work);
+pub(crate) fn build_resume_from_checkpoint_message(
+    checkpoint: &ContinuationCheckpoint,
+) -> ChatMessage {
+    let original_request = truncate_resume_directive_original_request(&checkpoint.original_request);
+    let completed_work = truncate_resume_directive_progress_field(&checkpoint.completed_work);
+    let pending_work = truncate_resume_directive_progress_field(&checkpoint.pending_work);
     let target_section =
         render_continuation_target_section(checkpoint.continuation_target.as_ref());
     let target_section_break = if target_section.is_empty() { "" } else { "\n" };
@@ -1740,7 +2361,8 @@ pub(crate) async fn maybe_auto_continue_delegate(
     }
 
     let result = delegate_tool.execute(args).await?;
-    let raw_output = if result.success {
+    let result_success = result.success;
+    let raw_output = if result_success {
         result.output
     } else {
         result.error.unwrap_or_default()
@@ -1748,7 +2370,7 @@ pub(crate) async fn maybe_auto_continue_delegate(
 
     // Extract a new continuation checkpoint from the delegate output, if any.
     let (display_text, continuation) =
-        normalize_tool_output_for_history("delegate", &raw_output, false);
+        normalize_tool_output_for_history("delegate", &raw_output, result_success, false);
 
     if let Some(mut checkpoint) = continuation {
         let prefers_spanish = prefers_spanish_for_user_message(history, Some(&checkpoint), None);
@@ -1759,11 +2381,7 @@ pub(crate) async fn maybe_auto_continue_delegate(
             prefers_spanish,
         )
         .unwrap_or_else(|| {
-            build_user_facing_continuation_message(
-                &checkpoint,
-                ask_to_continue,
-                prefers_spanish,
-            )
+            build_user_facing_continuation_message(&checkpoint, ask_to_continue, prefers_spanish)
         });
         let continuation_message = render_continuation_history_message_with_reference(
             root_scope,
@@ -1852,7 +2470,9 @@ pub(crate) fn maybe_inject_resume_from_persistent_checkpoint(
         return false;
     }
 
-    let Ok(Some(checkpoint)) = task_checkpoint_store::load_checkpoint(workspace_dir, scope_key, agent_name) else {
+    let Ok(Some(checkpoint)) =
+        task_checkpoint_store::load_checkpoint(workspace_dir, scope_key, agent_name)
+    else {
         return false;
     };
 
@@ -1934,7 +2554,8 @@ fn checkpoint_source_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
     history[start..]
         .iter()
         .filter(|message| {
-            !(message.role == "assistant" && extract_continuation_checkpoint(&message.content).is_some())
+            !(message.role == "assistant"
+                && extract_continuation_checkpoint(&message.content).is_some())
         })
         .cloned()
         .collect()
@@ -2195,7 +2816,8 @@ fn append_checkpoint_response_options(text: &str, prefers_spanish: bool) -> Stri
         return combined;
     }
 
-    let head_budget = CONTINUATION_CHECKPOINT_FIELD_CHAR_LIMIT.saturating_sub(suffix.chars().count());
+    let head_budget =
+        CONTINUATION_CHECKPOINT_FIELD_CHAR_LIMIT.saturating_sub(suffix.chars().count());
     if head_budget == 0 {
         return truncate_checkpoint_field(trimmed);
     }
@@ -2436,18 +3058,15 @@ fn parse_continuation_checkpoint_response(
     let ask_to_continue = !autonomous_continuation_authorized(history);
     let prefers_spanish =
         prefers_spanish_for_user_message(history, Some(&checkpoint), Some(&fallback));
-    checkpoint.user_message = sanitized_model_user_message(
-        &parsed.user_message,
-        ask_to_continue,
-        prefers_spanish,
-    )
-    .unwrap_or_else(|| {
-        build_user_facing_continuation_message(
-            &checkpoint,
-            ask_to_continue,
-            prefers_spanish,
-        )
-    });
+    checkpoint.user_message =
+        sanitized_model_user_message(&parsed.user_message, ask_to_continue, prefers_spanish)
+            .unwrap_or_else(|| {
+                build_user_facing_continuation_message(
+                    &checkpoint,
+                    ask_to_continue,
+                    prefers_spanish,
+                )
+            });
     checkpoint
 }
 
@@ -5072,6 +5691,102 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
+fn build_assistant_history_with_parsed_tool_calls(
+    text: &str,
+    tool_calls: &[ParsedToolCall],
+) -> String {
+    let mut parts = Vec::new();
+
+    if !text.trim().is_empty() {
+        parts.push(text.trim().to_string());
+    }
+
+    for call in tool_calls {
+        let mut payload = serde_json::json!({
+            "name": call.name.clone(),
+            "arguments": call.arguments.clone(),
+        });
+        if let Some(tool_call_id) = &call.tool_call_id {
+            payload
+                .as_object_mut()
+                .expect("tool call payload should be an object")
+                .insert(
+                    "id".to_string(),
+                    serde_json::Value::String(tool_call_id.clone()),
+                );
+        }
+        parts.push(format!("<tool_call>\n{payload}\n</tool_call>"));
+    }
+
+    parts.join("\n")
+}
+
+fn bound_procedure_tool_arguments_history_placeholder() -> serde_json::Value {
+    serde_json::json!({
+        "input": "[omitted from chat history; use only current-turn contract input]"
+    })
+}
+
+fn sanitize_bound_procedure_tool_calls_for_history(
+    tool_calls: &[ParsedToolCall],
+) -> Vec<ParsedToolCall> {
+    tool_calls
+        .iter()
+        .map(|call| {
+            if is_bound_procedure_tool_name(&call.name) {
+                ParsedToolCall {
+                    name: call.name.clone(),
+                    arguments: bound_procedure_tool_arguments_history_placeholder(),
+                    tool_call_id: call.tool_call_id.clone(),
+                }
+            } else {
+                call.clone()
+            }
+        })
+        .collect()
+}
+
+fn sanitize_bound_procedure_tool_history_content(
+    assistant_history_content: &str,
+    tool_calls: &[ParsedToolCall],
+) -> String {
+    if !tool_calls
+        .iter()
+        .any(|call| is_bound_procedure_tool_name(&call.name))
+    {
+        return assistant_history_content.to_string();
+    }
+
+    let placeholder_arguments =
+        serde_json::to_string(&bound_procedure_tool_arguments_history_placeholder())
+            .unwrap_or_else(|_| "{}".to_string());
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(assistant_history_content) {
+        if let Some(calls) = value
+            .get_mut("tool_calls")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for call in calls {
+                let is_bound = call
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_bound_procedure_tool_name);
+                if is_bound {
+                    if let Some(object) = call.as_object_mut() {
+                        object.insert(
+                            "arguments".to_string(),
+                            serde_json::Value::String(placeholder_arguments.clone()),
+                        );
+                    }
+                }
+            }
+            return value.to_string();
+        }
+    }
+
+    let sanitized_calls = sanitize_bound_procedure_tool_calls_for_history(tool_calls);
+    build_assistant_history_with_parsed_tool_calls("", &sanitized_calls)
+}
+
 fn resolve_display_text(
     response_text: &str,
     parsed_text: &str,
@@ -5349,13 +6064,13 @@ fn maybe_inject_channel_delivery_defaults(
     }
 }
 
-fn maybe_normalize_whatsapp_policy_procedure_call(
+fn maybe_normalize_bound_policy_procedure_call(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
     channel_name: &str,
     channel_reply_target: Option<&str>,
 ) {
-    if tool_name != "whatsapp_run_policy_procedure" {
+    if !is_bound_procedure_tool_name(tool_name) {
         return;
     }
 
@@ -5380,7 +6095,7 @@ fn maybe_normalize_whatsapp_policy_procedure_call(
                 .unwrap_or("");
             if previous != reply_target {
                 tracing::debug!(
-                    tool = "whatsapp_run_policy_procedure",
+                    tool = tool_name,
                     previous_chat_jid = previous,
                     chat_jid = reply_target,
                     "Bound WhatsApp policy procedure call to current reply target"
@@ -5428,9 +6143,9 @@ fn maybe_normalize_whatsapp_policy_procedure_call(
                 serde_json::Value::Object(_) => "object",
             };
             tracing::warn!(
-                tool = "whatsapp_run_policy_procedure",
+                tool = tool_name,
                 input_type = input_type,
-                "Replacing malformed policy procedure input with lifted current-turn fields"
+                "Replacing malformed bound policy procedure input with lifted current-turn fields"
             );
             serde_json::Map::new()
         }
@@ -5468,8 +6183,7 @@ fn maybe_normalize_tenant_service_announce_cron_prompt(
     else {
         return;
     };
-    let Some(resolved) =
-        resolve_tenant_service_announce_prompt_candidate(raw_path, workspace_dir)
+    let Some(resolved) = resolve_tenant_service_announce_prompt_candidate(raw_path, workspace_dir)
     else {
         return;
     };
@@ -5585,13 +6299,19 @@ fn latest_user_message_batch_multiplier(history: &[ChatMessage]) -> usize {
             m.content
                 .trim()
                 .to_ascii_lowercase()
-                .replace(['\n', '\r', '\t', ',', '.', '!', '?', ';', ':', '¿', '¡'], " ")
+                .replace(
+                    ['\n', '\r', '\t', ',', '.', '!', '?', ';', ':', '¿', '¡'],
+                    " ",
+                )
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
         })
         .unwrap_or_default();
-    if BATCH_CONTINUATION_HINTS.iter().any(|hint| *hint == last.as_str()) {
+    if BATCH_CONTINUATION_HINTS
+        .iter()
+        .any(|hint| *hint == last.as_str())
+    {
         10
     } else {
         1
@@ -5642,9 +6362,1086 @@ fn maybe_inject_delegate_resume_metadata(
     }
 }
 
+fn bound_procedure_history_string_field<'a>(
+    value: &'a serde_json::Value,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn bound_procedure_history_count_field(value: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_i64))
+}
+
+fn push_bound_procedure_history_field(lines: &mut Vec<String>, key: &str, value: &str) {
+    let value = truncate_with_ellipsis(&scrub_credentials(value.trim()), 500);
+    if !value.is_empty() {
+        lines.push(format!("{key}: {value}"));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundProcedureTerminalOutcome {
+    Success,
+    Partial,
+    Blocked,
+    Failure,
+    Unconfirmed,
+}
+
+impl BoundProcedureTerminalOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Partial => "partial",
+            Self::Blocked => "blocked",
+            Self::Failure => "failure",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+
+    fn is_success(self) -> bool {
+        matches!(self, Self::Success)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BoundProcedureTerminalReply {
+    outcome: BoundProcedureTerminalOutcome,
+    text: String,
+    evidence: BoundProcedureTerminalEvidence,
+}
+
+#[derive(Debug, Clone)]
+struct BoundProcedureTerminalEvidence {
+    tool_name: String,
+    tool_success: bool,
+    output_json_parseable: bool,
+    claim_contract_present: bool,
+    claim_contract_matched: bool,
+    used_delivery_text: bool,
+    reason: &'static str,
+}
+
+impl BoundProcedureTerminalEvidence {
+    fn new(tool_name: &str, tool_success: bool) -> Self {
+        Self {
+            tool_name: tool_name.to_string(),
+            tool_success,
+            output_json_parseable: false,
+            claim_contract_present: false,
+            claim_contract_matched: false,
+            used_delivery_text: false,
+            reason: "not_evaluated",
+        }
+    }
+
+    fn trace_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tool": self.tool_name,
+            "tool_success": self.tool_success,
+            "output_json_parseable": self.output_json_parseable,
+            "claim_contract_present": self.claim_contract_present,
+            "claim_contract_matched": self.claim_contract_matched,
+            "used_delivery_text": self.used_delivery_text,
+            "reason": self.reason,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BoundProcedureTerminalCounts {
+    processed: Option<i64>,
+    succeeded: Option<i64>,
+    failed: Option<i64>,
+    skipped: Option<i64>,
+}
+
+impl BoundProcedureTerminalCounts {
+    fn any(self) -> bool {
+        self.processed.is_some()
+            || self.succeeded.is_some()
+            || self.failed.is_some()
+            || self.skipped.is_some()
+    }
+}
+
+fn bound_procedure_count_field_from_sources(
+    envelope: &serde_json::Value,
+    procedure: &serde_json::Value,
+    keys: &[&str],
+) -> Option<i64> {
+    bound_procedure_history_count_field(procedure, keys)
+        .or_else(|| bound_procedure_history_count_field(envelope, keys))
+        .or_else(|| {
+            procedure
+                .get("counts")
+                .and_then(|counts| bound_procedure_history_count_field(counts, keys))
+        })
+        .or_else(|| {
+            procedure
+                .get("summary")
+                .and_then(|summary| bound_procedure_history_count_field(summary, keys))
+        })
+        .or_else(|| {
+            envelope
+                .get("counts")
+                .and_then(|counts| bound_procedure_history_count_field(counts, keys))
+        })
+        .or_else(|| {
+            envelope
+                .get("summary")
+                .and_then(|summary| bound_procedure_history_count_field(summary, keys))
+        })
+        .or_else(|| {
+            envelope
+                .get("output")
+                .and_then(|output| output.get("counts"))
+                .and_then(|counts| bound_procedure_history_count_field(counts, keys))
+        })
+        .or_else(|| {
+            envelope
+                .get("output")
+                .and_then(|output| output.get("summary"))
+                .and_then(|summary| bound_procedure_history_count_field(summary, keys))
+        })
+}
+
+fn bound_procedure_terminal_counts(
+    envelope: &serde_json::Value,
+    procedure: &serde_json::Value,
+) -> BoundProcedureTerminalCounts {
+    BoundProcedureTerminalCounts {
+        processed: bound_procedure_count_field_from_sources(
+            envelope,
+            procedure,
+            &[
+                "processedCount",
+                "processed_count",
+                "processedFilesCount",
+                "processed_files_count",
+                "detectedAttachmentsCount",
+                "detected_attachments_count",
+                "attachmentCount",
+                "attachment_count",
+                "totalAttachments",
+                "total_attachments",
+                "inputCount",
+                "input_count",
+                "rowsWrittenCount",
+                "rows_written_count",
+            ],
+        ),
+        succeeded: bound_procedure_count_field_from_sources(
+            envelope,
+            procedure,
+            &[
+                "uploadedCount",
+                "uploaded_count",
+                "successCount",
+                "success_count",
+                "succeededCount",
+                "succeeded_count",
+                "rowsWrittenCount",
+                "rows_written_count",
+                "writtenCount",
+                "written_count",
+            ],
+        ),
+        failed: bound_procedure_count_field_from_sources(
+            envelope,
+            procedure,
+            &[
+                "failedCount",
+                "failed_count",
+                "failureCount",
+                "failure_count",
+                "errorCount",
+                "error_count",
+                "errorsCount",
+                "errors_count",
+            ],
+        ),
+        skipped: bound_procedure_count_field_from_sources(
+            envelope,
+            procedure,
+            &[
+                "skippedCount",
+                "skipped_count",
+                "skippedDuplicateCount",
+                "skipped_duplicate_count",
+                "duplicateCount",
+                "duplicatesCount",
+            ],
+        ),
+    }
+}
+
+fn bound_procedure_terminal_counts_text(
+    counts: BoundProcedureTerminalCounts,
+    prefer_spanish: bool,
+) -> Option<String> {
+    if !counts.any() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(count) = counts.processed {
+        parts.push(if prefer_spanish {
+            format!("Procesados: {count}")
+        } else {
+            format!("Processed: {count}")
+        });
+    }
+    if let Some(count) = counts.succeeded {
+        parts.push(if prefer_spanish {
+            format!("Exitosos: {count}")
+        } else {
+            format!("Succeeded: {count}")
+        });
+    }
+    if let Some(count) = counts.failed {
+        parts.push(if prefer_spanish {
+            format!("Fallidos: {count}")
+        } else {
+            format!("Failed: {count}")
+        });
+    }
+    if let Some(count) = counts.skipped {
+        parts.push(if prefer_spanish {
+            format!("Omitidos: {count}")
+        } else {
+            format!("Skipped: {count}")
+        });
+    }
+
+    Some(parts.join(". "))
+}
+
+fn bound_procedure_product_detail(detail: Option<String>, prefer_spanish: bool) -> Option<String> {
+    let detail = detail?;
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    let lowered = detail.to_ascii_lowercase();
+    if lowered.contains("procedure_claim_contract")
+        || lowered.contains("procedure_input_contract")
+        || lowered.contains("procedure_output_contract")
+        || lowered.contains("procedure_minimum_valid_call")
+        || lowered.contains("procedure_sop")
+        || lowered.contains("bound procedure")
+        || lowered.contains("procedure_required")
+        || lowered.contains("claim_contract")
+        || lowered.contains("sidecar")
+    {
+        return Some(if prefer_spanish {
+            "la configuracion interna de la accion quedo incompleta".to_string()
+        } else {
+            "the action configuration is incomplete".to_string()
+        });
+    }
+    Some(truncate_with_ellipsis(&scrub_credentials(detail), 800))
+}
+
+fn bound_procedure_product_reply_text(
+    outcome: BoundProcedureTerminalOutcome,
+    counts: BoundProcedureTerminalCounts,
+    detail: Option<String>,
+    success_text: Option<String>,
+    prefer_spanish: bool,
+) -> (String, bool) {
+    let counts_text = bound_procedure_terminal_counts_text(counts, prefer_spanish);
+    match outcome {
+        BoundProcedureTerminalOutcome::Success => {
+            if let Some(counts_text) = counts_text {
+                let text = if prefer_spanish {
+                    format!("Listo: la accion se completo correctamente. {counts_text}.")
+                } else {
+                    format!("Done: the action completed successfully. {counts_text}.")
+                };
+                (text, false)
+            } else if let Some(text) = success_text {
+                (text, true)
+            } else {
+                let text = if prefer_spanish {
+                    "Listo: la accion se completo correctamente.".to_string()
+                } else {
+                    "Done: the action completed successfully.".to_string()
+                };
+                (text, false)
+            }
+        }
+        BoundProcedureTerminalOutcome::Partial => {
+            let detail = bound_procedure_product_detail(detail, prefer_spanish);
+            let mut text = if prefer_spanish {
+                "La accion se completo parcialmente.".to_string()
+            } else {
+                "The action completed partially.".to_string()
+            };
+            if let Some(counts_text) = counts_text {
+                text.push(' ');
+                text.push_str(&counts_text);
+                text.push('.');
+            }
+            if let Some(detail) = detail {
+                text.push(' ');
+                text.push_str(&detail);
+            }
+            (text, false)
+        }
+        BoundProcedureTerminalOutcome::Blocked => {
+            let detail = bound_procedure_product_detail(detail, prefer_spanish);
+            let mut text = if prefer_spanish {
+                "No pude completar la accion porque falta una condicion necesaria.".to_string()
+            } else {
+                "I could not complete the action because a required condition is missing."
+                    .to_string()
+            };
+            if let Some(counts_text) = counts_text {
+                text.push(' ');
+                text.push_str(&counts_text);
+                text.push('.');
+            }
+            if let Some(detail) = detail {
+                text.push(' ');
+                text.push_str(&detail);
+            }
+            (text, false)
+        }
+        BoundProcedureTerminalOutcome::Failure => {
+            let detail = bound_procedure_product_detail(detail, prefer_spanish);
+            let mut text = if prefer_spanish {
+                "No pude completar la accion.".to_string()
+            } else {
+                "I could not complete the action.".to_string()
+            };
+            if let Some(counts_text) = counts_text {
+                text.push(' ');
+                text.push_str(&counts_text);
+                text.push('.');
+            }
+            if let Some(detail) = detail {
+                text.push(' ');
+                text.push_str(&detail);
+            }
+            (text, false)
+        }
+        BoundProcedureTerminalOutcome::Unconfirmed => {
+            let text = if prefer_spanish {
+                "No pude confirmar el resultado de esta ejecucion. No voy a declarar exito ni fallo sin evidencia verificable.".to_string()
+            } else {
+                "I could not confirm the result of this run. I will not claim success or failure without verifiable evidence.".to_string()
+            };
+            (text, false)
+        }
+    }
+}
+
+fn bound_procedure_text_field(
+    envelope: &serde_json::Value,
+    procedure: &serde_json::Value,
+    keys: &[&str],
+) -> Option<String> {
+    bound_procedure_history_string_field(procedure, keys)
+        .or_else(|| bound_procedure_history_string_field(envelope, keys))
+        .map(|value| truncate_with_ellipsis(&scrub_credentials(value), 1200))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn bound_procedure_claim_contract_slice(context: &str) -> Option<&str> {
+    let marker = "Procedure claim contract:\n";
+    let start = context.find(marker)? + marker.len();
+    let tail = &context[start..];
+    let mut end = tail.len();
+    for stop in [
+        "\n\nAfter the procedure returns",
+        "\n\nProcedure SOP:",
+        "\n\nConversation policy:",
+        "\n\n## Tools",
+        "\n\n## Tool Use Protocol",
+    ] {
+        if let Some(index) = tail.find(stop) {
+            end = end.min(index);
+        }
+    }
+    Some(tail[..end].trim()).filter(|value| !value.is_empty())
+}
+
+fn bound_procedure_claim_contract(history: &[ChatMessage]) -> Option<&str> {
+    active_bound_procedure_context(history).and_then(bound_procedure_claim_contract_slice)
+}
+
+fn parse_bound_procedure_claim_contract(contract: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(contract)
+        .ok()
+        .or_else(|| {
+            serde_yaml::from_str::<serde_yaml::Value>(contract)
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok())
+        })
+        .and_then(|value| {
+            let contract = value
+                .get("procedure_claim_contract")
+                .or_else(|| value.get("claim_contract"))
+                .cloned()
+                .unwrap_or(value);
+            contract.as_object().is_some().then_some(contract)
+        })
+}
+
+fn value_at_bound_procedure_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+        let (key, index) = if let Some(open_index) = segment.find('[') {
+            let key = &segment[..open_index];
+            let index = segment[open_index + 1..]
+                .strip_suffix(']')
+                .and_then(|raw| raw.parse::<usize>().ok());
+            (key, index)
+        } else {
+            (segment, None)
+        };
+
+        if !key.is_empty() {
+            current = current.get(key)?;
+        }
+        if let Some(index) = index {
+            current = current.get(index)?;
+        }
+    }
+    Some(current)
+}
+
+fn bound_procedure_claim_path_values(
+    envelope: &serde_json::Value,
+    procedure: &serde_json::Value,
+    tool_success: bool,
+    path: &str,
+) -> Vec<serde_json::Value> {
+    let normalized = path.trim();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    for alias in bound_procedure_claim_path_aliases(normalized) {
+        if alias == "tool_success" {
+            return vec![serde_json::Value::Bool(tool_success)];
+        }
+        if alias == "tool_failed" {
+            return vec![serde_json::Value::Bool(!tool_success)];
+        }
+
+        let values = bound_procedure_claim_values_for_path(envelope, procedure, &alias);
+        if !values.is_empty() {
+            return values;
+        }
+    }
+
+    Vec::new()
+}
+
+fn bound_procedure_claim_values_for_path(
+    envelope: &serde_json::Value,
+    procedure: &serde_json::Value,
+    path: &str,
+) -> Vec<serde_json::Value> {
+    let mut values = Vec::new();
+    if let Some(value) = value_at_bound_procedure_path(procedure, path) {
+        values.push(value.clone());
+    }
+    if let Some(value) = value_at_bound_procedure_path(envelope, path) {
+        values.push(value.clone());
+    }
+
+    if values.is_empty() && !path.contains('.') {
+        if let Some(output) = envelope.get("output") {
+            if let Some(value) = value_at_bound_procedure_path(output, path) {
+                values.push(value.clone());
+            }
+        }
+    }
+
+    values
+}
+
+fn bound_procedure_claim_path_aliases(path: &str) -> Vec<String> {
+    let canonical = match path {
+        "procedure_ok" => "ok",
+        "procedure_status" => "status",
+        other => other,
+    };
+    let mut aliases = vec![canonical.to_string()];
+    let final_segment = canonical
+        .rsplit_once('.')
+        .map(|(_, segment)| segment)
+        .unwrap_or(canonical);
+    let (key, suffix) = final_segment
+        .split_once('[')
+        .map(|(key, rest)| (key, format!("[{rest}")))
+        .unwrap_or_else(|| (final_segment, String::new()));
+
+    let replacements: &[&str] = match key {
+        "uploadedCount" | "uploaded_count" | "successCount" | "success_count"
+        | "succeededCount" | "succeeded_count" | "rowsWrittenCount" | "rows_written_count"
+        | "writtenCount" | "written_count" => &[
+            "uploadedCount",
+            "uploaded_count",
+            "successCount",
+            "success_count",
+            "succeededCount",
+            "succeeded_count",
+            "rowsWrittenCount",
+            "rows_written_count",
+            "writtenCount",
+            "written_count",
+        ],
+        "failedCount" | "failed_count" | "failureCount" | "failure_count" | "errorCount"
+        | "error_count" | "errorsCount" | "errors_count" => &[
+            "failedCount",
+            "failed_count",
+            "failureCount",
+            "failure_count",
+            "errorCount",
+            "error_count",
+            "errorsCount",
+            "errors_count",
+        ],
+        "processedCount"
+        | "processed_count"
+        | "processedFilesCount"
+        | "processed_files_count"
+        | "detectedAttachmentsCount"
+        | "detected_attachments_count" => &[
+            "processedCount",
+            "processed_count",
+            "processedFilesCount",
+            "processed_files_count",
+            "detectedAttachmentsCount",
+            "detected_attachments_count",
+        ],
+        _ => &[],
+    };
+
+    if !replacements.is_empty() {
+        let prefix = canonical
+            .strip_suffix(final_segment)
+            .unwrap_or_default()
+            .to_string();
+        for replacement in replacements {
+            aliases.push(format!("{prefix}{replacement}{suffix}"));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    aliases.retain(|alias| seen.insert(alias.clone()));
+    aliases
+}
+
+fn bound_procedure_json_number(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn bound_procedure_json_scalar_equals(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+) -> bool {
+    match (actual, expected) {
+        (serde_json::Value::Bool(left), serde_json::Value::Bool(right)) => left == right,
+        (serde_json::Value::Number(_), serde_json::Value::Number(_)) => {
+            bound_procedure_json_number(actual) == bound_procedure_json_number(expected)
+        }
+        (serde_json::Value::String(left), serde_json::Value::String(right)) => {
+            left.trim().eq_ignore_ascii_case(right.trim())
+        }
+        (serde_json::Value::Bool(left), serde_json::Value::String(right)) => right
+            .trim()
+            .eq_ignore_ascii_case(if *left { "true" } else { "false" }),
+        (serde_json::Value::String(left), serde_json::Value::Bool(right)) => left
+            .trim()
+            .eq_ignore_ascii_case(if *right { "true" } else { "false" }),
+        _ => actual == expected,
+    }
+}
+
+fn bound_procedure_claim_condition_matches(
+    condition: &serde_json::Value,
+    envelope: &serde_json::Value,
+    procedure: &serde_json::Value,
+    tool_success: bool,
+) -> Option<bool> {
+    if let Some(all) = condition.get("all").and_then(serde_json::Value::as_array) {
+        return Some(all.iter().all(|item| {
+            bound_procedure_claim_condition_matches(item, envelope, procedure, tool_success)
+                == Some(true)
+        }));
+    }
+    if let Some(any) = condition.get("any").and_then(serde_json::Value::as_array) {
+        return Some(any.iter().any(|item| {
+            bound_procedure_claim_condition_matches(item, envelope, procedure, tool_success)
+                == Some(true)
+        }));
+    }
+    if let Some(nested) = condition.get("when").or_else(|| condition.get("condition")) {
+        return bound_procedure_claim_condition_matches(nested, envelope, procedure, tool_success);
+    }
+    if let Some(conditions) = condition
+        .get("conditions")
+        .and_then(serde_json::Value::as_array)
+    {
+        return Some(conditions.iter().all(|item| {
+            bound_procedure_claim_condition_matches(item, envelope, procedure, tool_success)
+                == Some(true)
+        }));
+    }
+
+    let path = condition
+        .get("path")
+        .or_else(|| condition.get("field"))
+        .and_then(serde_json::Value::as_str)?;
+    let values = bound_procedure_claim_path_values(envelope, procedure, tool_success, path);
+
+    if let Some(expected_exists) = condition.get("exists").and_then(serde_json::Value::as_bool) {
+        let exists = values.iter().any(|value| !value.is_null());
+        return Some(exists == expected_exists);
+    }
+
+    if let Some(expected) = condition.get("equals").or_else(|| condition.get("eq")) {
+        return Some(
+            !values.is_empty()
+                && values
+                    .iter()
+                    .any(|actual| bound_procedure_json_scalar_equals(actual, expected)),
+        );
+    }
+    if let Some(expected) = condition
+        .get("not_equals")
+        .or_else(|| condition.get("notEquals"))
+    {
+        return Some(
+            !values.is_empty()
+                && values
+                    .iter()
+                    .all(|actual| !bound_procedure_json_scalar_equals(actual, expected)),
+        );
+    }
+    if let Some(expected_values) = condition.get("in").and_then(serde_json::Value::as_array) {
+        return Some(
+            !values.is_empty()
+                && values.iter().any(|actual| {
+                    expected_values
+                        .iter()
+                        .any(|expected| bound_procedure_json_scalar_equals(actual, expected))
+                }),
+        );
+    }
+
+    for (operator, canonical_operator) in [
+        ("gt", "gt"),
+        ("greater_than", "gt"),
+        ("greaterThan", "gt"),
+        ("gte", "gte"),
+        ("greater_than_or_equal", "gte"),
+        ("greaterThanOrEqual", "gte"),
+        ("lt", "lt"),
+        ("less_than", "lt"),
+        ("lessThan", "lt"),
+        ("lte", "lte"),
+        ("less_than_or_equal", "lte"),
+        ("lessThanOrEqual", "lte"),
+    ] {
+        if let Some(expected) = condition
+            .get(operator)
+            .and_then(bound_procedure_json_number)
+        {
+            return Some(values.iter().any(|actual| {
+                bound_procedure_json_number(actual).is_some_and(|actual| match canonical_operator {
+                    "gt" => actual > expected,
+                    "gte" => actual >= expected,
+                    "lt" => actual < expected,
+                    "lte" => actual <= expected,
+                    _ => false,
+                })
+            }));
+        }
+    }
+
+    None
+}
+
+fn bound_procedure_claim_outcome_condition<'a>(
+    contract: &'a serde_json::Value,
+    outcome: BoundProcedureTerminalOutcome,
+) -> Option<&'a serde_json::Value> {
+    let outcome_key = outcome.as_str();
+    contract
+        .get("outcomes")
+        .and_then(|outcomes| outcomes.get(outcome_key))
+        .or_else(|| contract.get(outcome_key))
+}
+
+fn bound_procedure_claim_outcome_matches(
+    condition: &serde_json::Value,
+    envelope: &serde_json::Value,
+    procedure: &serde_json::Value,
+    tool_success: bool,
+) -> bool {
+    match condition {
+        serde_json::Value::Array(items) => items.iter().all(|item| {
+            bound_procedure_claim_condition_matches(item, envelope, procedure, tool_success)
+                == Some(true)
+        }),
+        serde_json::Value::Object(_) => {
+            bound_procedure_claim_condition_matches(condition, envelope, procedure, tool_success)
+                == Some(true)
+        }
+        _ => false,
+    }
+}
+
+fn bound_procedure_terminal_outcome_from_claim_contract(
+    contract: &str,
+    envelope: &serde_json::Value,
+    procedure: &serde_json::Value,
+    tool_success: bool,
+) -> Option<BoundProcedureTerminalOutcome> {
+    let contract = parse_bound_procedure_claim_contract(contract)?;
+    let outcomes = if tool_success {
+        [
+            BoundProcedureTerminalOutcome::Blocked,
+            BoundProcedureTerminalOutcome::Partial,
+            BoundProcedureTerminalOutcome::Failure,
+            BoundProcedureTerminalOutcome::Success,
+        ]
+    } else {
+        [
+            BoundProcedureTerminalOutcome::Failure,
+            BoundProcedureTerminalOutcome::Blocked,
+            BoundProcedureTerminalOutcome::Partial,
+            BoundProcedureTerminalOutcome::Success,
+        ]
+    };
+    for outcome in outcomes {
+        if let Some(condition) = bound_procedure_claim_outcome_condition(&contract, outcome) {
+            if bound_procedure_claim_outcome_matches(condition, envelope, procedure, tool_success) {
+                return Some(outcome);
+            }
+        }
+    }
+    None
+}
+
+fn unconfirmed_bound_procedure_terminal_reply(
+    prefer_spanish: bool,
+    evidence: BoundProcedureTerminalEvidence,
+) -> BoundProcedureTerminalReply {
+    let (text, _) = bound_procedure_product_reply_text(
+        BoundProcedureTerminalOutcome::Unconfirmed,
+        BoundProcedureTerminalCounts::default(),
+        None,
+        None,
+        prefer_spanish,
+    );
+    BoundProcedureTerminalReply {
+        outcome: BoundProcedureTerminalOutcome::Unconfirmed,
+        text,
+        evidence,
+    }
+}
+
+fn bound_procedure_terminal_reply_from_output(
+    tool_name: &str,
+    output: &str,
+    tool_success: bool,
+    prefer_spanish: bool,
+    claim_contract: Option<&str>,
+) -> Option<BoundProcedureTerminalReply> {
+    if !is_bound_procedure_tool_name(tool_name) {
+        return None;
+    }
+
+    let mut evidence = BoundProcedureTerminalEvidence::new(tool_name, tool_success);
+    let claim_contract = claim_contract
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.contains("procedure_claim_contract.v1"));
+    evidence.claim_contract_present = claim_contract.is_some();
+    let trimmed = output.trim();
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+    let Some(envelope) = parsed.as_ref() else {
+        if claim_contract.is_some() {
+            evidence.reason = "unparseable_tool_output_with_claim_contract";
+            return Some(unconfirmed_bound_procedure_terminal_reply(
+                prefer_spanish,
+                evidence,
+            ));
+        }
+        if tool_success {
+            evidence.reason = "successful_tool_output_without_claim_contract";
+            return Some(unconfirmed_bound_procedure_terminal_reply(
+                prefer_spanish,
+                evidence,
+            ));
+        }
+        let excerpt = truncate_with_ellipsis(&scrub_credentials(trimmed), 800);
+        let text = if prefer_spanish {
+            format!("No pude completar la accion. Resultado: {excerpt}")
+        } else {
+            format!("I could not complete the action. Result: {excerpt}")
+        };
+        return Some(BoundProcedureTerminalReply {
+            outcome: BoundProcedureTerminalOutcome::Failure,
+            text,
+            evidence: BoundProcedureTerminalEvidence {
+                reason: "tool_execution_failed_without_json_output",
+                ..evidence
+            },
+        });
+    };
+    evidence.output_json_parseable = true;
+
+    let procedure = envelope.get("output").unwrap_or(envelope);
+    let counts = bound_procedure_terminal_counts(envelope, procedure);
+    let success_text = bound_procedure_text_field(
+        envelope,
+        procedure,
+        &[
+            "deliveryText",
+            "replyText",
+            "userMessage",
+            "summary",
+            "message",
+        ],
+    );
+    let detail = bound_procedure_text_field(
+        envelope,
+        procedure,
+        &["error", "reason", "summary", "message", "deliveryText"],
+    );
+
+    let Some(contract) = claim_contract else {
+        if !tool_success {
+            evidence.reason = "tool_execution_failed_without_claim_contract";
+            let detail = detail.unwrap_or_else(|| {
+                if prefer_spanish {
+                    "la herramienta no pudo ejecutarse correctamente".to_string()
+                } else {
+                    "the tool could not execute successfully".to_string()
+                }
+            });
+            let text = if prefer_spanish {
+                format!("No pude completar la accion: {detail}")
+            } else {
+                format!("I could not complete the action: {detail}")
+            };
+            return Some(BoundProcedureTerminalReply {
+                outcome: BoundProcedureTerminalOutcome::Failure,
+                text,
+                evidence,
+            });
+        }
+        evidence.reason = "missing_claim_contract";
+        return Some(unconfirmed_bound_procedure_terminal_reply(
+            prefer_spanish,
+            evidence,
+        ));
+    };
+
+    let outcome = bound_procedure_terminal_outcome_from_claim_contract(
+        contract,
+        envelope,
+        procedure,
+        tool_success,
+    );
+    let Some(outcome) = outcome else {
+        evidence.reason = "claim_contract_unmatched";
+        return Some(unconfirmed_bound_procedure_terminal_reply(
+            prefer_spanish,
+            evidence,
+        ));
+    };
+    evidence.claim_contract_matched = true;
+    evidence.reason = "claim_contract_matched";
+
+    let (text, used_delivery_text) = match outcome {
+        BoundProcedureTerminalOutcome::Unconfirmed => {
+            evidence.reason = "claim_contract_unconfirmed";
+            return Some(unconfirmed_bound_procedure_terminal_reply(
+                prefer_spanish,
+                evidence,
+            ));
+        }
+        _ => bound_procedure_product_reply_text(
+            outcome,
+            counts,
+            detail,
+            success_text,
+            prefer_spanish,
+        ),
+    };
+    evidence.used_delivery_text = used_delivery_text;
+
+    Some(BoundProcedureTerminalReply {
+        outcome,
+        text,
+        evidence,
+    })
+}
+
+fn compact_bound_procedure_output_for_history(
+    tool_name: &str,
+    output: &str,
+    success: bool,
+) -> Option<String> {
+    if !is_bound_procedure_tool_name(tool_name) {
+        return None;
+    }
+
+    let mut lines = vec![
+        "[Bound procedure result retained for contract verification]".to_string(),
+        format!("tool: {tool_name}"),
+        format!("tool_success: {success}"),
+    ];
+    let trimmed = output.trim();
+
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => {
+            let procedure = value.get("output").unwrap_or(&value);
+
+            if let Some(status) =
+                bound_procedure_history_string_field(&value, &["status", "code", "error_code"])
+            {
+                push_bound_procedure_history_field(&mut lines, "envelope_status", status);
+            }
+            if let Some(status) =
+                bound_procedure_history_string_field(procedure, &["status", "code", "error_code"])
+            {
+                push_bound_procedure_history_field(&mut lines, "procedure_status", status);
+            }
+            if let Some(job) = bound_procedure_history_string_field(procedure, &["job", "slug"]) {
+                push_bound_procedure_history_field(&mut lines, "job", job);
+            } else if let Some(job) = bound_procedure_history_string_field(&value, &["job", "slug"])
+            {
+                push_bound_procedure_history_field(&mut lines, "job", job);
+            }
+
+            if let Some(ok) = procedure.get("ok").and_then(serde_json::Value::as_bool) {
+                lines.push(format!("procedure_ok: {ok}"));
+            }
+
+            for (label, keys) in [
+                (
+                    "uploaded_count",
+                    &[
+                        "uploadedCount",
+                        "uploaded_count",
+                        "successCount",
+                        "success_count",
+                        "rowsWrittenCount",
+                    ][..],
+                ),
+                (
+                    "failed_count",
+                    &[
+                        "failedCount",
+                        "failed_count",
+                        "failureCount",
+                        "failure_count",
+                        "errorCount",
+                    ][..],
+                ),
+                (
+                    "processed_count",
+                    &[
+                        "processedFilesCount",
+                        "processedCount",
+                        "detectedAttachmentsCount",
+                    ][..],
+                ),
+                (
+                    "skipped_duplicate_count",
+                    &["skippedDuplicateCount", "duplicateCount", "duplicatesCount"][..],
+                ),
+            ] {
+                if let Some(count) = bound_procedure_history_count_field(procedure, keys) {
+                    lines.push(format!("{label}: {count}"));
+                }
+            }
+
+            if let Some(counts) = procedure.get("counts") {
+                for (label, keys) in [
+                    (
+                        "uploaded_count",
+                        &[
+                            "uploadedCount",
+                            "uploaded_count",
+                            "successCount",
+                            "success_count",
+                        ][..],
+                    ),
+                    (
+                        "failed_count",
+                        &[
+                            "failedCount",
+                            "failed_count",
+                            "failureCount",
+                            "failure_count",
+                        ][..],
+                    ),
+                    (
+                        "detected_count",
+                        &["detectedAttachmentsCount", "detectedCount"][..],
+                    ),
+                    (
+                        "skipped_duplicate_count",
+                        &["skippedDuplicateCount", "duplicateCount"][..],
+                    ),
+                ] {
+                    if let Some(count) = bound_procedure_history_count_field(counts, keys) {
+                        lines.push(format!("{label}: {count}"));
+                    }
+                }
+            }
+
+            if let Some(summary) =
+                bound_procedure_history_string_field(procedure, &["summary", "message"])
+            {
+                if !summary.trim().is_empty() {
+                    lines.push("summary_present: true".to_string());
+                }
+            }
+            if let Some(error) =
+                bound_procedure_history_string_field(procedure, &["error", "reason"])
+                    .or_else(|| bound_procedure_history_string_field(&value, &["error", "reason"]))
+            {
+                if !error.trim().is_empty() {
+                    lines.push("error_present: true".to_string());
+                }
+            }
+        }
+        Err(_) => {
+            lines.push("result_parseable: false".to_string());
+        }
+    }
+
+    lines.push("[Raw bound procedure payload omitted from chat history.]".to_string());
+    Some(lines.join("\n"))
+}
+
 fn normalize_tool_output_for_history(
     tool_name: &str,
     output: &str,
+    success: bool,
     auto_continue_delegate_checkpoints: bool,
 ) -> (String, Option<ContinuationCheckpoint>) {
     if tool_name == "delegate" {
@@ -5658,10 +7455,11 @@ fn normalize_tool_output_for_history(
         }
     }
 
-    (
-        compact_tool_output_for_history(output),
-        None,
-    )
+    if let Some(compact) = compact_bound_procedure_output_for_history(tool_name, output, success) {
+        return (compact, None);
+    }
+
+    (compact_tool_output_for_history(output), None)
 }
 
 fn build_autonomous_delegate_continuation_message(
@@ -6067,13 +7865,9 @@ pub(crate) async fn run_tool_call_loop(
 
     // Short-circuit: if the user replied Y/10x to a checkpoint prompt, auto-resume
     // the paused delegate directly without calling the root LLM.
-    if let Some(outcome) = maybe_auto_continue_delegate(
-        history,
-        tools_registry,
-        workspace_dir,
-        continuation_scope,
-    )
-    .await?
+    if let Some(outcome) =
+        maybe_auto_continue_delegate(history, tools_registry, workspace_dir, continuation_scope)
+            .await?
     {
         return Ok(outcome);
     }
@@ -6084,12 +7878,20 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    if multimodal::contains_image_markers(history) && multimodal_config.processor.enabled {
-        let processed = multimodal::preprocess_images_to_text_context(
+    if multimodal::contains_image_markers(history)
+        && (multimodal_config.processor.enabled
+            || should_force_storage_only_image_context_for_bound_procedure(history))
+    {
+        let processed = multimodal::preprocess_images_to_text_context_with_options(
             history,
             multimodal_config,
             reliability_config,
             workspace_dir,
+            multimodal::ImagePreprocessOptions {
+                force_latest_user_storage_only: false,
+                force_all_user_storage_only:
+                    should_force_storage_only_image_context_for_bound_procedure(history),
+            },
         )
         .await?;
         if processed {
@@ -6104,15 +7906,17 @@ pub(crate) async fn run_tool_call_loop(
     let turn_id = Uuid::new_v4().to_string();
     let mut scheduled_delivery_created = false;
     let mut scheduled_delivery_verified = false;
-    let mut policy_procedure_succeeded = false;
-    let mut policy_procedure_unverified_claims = 0usize;
+    let mut bound_procedure_succeeded = false;
+    let mut bound_procedure_failed = false;
+    let mut bound_procedure_contract_repair_attempts = 0usize;
+    let mut bound_procedure_terminal_reply: Option<BoundProcedureTerminalReply> = None;
     let mut side_effect_claims = SideEffectClaimTracker::default();
     let mut requests = Vec::new();
     let mut tool_failures = Vec::new();
     let mut blocked_by_policy: HashSet<(String, String)> = HashSet::new();
     let mut repeated_tool_failures: HashMap<(String, String, String), usize> = HashMap::new();
 
-    for iteration in 0..max_iterations {
+    'tool_loop: for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
         let mut repeated_failure_blocker: Option<String> = None;
 
@@ -6264,160 +8068,164 @@ pub(crate) async fn run_tool_call_loop(
             chat_future.await
         };
 
-        let (response_text, parsed_text, tool_calls, mut assistant_history_content, native_tool_calls) =
-            match chat_result {
-                Ok(resp) => {
-                    let (resp_input_tokens, resp_output_tokens) = resp
+        let (
+            response_text,
+            parsed_text,
+            mut tool_calls,
+            mut assistant_history_content,
+            native_tool_calls,
+        ) = match chat_result {
+            Ok(resp) => {
+                let (resp_input_tokens, resp_output_tokens) = resp
+                    .usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((None, None));
+
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                    input_tokens: resp_input_tokens,
+                    output_tokens: resp_output_tokens,
+                });
+                requests.push(LlmCallUsage {
+                    iteration: iteration + 1,
+                    #[allow(clippy::cast_possible_truncation)]
+                    duration_ms: llm_started_at.elapsed().as_millis() as u64,
+                    input_tokens: resp_input_tokens,
+                    output_tokens: resp_output_tokens,
+                    cached_input_tokens: resp
                         .usage
                         .as_ref()
-                        .map(|u| (u.input_tokens, u.output_tokens))
-                        .unwrap_or((None, None));
+                        .and_then(|usage| usage.cached_input_tokens),
+                    prompt: prompt_breakdown.clone(),
+                });
 
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                        input_tokens: resp_input_tokens,
-                        output_tokens: resp_output_tokens,
-                    });
-                    requests.push(LlmCallUsage {
-                        iteration: iteration + 1,
-                        #[allow(clippy::cast_possible_truncation)]
-                        duration_ms: llm_started_at.elapsed().as_millis() as u64,
-                        input_tokens: resp_input_tokens,
-                        output_tokens: resp_output_tokens,
-                        cached_input_tokens: resp
-                            .usage
-                            .as_ref()
-                            .and_then(|usage| usage.cached_input_tokens),
-                        prompt: prompt_breakdown.clone(),
-                    });
+                let response_text = resp.text_or_empty().to_string();
+                // First try native structured tool calls (OpenAI-format).
+                // Fall back to text-based parsing (XML tags, markdown blocks,
+                // GLM format) only if the provider returned no native calls —
+                // this ensures we support both native and prompt-guided models.
+                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let mut parsed_text = String::new();
 
-                    let response_text = resp.text_or_empty().to_string();
-                    // First try native structured tool calls (OpenAI-format).
-                    // Fall back to text-based parsing (XML tags, markdown blocks,
-                    // GLM format) only if the provider returned no native calls —
-                    // this ensures we support both native and prompt-guided models.
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
-
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
+                if calls.is_empty() {
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    if !fallback_text.is_empty() {
+                        parsed_text = fallback_text;
                     }
-
-                    if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls)
-                    {
-                        runtime_trace::record_event(
-                            "tool_call_parse_issue",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
-                            Some(&turn_id),
-                            Some(false),
-                            Some(&parse_issue),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "response_excerpt": truncate_with_ellipsis(
-                                    &scrub_credentials(&response_text),
-                                    600
-                                ),
-                            }),
-                        );
-                    }
-
-                    runtime_trace::record_event(
-                        "llm_response",
-                        Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
-                        Some(&turn_id),
-                        Some(true),
-                        None,
-                        serde_json::json!({
-                            "iteration": iteration + 1,
-                            "duration_ms": llm_started_at.elapsed().as_millis(),
-                            "input_tokens": resp_input_tokens,
-                            "output_tokens": resp_output_tokens,
-                            "cached_input_tokens": resp.usage.as_ref().and_then(|usage| usage.cached_input_tokens),
-                            "prompt": {
-                                "total_chars": prompt_breakdown.total_chars,
-                                "estimated_total_tokens": prompt_breakdown.estimated_total_tokens,
-                                "system_chars": prompt_breakdown.system_chars,
-                                "user_chars": prompt_breakdown.user_chars,
-                                "assistant_chars": prompt_breakdown.assistant_chars,
-                                "tool_chars": prompt_breakdown.tool_chars,
-                                "messages_count": prompt_breakdown.messages_count,
-                            },
-                            "raw_response": scrub_credentials(&response_text),
-                            "native_tool_calls": resp.tool_calls.len(),
-                            "parsed_tool_calls": calls.len(),
-                        }),
-                    );
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let reasoning_content = resp.reasoning_content.clone();
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        if use_native_tools {
-                            build_native_assistant_history_from_parsed_calls(
-                                &response_text,
-                                &calls,
-                                reasoning_content.as_deref(),
-                            )
-                            .unwrap_or_else(|| response_text.clone())
-                        } else {
-                            response_text.clone()
-                        }
-                    } else {
-                        build_native_assistant_history(
-                            &response_text,
-                            &resp.tool_calls,
-                            reasoning_content.as_deref(),
-                        )
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
-                    )
+                    calls = fallback_calls;
                 }
-                Err(e) => {
-                    let safe_error = crate::providers::sanitize_api_error(&e.to_string());
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(safe_error.clone()),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
+
+                if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls) {
                     runtime_trace::record_event(
-                        "llm_response",
+                        "tool_call_parse_issue",
                         Some(channel_name),
                         Some(provider_name),
                         Some(model),
                         Some(&turn_id),
                         Some(false),
-                        Some(&safe_error),
+                        Some(&parse_issue),
                         serde_json::json!({
                             "iteration": iteration + 1,
-                            "duration_ms": llm_started_at.elapsed().as_millis(),
+                            "response_excerpt": truncate_with_ellipsis(
+                                &scrub_credentials(&response_text),
+                                600
+                            ),
                         }),
                     );
-                    return Err(e);
                 }
-            };
+
+                runtime_trace::record_event(
+                    "llm_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                        "input_tokens": resp_input_tokens,
+                        "output_tokens": resp_output_tokens,
+                        "cached_input_tokens": resp.usage.as_ref().and_then(|usage| usage.cached_input_tokens),
+                        "prompt": {
+                            "total_chars": prompt_breakdown.total_chars,
+                            "estimated_total_tokens": prompt_breakdown.estimated_total_tokens,
+                            "system_chars": prompt_breakdown.system_chars,
+                            "user_chars": prompt_breakdown.user_chars,
+                            "assistant_chars": prompt_breakdown.assistant_chars,
+                            "tool_chars": prompt_breakdown.tool_chars,
+                            "messages_count": prompt_breakdown.messages_count,
+                        },
+                        "raw_response": scrub_credentials(&response_text),
+                        "native_tool_calls": resp.tool_calls.len(),
+                        "parsed_tool_calls": calls.len(),
+                    }),
+                );
+
+                // Preserve native tool call IDs in assistant history so role=tool
+                // follow-up messages can reference the exact call id.
+                let reasoning_content = resp.reasoning_content.clone();
+                let assistant_history_content = if resp.tool_calls.is_empty() {
+                    if use_native_tools {
+                        build_native_assistant_history_from_parsed_calls(
+                            &response_text,
+                            &calls,
+                            reasoning_content.as_deref(),
+                        )
+                        .unwrap_or_else(|| response_text.clone())
+                    } else {
+                        response_text.clone()
+                    }
+                } else {
+                    build_native_assistant_history(
+                        &response_text,
+                        &resp.tool_calls,
+                        reasoning_content.as_deref(),
+                    )
+                };
+
+                let native_calls = resp.tool_calls;
+                (
+                    response_text,
+                    parsed_text,
+                    calls,
+                    assistant_history_content,
+                    native_calls,
+                )
+            }
+            Err(e) => {
+                let safe_error = crate::providers::sanitize_api_error(&e.to_string());
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(safe_error.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+                runtime_trace::record_event(
+                    "llm_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(&safe_error),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                    }),
+                );
+                return Err(e);
+            }
+        };
 
         let display_text = resolve_display_text(
             &response_text,
@@ -6448,6 +8256,52 @@ pub(crate) async fn run_tool_call_loop(
             display_text.clear();
             assistant_history_content =
                 clear_assistant_history_content_if_semantically_empty(&assistant_history_content);
+        }
+
+        if tool_calls.is_empty()
+            && !bound_procedure_succeeded
+            && !bound_procedure_failed
+            && active_turn_satisfies_bound_procedure_runtime_input(history)
+        {
+            if let Some(synthesized_call) = synthesize_bound_procedure_tool_call_from_current_turn(
+                history,
+                tools_registry,
+                channel_name,
+                channel_reply_target,
+            ) {
+                let attachment_count = synthesized_call
+                    .arguments
+                    .get("input")
+                    .and_then(|input| input.get("attachments"))
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, |attachments| attachments.len());
+                runtime_trace::record_event(
+                    "bound_procedure_tool_call_synthesized",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "tool": synthesized_call.name.as_str(),
+                        "attachment_count": attachment_count,
+                        "input_bundle": bound_procedure_input_bundle(history).trace_payload(),
+                        "arguments": scrub_credentials(&synthesized_call.arguments.to_string()),
+                    }),
+                );
+                tool_calls.push(synthesized_call);
+                display_text.clear();
+                assistant_history_content = if use_native_tools {
+                    build_native_assistant_history_from_parsed_calls("", &tool_calls, None)
+                        .unwrap_or_else(|| {
+                            build_assistant_history_with_parsed_tool_calls("", &tool_calls)
+                        })
+                } else {
+                    build_assistant_history_with_parsed_tool_calls("", &tool_calls)
+                };
+            }
         }
 
         // ── Progress: LLM responded ─────────────────────────────
@@ -6551,48 +8405,62 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
-            if active_turn_has_bound_policy_procedure_input(history)
-                && response_claims_policy_procedure_success(&display_text)
-                && !policy_procedure_succeeded
+            let bound_procedure_has_decision = bound_procedure_succeeded || bound_procedure_failed;
+            let bound_procedure_requires_decision =
+                active_turn_satisfies_bound_procedure_runtime_input(history);
+            let bound_procedure_violation_reason = if bound_procedure_requires_decision
+                && !bound_procedure_has_decision
             {
-                policy_procedure_unverified_claims += 1;
+                Some(
+                        "assistant attempted a final response without a bound procedure decision for current-turn contract input",
+                    )
+            } else {
+                None
+            };
+
+            if let Some(bound_procedure_violation_reason) = bound_procedure_violation_reason {
+                bound_procedure_contract_repair_attempts += 1;
                 runtime_trace::record_event(
-                    "final_response_unverified_policy_procedure",
+                    "final_response_missing_bound_procedure_decision",
                     Some(channel_name),
                     Some(provider_name),
                     Some(model),
                     Some(&turn_id),
                     Some(false),
-                    Some(
-                        "assistant claimed a bound procedure side effect without executing the policy procedure",
-                    ),
+                    Some(bound_procedure_violation_reason),
                     serde_json::json!({
                         "iteration": iteration + 1,
-                        "claim_attempt": policy_procedure_unverified_claims,
-                        "max_claim_attempts": MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN,
+                        "contract_repair_attempt": bound_procedure_contract_repair_attempts,
+                        "max_contract_repair_attempts": MAX_BOUND_PROCEDURE_CONTRACT_REPAIRS_PER_TURN,
+                        "bound_procedure_succeeded": bound_procedure_succeeded,
+                        "bound_procedure_failed": bound_procedure_failed,
+                        "input_bundle": bound_procedure_input_bundle(history).trace_payload(),
                         "text": scrub_credentials(&display_text),
                     }),
                 );
 
-                if policy_procedure_unverified_claims
-                    >= MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN
+                if bound_procedure_contract_repair_attempts
+                    >= MAX_BOUND_PROCEDURE_CONTRACT_REPAIRS_PER_TURN
                 {
-                    let blocker = policy_procedure_claim_limit_message(
+                    let blocker = bound_procedure_contract_limit_message(
                         history,
-                        policy_procedure_unverified_claims,
+                        bound_procedure_contract_repair_attempts,
                     );
                     runtime_trace::record_event(
-                        "policy_procedure_claim_guard_exhausted",
+                        "bound_procedure_contract_guard_exhausted",
                         Some(channel_name),
                         Some(provider_name),
                         Some(model),
                         Some(&turn_id),
                         Some(false),
-                        Some("assistant repeatedly claimed a bound procedure side effect without tool evidence"),
+                        Some("assistant repeatedly attempted to close a bound-procedure turn without a valid current-turn procedure decision"),
                         serde_json::json!({
                             "iteration": iteration + 1,
-                            "claim_attempts": policy_procedure_unverified_claims,
-                            "max_claim_attempts": MAX_POLICY_PROCEDURE_UNVERIFIED_CLAIMS_PER_TURN,
+                            "contract_repair_attempts": bound_procedure_contract_repair_attempts,
+                            "max_contract_repair_attempts": MAX_BOUND_PROCEDURE_CONTRACT_REPAIRS_PER_TURN,
+                            "bound_procedure_succeeded": bound_procedure_succeeded,
+                            "bound_procedure_failed": bound_procedure_failed,
+                            "input_bundle": bound_procedure_input_bundle(history).trace_payload(),
                             "text": scrub_credentials(&display_text),
                         }),
                     );
@@ -6603,7 +8471,7 @@ pub(crate) async fn run_tool_call_loop(
                     }
                     history.push(ChatMessage::assistant(blocker.clone()));
                     tool_failures.push(format!(
-                        "whatsapp_run_policy_procedure: unverified success claim repeated {policy_procedure_unverified_claims} times without a successful tool result"
+                        "bound procedure: contract guard exhausted after {bound_procedure_contract_repair_attempts} attempts without a valid current-turn procedure decision"
                     ));
                     return Ok(AgentTurnOutcome {
                         output: blocker,
@@ -6613,28 +8481,31 @@ pub(crate) async fn run_tool_call_loop(
                     });
                 }
 
+                let repair_prompt = "The current conversation has a bound procedure and this turn satisfies the procedure input/output contract with current-turn runtime input. A final response is not valid until this turn has a bound procedure decision. Call the bound procedure tool now with only valid current-turn input and base the reply on its result. Do not reuse historical inputs.";
                 history.push(ChatMessage::assistant(response_text.clone()));
-                history.push(internal_repair_message(
-                    "The current conversation has a bound procedure and this turn contains current-turn procedure input. Your previous response claimed the action succeeded, but this turn has no successful whatsapp_run_policy_procedure result. Call whatsapp_run_policy_procedure now with the valid current-turn input, or if the input is invalid/missing, reply briefly with that concrete blocker. Do not claim success without the tool result.",
-                ));
+                history.push(internal_repair_message(repair_prompt));
                 continue;
             }
 
-            if let Some(claim) = side_effect_claims.unverified_final_response_claim(&display_text) {
-                runtime_trace::record_event(
-                    claim.event,
-                    Some(channel_name),
-                    Some(provider_name),
-                    Some(model),
-                    Some(&turn_id),
-                    Some(false),
-                    Some(claim.reason),
-                    side_effect_claim_trace_payload(iteration, &display_text, &claim),
-                );
+            if can_enforce_side_effect_claim_repairs(tools_registry) {
+                if let Some(claim) =
+                    side_effect_claims.unverified_final_response_claim(&display_text)
+                {
+                    runtime_trace::record_event(
+                        claim.event,
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some(claim.reason),
+                        side_effect_claim_trace_payload(iteration, &display_text, &claim),
+                    );
 
-                history.push(ChatMessage::assistant(response_text.clone()));
-                history.push(internal_repair_message(claim.repair_prompt));
-                continue;
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    history.push(internal_repair_message(claim.repair_prompt));
+                    continue;
+                }
             }
 
             if should_enforce_artifact_existence(history, &display_text) {
@@ -6730,10 +8601,8 @@ pub(crate) async fn run_tool_call_loop(
                     scope_key,
                     ROOT_TASK_CHECKPOINT_AGENT,
                 );
-                let _ = crate::agent::subagent_history_store::clear_history(
-                    workspace_dir,
-                    scope_key,
-                );
+                let _ =
+                    crate::agent::subagent_history_store::clear_history(workspace_dir, scope_key);
             }
             return Ok(AgentTurnOutcome {
                 output: display_text,
@@ -6762,8 +8631,7 @@ pub(crate) async fn run_tool_call_loop(
         //
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
-        let auto_continue_delegate_checkpoints =
-            autonomous_continuation_authorized(history);
+        let auto_continue_delegate_checkpoints = autonomous_continuation_authorized(history);
         let mut tool_results = String::new();
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
         let mut delegate_checkpoint_for_turn: Option<ContinuationCheckpoint> = None;
@@ -6833,22 +8701,45 @@ pub(crate) async fn run_tool_call_loop(
                 channel_name,
                 channel_reply_target,
             );
-            maybe_normalize_whatsapp_policy_procedure_call(
+            maybe_normalize_bound_policy_procedure_call(
                 &tool_name,
                 &mut tool_args,
                 channel_name,
                 channel_reply_target,
             );
+            if maybe_fill_bound_procedure_tool_call_from_current_turn(
+                history,
+                &tool_name,
+                &mut tool_args,
+            ) {
+                runtime_trace::record_event(
+                    "bound_procedure_tool_call_current_turn_input_filled",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "tool": tool_name.clone(),
+                        "input_bundle": bound_procedure_input_bundle(history).trace_payload(),
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                    }),
+                );
+            }
             maybe_normalize_tenant_service_announce_cron_prompt(
                 &tool_name,
                 &mut tool_args,
                 workspace_dir,
             );
-            if let Some(normalized_prompt) = maybe_normalize_confirmed_service_builder_delegate_prompt(
-                history,
-                &tool_name,
-                &mut tool_args,
-            ) {
+            if let Some(normalized_prompt) =
+                maybe_normalize_confirmed_service_builder_delegate_prompt(
+                    history,
+                    &tool_name,
+                    &mut tool_args,
+                )
+            {
                 runtime_trace::record_event(
                     "service_builder_delegate_prompt_normalized_after_confirmation",
                     Some(channel_name),
@@ -6863,8 +8754,7 @@ pub(crate) async fn run_tool_call_loop(
                     }),
                 );
             }
-            if let Some(blocked) =
-                blocked_tenant_service_execution_cron_add(&tool_name, &tool_args)
+            if let Some(blocked) = blocked_tenant_service_execution_cron_add(&tool_name, &tool_args)
             {
                 runtime_trace::record_event(
                     "tool_call_result",
@@ -6907,6 +8797,75 @@ pub(crate) async fn run_tool_call_loop(
                 &mut tool_args,
                 continuation_scope,
             );
+            if let Some(violation) = validate_bound_procedure_tool_call_current_turn_input(
+                history, &tool_name, &tool_args,
+            ) {
+                bound_procedure_contract_repair_attempts += 1;
+                let violation_summary = format!("{violation:?}");
+                runtime_trace::record_event(
+                    "bound_procedure_tool_input_contract_violation",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(&violation_summary),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "tool": tool_name.clone(),
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "input_bundle": bound_procedure_input_bundle(history).trace_payload(),
+                        "contract_repair_attempt": bound_procedure_contract_repair_attempts,
+                        "max_contract_repair_attempts": MAX_BOUND_PROCEDURE_CONTRACT_REPAIRS_PER_TURN,
+                    }),
+                );
+
+                if bound_procedure_contract_repair_attempts
+                    >= MAX_BOUND_PROCEDURE_CONTRACT_REPAIRS_PER_TURN
+                {
+                    let blocker = bound_procedure_contract_limit_message(
+                        history,
+                        bound_procedure_contract_repair_attempts,
+                    );
+                    runtime_trace::record_event(
+                        "bound_procedure_contract_guard_exhausted",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some("assistant repeatedly attempted invalid bound-procedure calls for the current-turn contract"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "tool": tool_name.clone(),
+                            "violation": violation_summary,
+                            "input_bundle": bound_procedure_input_bundle(history).trace_payload(),
+                            "contract_repair_attempts": bound_procedure_contract_repair_attempts,
+                            "max_contract_repair_attempts": MAX_BOUND_PROCEDURE_CONTRACT_REPAIRS_PER_TURN,
+                        }),
+                    );
+
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        let _ = tx.send(blocker.clone()).await;
+                    }
+                    history.push(ChatMessage::assistant(blocker.clone()));
+                    tool_failures.push(format!(
+                        "bound procedure: invalid current-turn input contract repeated {bound_procedure_contract_repair_attempts} times: {violation_summary}"
+                    ));
+                    return Ok(AgentTurnOutcome {
+                        output: blocker,
+                        continuation: None,
+                        requests,
+                        tool_failures,
+                    });
+                }
+
+                history.push(internal_repair_message(
+                    bound_procedure_tool_input_violation_repair_prompt(&violation),
+                ));
+                continue 'tool_loop;
+            }
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
@@ -6965,7 +8924,10 @@ pub(crate) async fn run_tool_call_loop(
 
             let signature = tool_call_signature(&tool_name, &tool_args);
             let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
-            if !dedup_exempt && (blocked_by_policy.contains(&signature) || !seen_tool_signatures.insert(signature)) {
+            if !dedup_exempt
+                && (blocked_by_policy.contains(&signature)
+                    || !seen_tool_signatures.insert(signature))
+            {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
                 );
@@ -7063,10 +9025,30 @@ pub(crate) async fn run_tool_call_loop(
             .zip(executed_outcomes.into_iter())
         {
             let outcome = outcome;
-            if outcome.success {
-                if call.name == "whatsapp_run_policy_procedure" {
-                    policy_procedure_succeeded = true;
+            if is_bound_procedure_tool_name(&call.name) {
+                let terminal_reply = bound_procedure_terminal_reply_from_output(
+                    &call.name,
+                    &outcome.output,
+                    outcome.success,
+                    prefers_spanish_for_user_message(history, None, None),
+                    bound_procedure_claim_contract(history),
+                );
+                if let Some(reply) = terminal_reply {
+                    if reply.outcome.is_success() {
+                        bound_procedure_succeeded = true;
+                    } else {
+                        bound_procedure_failed = true;
+                    }
+                    if bound_procedure_terminal_reply.is_none() {
+                        bound_procedure_terminal_reply = Some(reply);
+                    }
+                } else if outcome.success {
+                    bound_procedure_succeeded = true;
+                } else {
+                    bound_procedure_failed = true;
                 }
+            }
+            if outcome.success {
                 if call.name == "cron_add" || call.name == "cron_update" {
                     scheduled_delivery_created = true;
                 }
@@ -7099,7 +9081,8 @@ pub(crate) async fn run_tool_call_loop(
 
             if !outcome.success {
                 if let Some(ref reason) = outcome.error_reason {
-                    if reason.contains("security policy") || reason.contains("disallowed by policy") {
+                    if reason.contains("security policy") || reason.contains("disallowed by policy")
+                    {
                         blocked_by_policy.insert(tool_call_signature(&call.name, &call.arguments));
                     }
                 }
@@ -7135,15 +9118,30 @@ pub(crate) async fn run_tool_call_loop(
 
                 if *failure_count >= REPEATED_TOOL_FAILURE_LIMIT {
                     let prefers_spanish = prefers_spanish_for_user_message(history, None, None);
-                    let message = if prefers_spanish {
+                    let user_facing_reason =
+                        user_facing_tool_failure_reason(&call.name, &safe_reason, prefers_spanish);
+                    let message = if tool_failure_is_incomplete_procedure_handoff(
+                        &call.name,
+                        &safe_reason,
+                    ) {
+                        if prefers_spanish {
+                            format!(
+                                "No pude activar el proceso porque su configuración quedó incompleta. Ya reintenté con la evidencia disponible y corté los reintentos para evitar un loop. {user_facing_reason}"
+                            )
+                        } else {
+                            format!(
+                                "I could not activate the process because its configuration is incomplete. I retried with the available evidence and stopped to avoid a loop. {user_facing_reason}"
+                            )
+                        }
+                    } else if prefers_spanish {
                         format!(
                             "No pude continuar porque la herramienta `{}` falló {} veces con el mismo error: {}. Corté los reintentos para evitar un loop y gasto innecesario.",
-                            call.name, *failure_count, safe_reason
+                            call.name, *failure_count, user_facing_reason
                         )
                     } else {
                         format!(
                             "I couldn't continue because tool `{}` failed {} times with the same error: {}. I stopped retrying to avoid a loop and unnecessary spend.",
-                            call.name, *failure_count, safe_reason
+                            call.name, *failure_count, user_facing_reason
                         )
                     };
 
@@ -7209,6 +9207,7 @@ pub(crate) async fn run_tool_call_loop(
             let (compact_output, delegate_checkpoint) = normalize_tool_output_for_history(
                 &tool_name,
                 &outcome.output,
+                outcome.success,
                 auto_continue_delegate_checkpoints,
             );
             if delegate_checkpoint_for_turn.is_none() {
@@ -7226,6 +9225,8 @@ pub(crate) async fn run_tool_call_loop(
         // Native mode: use JSON-structured messages so convert_messages() can
         // reconstruct proper OpenAI-format tool_calls and tool result messages.
         // Prompt mode: use XML-based text format as before.
+        assistant_history_content =
+            sanitize_bound_procedure_tool_history_content(&assistant_history_content, &tool_calls);
         history.push(ChatMessage::assistant(assistant_history_content));
         if native_tool_calls.is_empty() {
             let all_results_have_ids = use_native_tools
@@ -7254,6 +9255,36 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        if let Some(reply) = bound_procedure_terminal_reply.take() {
+            runtime_trace::record_event(
+                "bound_procedure_terminal_reply_from_evidence_ledger",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(&turn_id),
+                Some(reply.outcome.is_success()),
+                None,
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "outcome": reply.outcome.as_str(),
+                    "evidence": reply.evidence.trace_payload(),
+                    "input_bundle": bound_procedure_input_bundle(history).trace_payload(),
+                    "text": scrub_credentials(&reply.text),
+                }),
+            );
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                let _ = tx.send(reply.text.clone()).await;
+            }
+            history.push(ChatMessage::assistant(reply.text.clone()));
+            return Ok(AgentTurnOutcome {
+                output: reply.text,
+                continuation: None,
+                requests,
+                tool_failures,
+            });
         }
 
         if let Some(blocker) = repeated_failure_blocker {
@@ -7396,15 +9427,14 @@ pub(crate) async fn run_tool_call_loop(
         let _ = tx.send(progress.to_string()).await;
     }
 
-    let (mut checkpoint, checkpoint_usage) =
-        build_tool_loop_continuation_checkpoint(
-            provider,
-            model,
-            history,
-            max_iterations,
-            max_iterations,
-        )
-        .await;
+    let (mut checkpoint, checkpoint_usage) = build_tool_loop_continuation_checkpoint(
+        provider,
+        model,
+        history,
+        max_iterations,
+        max_iterations,
+    )
+    .await;
     if let Some(usage) = checkpoint_usage {
         requests.push(usage);
     }
@@ -7430,11 +9460,9 @@ pub(crate) async fn run_tool_call_loop(
             .map(str::trim)
             .filter(|value| !value.is_empty()),
     ) {
-        if let Ok(relative) = crate::agent::subagent_history_store::save_history(
-            workspace_dir,
-            scope_key,
-            history,
-        ) {
+        if let Ok(relative) =
+            crate::agent::subagent_history_store::save_history(workspace_dir, scope_key, history)
+        {
             checkpoint.subagent_history_file = Some(relative);
         }
         let _ = task_checkpoint_store::save_checkpoint(
@@ -9163,8 +11191,7 @@ mod tests {
         // With the fix the validator strips the leading /workspace/ and resolves
         // to workspace_dir/workspace/X — which is where file_write actually wrote it.
         let ws = Path::new("/zeroclaw-data/workspace");
-        let resolved =
-            resolve_artifact_reference("/workspace/workspace/attachments/foo.pdf", ws);
+        let resolved = resolve_artifact_reference("/workspace/workspace/attachments/foo.pdf", ws);
         assert_eq!(
             resolved,
             PathBuf::from("/zeroclaw-data/workspace/workspace/attachments/foo.pdf")
@@ -9288,7 +11315,7 @@ Encontré estos 5 archivos en Google Drive:
     }
 
     #[test]
-    fn maybe_normalize_whatsapp_policy_procedure_binds_current_chat_and_lifts_payload() {
+    fn maybe_normalize_bound_policy_procedure_binds_current_whatsapp_chat_and_lifts_payload() {
         let mut args = serde_json::json!({
             "chat_jid": "5491167625318\">5491167625318@s.whatsapp.net",
             "input": "<DSML parameter name=\"sender\">",
@@ -9298,7 +11325,7 @@ Encontré estos 5 archivos en Google Drive:
             "timeout_ms": 60000
         });
 
-        maybe_normalize_whatsapp_policy_procedure_call(
+        maybe_normalize_bound_policy_procedure_call(
             "whatsapp_run_policy_procedure",
             &mut args,
             "whatsapp",
@@ -9322,10 +11349,10 @@ Encontré estos 5 archivos en Google Drive:
     }
 
     #[test]
-    fn maybe_normalize_whatsapp_policy_procedure_creates_empty_input_for_channel_call() {
+    fn maybe_normalize_bound_policy_procedure_creates_empty_input_for_channel_call() {
         let mut args = serde_json::json!({});
 
-        maybe_normalize_whatsapp_policy_procedure_call(
+        maybe_normalize_bound_policy_procedure_call(
             "whatsapp_run_policy_procedure",
             &mut args,
             "whatsapp",
@@ -9333,18 +11360,20 @@ Encontré estos 5 archivos en Google Drive:
         );
 
         assert_eq!(args["chat_jid"], "120363025123456789@g.us");
-        assert!(args["input"].as_object().is_some_and(|input| input.is_empty()));
+        assert!(args["input"]
+            .as_object()
+            .is_some_and(|input| input.is_empty()));
     }
 
     #[test]
-    fn maybe_normalize_whatsapp_policy_procedure_binds_third_party_channel() {
+    fn maybe_normalize_bound_policy_procedure_binds_whatsapp_third_party_channel() {
         let mut args = serde_json::json!({
             "input": {
                 "attachments": []
             }
         });
 
-        maybe_normalize_whatsapp_policy_procedure_call(
+        maybe_normalize_bound_policy_procedure_call(
             "whatsapp_run_policy_procedure",
             &mut args,
             "whatsapp:third_party",
@@ -9355,7 +11384,38 @@ Encontré estos 5 archivos en Google Drive:
     }
 
     #[test]
-    fn active_turn_has_bound_policy_procedure_input_detects_current_attachments() {
+    fn maybe_normalize_bound_policy_procedure_lifts_payload_for_generic_channel_tool() {
+        let mut args = serde_json::json!({
+            "input": "malformed",
+            "attachments": [
+                {
+                    "path": "/workspace/attachments/slack/a.pdf"
+                }
+            ],
+            "message": {
+                "text": "please file this"
+            }
+        });
+
+        maybe_normalize_bound_policy_procedure_call(
+            "slack_run_policy_procedure",
+            &mut args,
+            "slack",
+            Some("C0123"),
+        );
+
+        assert!(args.get("chat_jid").is_none());
+        assert!(args.get("attachments").is_none());
+        assert!(args.get("message").is_none());
+        assert_eq!(
+            args["input"]["attachments"][0]["path"],
+            "/workspace/attachments/slack/a.pdf"
+        );
+        assert_eq!(args["input"]["message"]["text"], "please file this");
+    }
+
+    #[test]
+    fn active_turn_has_bound_procedure_input_detects_current_attachments() {
         let history = vec![
             ChatMessage::system(
                 "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.",
@@ -9365,11 +11425,11 @@ Encontré estos 5 archivos en Google Drive:
             ),
         ];
 
-        assert!(active_turn_has_bound_policy_procedure_input(&history));
+        assert!(active_turn_has_bound_procedure_input(&history));
     }
 
     #[test]
-    fn active_turn_has_bound_policy_procedure_input_ignores_text_only_turns() {
+    fn active_turn_has_bound_procedure_input_ignores_text_only_turns() {
         let history = vec![
             ChatMessage::system(
                 "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.",
@@ -9377,39 +11437,1553 @@ Encontré estos 5 archivos en Google Drive:
             ChatMessage::user("Mentira"),
         ];
 
-        assert!(!active_turn_has_bound_policy_procedure_input(&history));
+        assert!(!active_turn_has_bound_procedure_input(&history));
     }
 
     #[test]
-    fn response_claims_policy_procedure_success_detects_external_effect_claims() {
-        assert!(response_claims_policy_procedure_success(
-            "✅ Subí las 4 imágenes a Google Drive."
-        ));
-        assert!(response_claims_policy_procedure_success(
-            "✅ 11 archivos subidos correctamente a la carpeta Anda en Google Drive. Sin errores."
-        ));
-        assert!(response_claims_policy_procedure_success(
-            "Uploaded 9 files with 0 errors."
-        ));
-        assert!(response_claims_policy_procedure_success(
-            "Processed 3 invoices and appended the rows."
+    fn bound_procedure_input_bundle_separates_current_turn_from_history() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/previous.jpg\n[/Image attachment]",
+            ),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_previous","name":"whatsapp_run_policy_procedure","arguments":"{\"input\":\"[omitted from chat history; use only current-turn contract input]\"}"}]}"#,
+            ),
+            ChatMessage::tool(
+                "tool: whatsapp_run_policy_procedure\ntool_success: true\nprocedure_ok: true\n[Raw bound procedure payload omitted from chat history.]",
+            ),
+            ChatMessage::user("Gracias, todo bien."),
+        ];
+
+        let bundle = bound_procedure_input_bundle(&history);
+
+        assert!(bundle.policy_state.active);
+        assert_eq!(bundle.policy_state.job_slug.as_deref(), Some("upload"));
+        assert!(bundle.conversation_state.prior_bound_procedure_decision);
+        assert!(bundle
+            .conversation_state
+            .prior_input_refs
+            .contains("/workspace/attachments/whatsapp/previous.jpg"));
+        assert!(bundle.current_turn_input.refs.is_empty());
+        assert!(!bundle.current_turn_input.has_attachment);
+        assert!(!bundle.current_turn_satisfies_policy());
+    }
+
+    #[test]
+    fn bound_procedure_input_bundle_fails_closed_without_input_contract() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.",
+            ),
+            ChatMessage::user(
+                "[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/current.jpg\n[/Image attachment]",
+            ),
+        ];
+
+        let bundle = bound_procedure_input_bundle(&history);
+
+        assert!(bundle.policy_state.active);
+        assert!(bundle.policy_state.requirement.is_none());
+        assert!(active_turn_has_bound_procedure_input(&history));
+        assert!(!bundle.current_turn_satisfies_policy());
+        assert!(!active_turn_satisfies_bound_procedure_runtime_input(
+            &history
         ));
     }
 
     #[test]
-    fn response_claims_policy_procedure_success_ignores_blocker_claims() {
-        assert!(!response_claims_policy_procedure_success(
-            "No pude subir los archivos porque este turno no trae adjuntos válidos."
+    fn bound_procedure_input_bundle_is_policy_specific() {
+        let user_message = ChatMessage::user("Se rompió la bomba del subsuelo.");
+        let text_policy_history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `ticket` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"text\"],\"action\":\"create an external ticket\"}",
+            ),
+            user_message.clone(),
+        ];
+        let attachment_policy_history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            user_message,
+        ];
+
+        assert!(bound_procedure_input_bundle(&text_policy_history).current_turn_satisfies_policy());
+        assert!(!bound_procedure_input_bundle(&attachment_policy_history)
+            .current_turn_satisfies_policy());
+    }
+
+    #[test]
+    fn bound_procedure_input_bundle_trace_payload_omits_raw_refs() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Document: invoice.pdf] /zeroclaw-data/workspace/attachments/whatsapp/invoice.pdf",
+            ),
+        ];
+
+        let trace_payload = bound_procedure_input_bundle(&history)
+            .trace_payload()
+            .to_string();
+
+        assert!(trace_payload.contains("\"ref_count\":1"));
+        assert!(trace_payload.contains("\"job_slug\":\"upload\""));
+        assert!(!trace_payload.contains("invoice.pdf"));
+        assert!(!trace_payload.contains("/workspace/attachments"));
+    }
+
+    #[test]
+    fn bound_procedure_input_refs_are_current_turn_and_canonical() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/a.jpg\n[/Image attachment]",
+            ),
+        ];
+
+        let facts = latest_user_turn_bound_procedure_input_facts(&history);
+
+        assert!(facts.has_attachment);
+        assert!(facts.refs.contains("/workspace/attachments/whatsapp/a.jpg"));
+        assert!(active_turn_satisfies_bound_procedure_runtime_input(
+            &history
         ));
-        assert!(!response_claims_policy_procedure_success(
-            "The procedure failed with an invalid input error."
+    }
+
+    #[test]
+    fn bound_procedure_attachment_only_contract_forces_storage_only_image_context() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "cuando llegue una imagen analizá el contenido y subilo".to_string(),
+            ),
+            ChatMessage::user("[IMAGE:/zeroclaw-data/workspace/attachments/whatsapp/current.png]"),
+        ];
+
+        assert!(should_force_storage_only_image_context_for_bound_procedure(
+            &history
         ));
-        assert!(!response_claims_policy_procedure_success(
-            "Subí algunos archivos, pero hubo un error al completar la carga."
+    }
+
+    #[test]
+    fn bound_procedure_visual_contract_does_not_force_storage_only_image_context() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `extract` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\",\"visual_analysis.v1\"]}",
+            ),
+            ChatMessage::user("[IMAGE:/zeroclaw-data/workspace/attachments/whatsapp/current.png]"),
+        ];
+
+        assert!(!should_force_storage_only_image_context_for_bound_procedure(&history));
+    }
+
+    #[test]
+    fn bound_procedure_input_contract_identifies_attachment_storage_only() {
+        assert!(
+            bound_procedure_input_contract_requires_attachment_storage_only(
+                r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["attachments[]"]}"#
+            )
+        );
+        assert!(
+            bound_procedure_input_contract_requires_attachment_storage_only(
+                r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["text","attachments[]"]}"#
+            )
+        );
+        assert!(
+            !bound_procedure_input_contract_requires_attachment_storage_only(
+                r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["attachments[]","visual_analysis.v1"]}"#
+            )
+        );
+    }
+
+    #[test]
+    fn bound_procedure_runtime_input_contract_rejects_text_only_turn() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"],\"on_invalid_input\":\"Send an attachment.\"}",
+            ),
+            ChatMessage::user("Subí los archivos a Drive."),
+        ];
+
+        let args = serde_json::json!({ "input": {} });
+
+        assert!(!active_turn_satisfies_bound_procedure_runtime_input(
+            &history
         ));
-        assert!(!response_claims_policy_procedure_success(
-            "Necesito un adjunto válido para poder actualizar Drive."
+        assert!(matches!(
+            validate_bound_procedure_tool_call_current_turn_input(
+                &history,
+                "whatsapp_run_policy_procedure",
+                &args,
+            ),
+            Some(BoundProcedureToolInputViolation::MissingRequiredCurrentTurnInput { .. })
         ));
+    }
+
+    #[test]
+    fn bound_procedure_runtime_input_contract_accepts_text_only_contracts() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `ticket` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"text\"],\"action\":\"create an external ticket\"}",
+            ),
+            ChatMessage::user("Se rompió la bomba del subsuelo."),
+        ];
+        let args = serde_json::json!({
+            "input": {
+                "description": "Se rompió la bomba del subsuelo."
+            }
+        });
+
+        assert!(active_turn_satisfies_bound_procedure_runtime_input(
+            &history
+        ));
+        assert!(validate_bound_procedure_tool_call_current_turn_input(
+            &history,
+            "whatsapp_run_policy_procedure",
+            &args,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bound_procedure_runtime_input_contract_ignores_channel_identity_as_text() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `ticket` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"text\"],\"action\":\"create an external ticket\"}",
+            ),
+            ChatMessage::user("<ID: +5491167625318>"),
+        ];
+
+        assert!(!active_turn_satisfies_bound_procedure_runtime_input(
+            &history
+        ));
+    }
+
+    #[test]
+    fn bound_procedure_tool_call_rejects_historical_local_refs() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/current.jpg\n[/Image attachment]",
+            ),
+        ];
+        let args = serde_json::json!({
+            "input": {
+                "attachments": [
+                    { "path": "/workspace/attachments/whatsapp/previous.jpg" }
+                ]
+            }
+        });
+
+        assert!(matches!(
+            validate_bound_procedure_tool_call_current_turn_input(
+                &history,
+                "whatsapp_run_policy_procedure",
+                &args,
+            ),
+            Some(BoundProcedureToolInputViolation::StaleInputRefs { .. })
+        ));
+    }
+
+    #[test]
+    fn bound_procedure_tool_call_allows_current_turn_local_refs() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Document: factura.pdf] /zeroclaw-data/workspace/attachments/whatsapp/factura.pdf",
+            ),
+        ];
+        let args = serde_json::json!({
+            "input": {
+                "attachments": [
+                    { "path": "/workspace/attachments/whatsapp/factura.pdf" }
+                ]
+            }
+        });
+
+        assert!(validate_bound_procedure_tool_call_current_turn_input(
+            &history,
+            "whatsapp_run_policy_procedure",
+            &args,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bound_procedure_synthesizes_attachment_tool_call_from_current_turn_contract() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/a.jpg\n- /zeroclaw-data/workspace/attachments/whatsapp/b.pdf\n[/Image attachment]",
+            ),
+        ];
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "whatsapp_run_policy_procedure",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let call = synthesize_bound_procedure_tool_call_from_current_turn(
+            &history,
+            &tools_registry,
+            "whatsapp:third_party",
+            Some("120363025123456789@g.us"),
+        )
+        .expect("attachment contract should synthesize a bound procedure call");
+
+        assert_eq!(call.name, "whatsapp_run_policy_procedure");
+        assert_eq!(call.arguments["chat_jid"], "120363025123456789@g.us");
+        let attachments = call.arguments["input"]["attachments"]
+            .as_array()
+            .expect("attachments should be an array");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(
+            attachments[0]["path"],
+            "/workspace/attachments/whatsapp/a.jpg"
+        );
+        assert_eq!(attachments[0]["mimeType"], "image/jpeg");
+        assert_eq!(
+            attachments[1]["path"],
+            "/workspace/attachments/whatsapp/b.pdf"
+        );
+        assert_eq!(attachments[1]["mimeType"], "application/pdf");
+    }
+
+    #[test]
+    fn bound_procedure_current_turn_input_excludes_prior_refs_even_when_prompt_is_polluted() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[Document: old.pdf] /zeroclaw-data/workspace/attachments/whatsapp/old.pdf\n\n[IMAGE:/zeroclaw-data/workspace/attachments/whatsapp/already-uploaded.jpg]",
+            ),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_previous","name":"whatsapp_run_policy_procedure","arguments":"{\"input\":\"[omitted from chat history; use only current-turn contract input]\"}"}]}"#,
+            ),
+            ChatMessage::tool(
+                "tool: whatsapp_run_policy_procedure\ntool_success: true\nprocedure_ok: true\n[Raw bound procedure payload omitted from chat history.]",
+            ),
+            ChatMessage::user(
+                "<ID: +5491140853388>\n[Document: old.pdf] /zeroclaw-data/workspace/attachments/whatsapp/old.pdf\n\n[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/already-uploaded.jpg\n- /zeroclaw-data/workspace/attachments/whatsapp/new.jpg\n[/Image attachment]",
+            ),
+        ];
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "whatsapp_run_policy_procedure",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let bundle = bound_procedure_input_bundle(&history);
+        assert_eq!(bundle.current_turn_input.refs.len(), 3);
+        assert_eq!(bundle.effective_current_turn_refs().len(), 1);
+        assert!(bundle.current_turn_satisfies_policy());
+
+        let call = synthesize_bound_procedure_tool_call_from_current_turn(
+            &history,
+            &tools_registry,
+            "whatsapp:third_party",
+            Some("120363025123456789@g.us"),
+        )
+        .expect("polluted prompt should still synthesize from effective current refs");
+        let attachments = call.arguments["input"]["attachments"]
+            .as_array()
+            .expect("attachments should be an array");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0]["path"],
+            "/workspace/attachments/whatsapp/new.jpg"
+        );
+
+        let stale_args = serde_json::json!({
+            "input": {
+                "attachments": [
+                    { "path": "/workspace/attachments/whatsapp/old.pdf" },
+                    { "path": "/workspace/attachments/whatsapp/already-uploaded.jpg" },
+                    { "path": "/workspace/attachments/whatsapp/new.jpg" }
+                ]
+            }
+        });
+        assert!(matches!(
+            validate_bound_procedure_tool_call_current_turn_input(
+                &history,
+                "whatsapp_run_policy_procedure",
+                &stale_args,
+            ),
+            Some(BoundProcedureToolInputViolation::StaleInputRefs { .. })
+        ));
+    }
+
+    #[test]
+    fn bound_procedure_fills_empty_attachment_tool_call_from_effective_current_turn() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}",
+            ),
+            ChatMessage::user(
+                "[IMAGE:/zeroclaw-data/workspace/attachments/whatsapp/old.jpg]",
+            ),
+            ChatMessage::tool(
+                "tool: whatsapp_run_policy_procedure\ntool_success: true\nprocedure_ok: true\n[Raw bound procedure payload omitted from chat history.]",
+            ),
+            ChatMessage::user(
+                "[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/old.jpg\n- /zeroclaw-data/workspace/attachments/whatsapp/current.pdf\n[/Image attachment]",
+            ),
+        ];
+        let mut args = serde_json::json!({ "input": {} });
+
+        assert!(matches!(
+            validate_bound_procedure_tool_call_current_turn_input(
+                &history,
+                "whatsapp_run_policy_procedure",
+                &args,
+            ),
+            Some(BoundProcedureToolInputViolation::MissingRequiredCurrentTurnInput { .. })
+        ));
+
+        assert!(maybe_fill_bound_procedure_tool_call_from_current_turn(
+            &history,
+            "whatsapp_run_policy_procedure",
+            &mut args,
+        ));
+        assert!(validate_bound_procedure_tool_call_current_turn_input(
+            &history,
+            "whatsapp_run_policy_procedure",
+            &args,
+        )
+        .is_none());
+        let attachments = args["input"]["attachments"]
+            .as_array()
+            .expect("attachments should be filled");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0]["path"],
+            "/workspace/attachments/whatsapp/current.pdf"
+        );
+    }
+
+    #[test]
+    fn bound_procedure_does_not_synthesize_for_text_only_contract() {
+        let history = vec![
+            ChatMessage::system(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `ticket` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"text\"],\"action\":\"create an external ticket\"}",
+            ),
+            ChatMessage::user("Se rompió la bomba del subsuelo."),
+        ];
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "whatsapp_run_policy_procedure",
+            Arc::clone(&recorded_args),
+        ))];
+
+        assert!(synthesize_bound_procedure_tool_call_from_current_turn(
+            &history,
+            &tools_registry,
+            "whatsapp:third_party",
+            Some("120363025123456789@g.us"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bound_procedure_detects_channel_specific_tool_suffix() {
+        assert!(is_bound_procedure_tool_name(
+            "whatsapp_run_policy_procedure"
+        ));
+        assert!(is_bound_procedure_tool_name("slack_run_policy_procedure"));
+        assert!(!is_bound_procedure_tool_name(
+            "whatsapp_configure_conversation_policy"
+        ));
+    }
+
+    #[test]
+    fn bound_procedure_history_summary_omits_raw_payload_shape() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "job": "upload-job",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "job": "upload-job",
+                "uploadedCount": 2,
+                "failedCount": 0,
+                "summary": "Subí 2 archivo(s) a Drive.",
+                "uploaded": [
+                    {
+                        "filename": "invoice-a.pdf",
+                        "driveFileId": "secret-file-id-a",
+                        "webViewLink": "https://drive.example/a"
+                    },
+                    {
+                        "filename": "invoice-b.pdf",
+                        "driveFileId": "secret-file-id-b",
+                        "webViewLink": "https://drive.example/b"
+                    }
+                ],
+                "logs": {
+                    "latestPath": "/workspace/tenant-app/server/jobs/upload-job/output/logs/latest.jsonl"
+                }
+            }
+        })
+        .to_string();
+
+        let (history_output, checkpoint) = normalize_tool_output_for_history(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            false,
+        );
+
+        assert!(checkpoint.is_none());
+        assert!(history_output.contains("tool_success: true"));
+        assert!(history_output.contains("procedure_ok: true"));
+        assert!(history_output.contains("uploaded_count: 2"));
+        assert!(history_output.contains("failed_count: 0"));
+        assert!(history_output.contains("summary_present: true"));
+        assert!(history_output.contains("Raw bound procedure payload omitted"));
+        assert!(!history_output.contains("Subí 2 archivo"));
+        assert!(!history_output.contains("invoice-a.pdf"));
+        assert!(!history_output.contains("secret-file-id-a"));
+        assert!(!history_output.contains("webViewLink"));
+        assert!(!history_output.contains("latestPath"));
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_uses_success_delivery_text() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "deliveryText": "Subí 1 archivo a Drive correctamente.",
+                "uploaded": [{"filename": "secret.pdf", "fileId": "file-secret"}]
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.ok
+        equals: true
+      - path: output.status
+        equals: ok
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+      - path: tool_failed
+        equals: true
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("structured success should produce terminal reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Success);
+        assert_eq!(reply.text, "Subí 1 archivo a Drive correctamente.");
+        assert_eq!(reply.evidence.tool_name, "whatsapp_run_policy_procedure");
+        assert!(reply.evidence.tool_success);
+        assert!(reply.evidence.output_json_parseable);
+        assert!(reply.evidence.claim_contract_present);
+        assert!(reply.evidence.claim_contract_matched);
+        assert!(reply.evidence.used_delivery_text);
+        assert_eq!(reply.evidence.reason, "claim_contract_matched");
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_accepts_generic_policy_tool_suffix() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "deliveryText": "Ticket created from the structured ledger."
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.ok
+        equals: true
+      - path: output.status
+        equals: ok
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+      - path: tool_failed
+        equals: true
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "slack_run_policy_procedure",
+            &output,
+            true,
+            false,
+            Some(claim_contract),
+        )
+        .expect("generic policy procedure suffix should produce terminal reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Success);
+        assert_eq!(reply.text, "Ticket created from the structured ledger.");
+        assert_eq!(reply.evidence.tool_name, "slack_run_policy_procedure");
+        assert!(reply.evidence.claim_contract_present);
+        assert!(reply.evidence.claim_contract_matched);
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_requires_claim_contract_for_success() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "deliveryText": "LLM copied a success template that should not be used."
+            }
+        })
+        .to_string();
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "slack_run_policy_procedure",
+            &output,
+            true,
+            false,
+            None,
+        )
+        .expect("missing claim contract should still produce a terminal no-claim reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Unconfirmed);
+        assert!(reply.text.contains("could not confirm"));
+        assert!(!reply.text.contains("success template"));
+        assert!(!reply.evidence.claim_contract_present);
+        assert!(!reply.evidence.claim_contract_matched);
+        assert_eq!(reply.evidence.reason, "missing_claim_contract");
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_does_not_trust_success_text_on_failure() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": false,
+                "status": "error",
+                "deliveryText": "Subí 11 archivos.",
+                "error": "quota exceeded"
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.ok
+        equals: true
+      - path: output.status
+        equals: ok
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+      - path: tool_failed
+        equals: true
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("structured failure should produce terminal reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Failure);
+        assert!(reply.text.contains("No pude completar"));
+        assert!(reply.text.contains("quota exceeded"));
+        assert!(!reply.text.contains("Subí 11"));
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_renders_partial_before_broad_failure() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": false,
+                "status": "partial",
+                "uploadedCount": 1,
+                "failedCount": 1,
+                "deliveryText": "Todo quedo perfecto.",
+                "summary": "processed with one failed item"
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.ok
+        equals: true
+  partial:
+    all:
+      - path: output.status
+        equals: partial
+      - path: output.uploadedCount
+        gte: 1
+      - path: output.failedCount
+        gt: 0
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("partial evidence should produce a product partial reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Partial);
+        assert!(reply.text.contains("La accion se completo parcialmente"));
+        assert!(reply.text.contains("Exitosos: 1"));
+        assert!(reply.text.contains("Fallidos: 1"));
+        assert!(!reply.text.contains("Todo quedo perfecto"));
+        assert!(!reply.evidence.used_delivery_text);
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_renders_blocked_before_broad_failure() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": false,
+                "status": "blocked",
+                "uploadedCount": 0,
+                "failedCount": 1,
+                "error": "Attachment local read failed"
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.ok
+        equals: true
+  blocked:
+    any:
+      - path: output.status
+        equals: blocked
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("blocked evidence should produce a product blocked reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Blocked);
+        assert!(reply.text.contains("No pude completar la accion"));
+        assert!(reply.text.contains("falta una condicion necesaria"));
+        assert!(reply.text.contains("Fallidos: 1"));
+        assert!(reply.text.contains("Attachment local read failed"));
+        assert!(!reply.text.contains("contrato"));
+        assert!(!reply.text.contains("procedimiento"));
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_uses_machine_claim_contract() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "deliveryText": "Ticket creado con evidencia contractual."
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.ok
+        equals: true
+      - path: output.status
+        in: [ok, success]
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+      - path: status
+        in: [error, failed]
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("contract-matched success should produce terminal reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Success);
+        assert_eq!(reply.text, "Ticket creado con evidencia contractual.");
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_rejects_unmatched_claim_contract() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "deliveryText": "Subí 11 archivos."
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.confirmed_external_write
+        equals: true
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("unmatched contract should still produce a terminal no-claim reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Unconfirmed);
+        assert!(reply.text.contains("No pude confirmar"));
+        assert!(!reply.text.contains("procedure_claim_contract"));
+        assert!(!reply.text.contains("Subí 11"));
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_rejects_unparseable_output_with_claim_contract() {
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.ok
+        equals: true
+  failure:
+    any:
+      - path: tool_failed
+        equals: true
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            "Subí 11 archivos sin JSON estructurado.",
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("contracted procedure without parseable evidence should produce a no-claim reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Unconfirmed);
+        assert!(reply.text.contains("No pude confirmar"));
+        assert!(!reply.text.contains("procedure_claim_contract"));
+        assert!(!reply.text.contains("Subí 11"));
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_matches_stage_style_claim_contract() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "uploadedCount": 1,
+                "failedCount": 0,
+                "deliveryText": "Subí 99 archivo(s) a Drive."
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: ok
+        equals: true
+      - path: status
+        equals: ok
+      - path: failedCount
+        equals: 0
+      - path: uploadedCount
+        gte: 1
+  partial:
+    all:
+      - path: status
+        equals: partial
+      - path: ok
+        equals: false
+      - path: uploadedCount
+        gte: 1
+      - path: failedCount
+        gt: 0
+  failure:
+    any:
+      - all:
+          - path: status
+            equals: blocked
+          - path: ok
+            equals: false
+      - all:
+          - path: ok
+            equals: false
+          - path: uploadedCount
+            equals: 0
+          - path: failedCount
+            gt: 0
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("stage-style contract should prove the side effect");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Success);
+        assert_eq!(
+            reply.text,
+            "Listo: la accion se completo correctamente. Exitosos: 1. Fallidos: 0."
+        );
+        assert!(!reply.evidence.used_delivery_text);
+        assert!(!reply.text.contains("99"));
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_counts_summary_fields_before_delivery_text() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "success",
+                "summary": {
+                    "total_attachments": 1,
+                    "success_count": 1,
+                    "failed_count": 0
+                },
+                "deliveryText": "Subí 99 archivo(s) a Drive."
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.status
+        equals: success
+      - path: output.ok
+        equals: true
+      - path: output.summary.success_count
+        greater_than: 0
+      - path: output.summary.failed_count
+        equals: 0
+  partial:
+    all:
+      - path: output.status
+        equals: partial
+      - path: output.summary.success_count
+        greater_than: 0
+      - path: output.summary.failed_count
+        greater_than: 0
+  blocked:
+    any:
+      - path: output.status
+        equals: blocked
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("summary counts should prove the side effect");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Success);
+        assert_eq!(
+            reply.text,
+            "Listo: la accion se completo correctamente. Procesados: 1. Exitosos: 1. Fallidos: 0."
+        );
+        assert!(!reply.evidence.used_delivery_text);
+        assert!(!reply.text.contains("99"));
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_matches_count_field_aliases() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "successCount": 1,
+                "failureCount": 0,
+                "deliveryText": "Procesé 1 archivo con evidencia verificable."
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.ok
+        equals: true
+      - path: output.status
+        in: [ok, success]
+      - path: output.failedCount
+        equals: 0
+      - path: output.uploadedCount
+        gte: 1
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("count aliases should allow the contract to match equivalent evidence fields");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Success);
+        assert_eq!(
+            reply.text,
+            "Listo: la accion se completo correctamente. Exitosos: 1. Fallidos: 0."
+        );
+        assert!(reply.evidence.claim_contract_matched);
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_prefers_exact_count_field_before_alias() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "uploadedCount": 0,
+                "successCount": 1,
+                "failedCount": 0,
+                "failureCount": 0,
+                "deliveryText": "No debería confirmar este texto."
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: output.uploadedCount
+        gte: 1
+      - path: output.failedCount
+        equals: 0
+  failure:
+    any:
+      - path: output.ok
+        equals: false
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("unmatched exact evidence should produce a terminal no-claim reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Unconfirmed);
+        assert!(!reply.text.contains("No debería confirmar"));
+    }
+
+    #[test]
+    fn bound_procedure_terminal_reply_rejects_stage_style_claim_without_side_effect() {
+        let output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "uploadedCount": 0,
+                "failedCount": 0,
+                "deliveryText": "Subí 1 archivo(s) a Drive."
+            }
+        })
+        .to_string();
+        let claim_contract = r#"
+schema_version: procedure_claim_contract.v1
+outcomes:
+  success:
+    all:
+      - path: ok
+        equals: true
+      - path: status
+        equals: ok
+      - path: failedCount
+        equals: 0
+      - path: uploadedCount
+        gte: 1
+  failure:
+    any:
+      - all:
+          - path: ok
+            equals: false
+          - path: uploadedCount
+            equals: 0
+          - path: failedCount
+            gt: 0
+"#;
+
+        let reply = bound_procedure_terminal_reply_from_output(
+            "whatsapp_run_policy_procedure",
+            &output,
+            true,
+            true,
+            Some(claim_contract),
+        )
+        .expect("unproven stage-style contract should produce a terminal no-claim reply");
+
+        assert_eq!(reply.outcome, BoundProcedureTerminalOutcome::Unconfirmed);
+        assert!(reply.text.contains("No pude confirmar"));
+        assert!(!reply.text.contains("Subí 1"));
+    }
+
+    #[test]
+    fn repeated_failure_reason_hides_procedure_sidecar_internals() {
+        let reason = "Missing procedure artifact(s) for a procedure-backed policy: procedure_input_schema, procedure_claim_contract. Pass the complete sidecar set in one configure call.";
+
+        let user_facing =
+            user_facing_tool_failure_reason("whatsapp_configure_conversation_policy", reason, true);
+
+        assert!(tool_failure_is_incomplete_procedure_handoff(
+            "whatsapp_configure_conversation_policy",
+            reason
+        ));
+        assert!(user_facing.contains("información interna incompleta"));
+        assert!(!user_facing.contains("procedure_claim_contract"));
+        assert!(!user_facing.contains("sidecar"));
+    }
+
+    #[test]
+    fn bound_procedure_history_sanitizes_tool_call_arguments() {
+        let tool_calls = vec![ParsedToolCall {
+            name: "whatsapp_run_policy_procedure".to_string(),
+            arguments: serde_json::json!({
+                "chat_jid": "120363025123456789@g.us",
+                "input": {
+                    "attachments": [
+                        {
+                            "path": "/workspace/attachments/whatsapp/current.jpg",
+                            "localPath": "/workspace/attachments/whatsapp/current.jpg"
+                        }
+                    ]
+                }
+            }),
+            tool_call_id: Some("call_123".to_string()),
+        }];
+        let history_content =
+            build_native_assistant_history_from_parsed_calls("", &tool_calls, None)
+                .expect("native assistant history should be built");
+
+        let sanitized =
+            sanitize_bound_procedure_tool_history_content(&history_content, &tool_calls);
+
+        assert!(sanitized.contains("call_123"));
+        assert!(sanitized.contains("omitted from chat history"));
+        assert!(!sanitized.contains("/workspace/attachments/whatsapp/current.jpg"));
+        assert!(!sanitized.contains("120363025123456789@g.us"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_auto_executes_bound_procedure_attachment_when_model_omits_tool() {
+        let provider =
+            ScriptedProvider::from_text_responses(vec!["✅ Subí 2 archivos a Drive.", "done"])
+                .with_native_tool_support();
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let procedure_output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "deliveryText": "done"
+            }
+        })
+        .to_string();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+            RecordingArgsTool::new("whatsapp_run_policy_procedure", Arc::clone(&recorded_args))
+                .with_output(procedure_output),
+        )];
+        let procedure_claim_contract = r#"{"schema_version":"procedure_claim_contract.v1","outcomes":{"success":{"all":[{"path":"output.ok","equals":true},{"path":"output.status","equals":"ok"}]},"failure":{"any":[{"path":"tool_failed","equals":true},{"path":"output.ok","equals":false}]}}}"#;
+        let mut history = vec![
+            ChatMessage::system(format!(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}}\n\nProcedure claim contract:\n{procedure_claim_contract}",
+            )),
+            ChatMessage::user(
+                "[Image attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/whatsapp/a.jpg\n- /zeroclaw-data/workspace/attachments/whatsapp/b.jpg\n[/Image attachment]",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:third_party",
+            Some("120363025123456789@g.us"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should auto-execute the bound procedure");
+
+        assert_eq!(result.output, "done");
+        let recorded_args = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        assert_eq!(recorded_args.len(), 1);
+        let args = &recorded_args[0];
+        assert_eq!(args["chat_jid"], "120363025123456789@g.us");
+        assert_eq!(
+            args["input"]["attachments"]
+                .as_array()
+                .expect("attachments should be present")
+                .len(),
+            2
+        );
+        assert!(history.iter().any(|message| {
+            message.role == "assistant"
+                && message.content.contains("call_auto_bound_procedure_")
+                && message.content.contains("whatsapp_run_policy_procedure")
+        }));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_auto_executes_generic_bound_procedure_attachment() {
+        let provider = ScriptedProvider::from_text_responses(vec!["Filed the documents.", "done"])
+            .with_native_tool_support();
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let procedure_output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "deliveryText": "done"
+            }
+        })
+        .to_string();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+            RecordingArgsTool::new("slack_run_policy_procedure", Arc::clone(&recorded_args))
+                .with_output(procedure_output),
+        )];
+        let procedure_claim_contract = r#"{"schema_version":"procedure_claim_contract.v1","outcomes":{"success":{"all":[{"path":"output.ok","equals":true},{"path":"output.status","equals":"ok"}]},"failure":{"any":[{"path":"tool_failed","equals":true},{"path":"output.ok","equals":false}]}}}"#;
+        let mut history = vec![
+            ChatMessage::system(format!(
+                "Conversation policy procedure: This slack conversation has a bound on-demand tenant job `file-documents` scoped only to this channel. Call slack_run_policy_procedure.\n\nProcedure input contract:\n{{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}}\n\nProcedure claim contract:\n{procedure_claim_contract}",
+            )),
+            ChatMessage::user(
+                "[File attachment]\nSources:\n- /zeroclaw-data/workspace/attachments/slack/a.pdf\n- /zeroclaw-data/workspace/attachments/slack/b.pdf\n[/File attachment]",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "slack:third_party",
+            Some("C0123"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should auto-execute the generic bound procedure");
+
+        assert_eq!(result.output, "done");
+        let recorded_args = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        assert_eq!(recorded_args.len(), 1);
+        let args = &recorded_args[0];
+        assert!(args.get("chat_jid").is_none());
+        assert_eq!(
+            args["input"]["attachments"]
+                .as_array()
+                .expect("attachments should be present")
+                .len(),
+            2
+        );
+        assert!(history.iter().any(|message| {
+            message.role == "assistant"
+                && message.content.contains("call_auto_bound_procedure_")
+                && message.content.contains("slack_run_policy_procedure")
+        }));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_bound_procedure_delivery_text_without_second_llm_claim() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"{"content":null,"tool_calls":[{"id":"call_upload","name":"whatsapp_run_policy_procedure","arguments":"{\"input\":{\"attachments\":[{\"path\":\"/zeroclaw-data/workspace/attachments/whatsapp/a.pdf\"}]}}"}]}"#,
+            "LLM copied a success template that should not be used.",
+        ])
+        .with_native_tool_support();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FixedOutputTool::new(
+            "whatsapp_run_policy_procedure",
+            serde_json::json!({
+                "status": "ok",
+                "output": {
+                    "ok": true,
+                    "status": "ok",
+                    "deliveryText": "Subí 1 archivo desde el ledger estructurado."
+                }
+            })
+            .to_string(),
+            true,
+            Arc::clone(&invocations),
+        ))];
+        let procedure_claim_contract = r#"{"schema_version":"procedure_claim_contract.v1","outcomes":{"success":{"all":[{"path":"output.ok","equals":true},{"path":"output.status","equals":"ok"}]},"failure":{"any":[{"path":"tool_failed","equals":true},{"path":"output.ok","equals":false}]}}}"#;
+        let mut history = vec![
+            ChatMessage::system(format!(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `upload` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"attachments[]\"]}}\n\nProcedure claim contract:\n{procedure_claim_contract}",
+            )),
+            ChatMessage::user(
+                "[Document: a.pdf] /zeroclaw-data/workspace/attachments/whatsapp/a.pdf",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:third_party",
+            Some("120363025123456789@g.us"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should return structured procedure delivery text");
+
+        assert_eq!(
+            result.output,
+            "Subí 1 archivo desde el ledger estructurado."
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(!history.iter().any(|message| {
+            message
+                .content
+                .contains("LLM copied a success template that should not be used")
+        }));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_repairs_text_bound_procedure_claim_without_tool() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "Ticket creado para mantenimiento.",
+            r#"{"content":null,"tool_calls":[{"id":"call_ticket","name":"whatsapp_run_policy_procedure","arguments":"{\"input\":{\"description\":\"Se rompió la bomba del subsuelo.\"}}"}]}"#,
+            "Ticket creado con evidencia del procedimiento.",
+        ]);
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let procedure_output = serde_json::json!({
+            "status": "ok",
+            "output": {
+                "ok": true,
+                "status": "ok",
+                "deliveryText": "Ticket creado con evidencia del procedimiento."
+            }
+        })
+        .to_string();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+            RecordingArgsTool::new("whatsapp_run_policy_procedure", Arc::clone(&recorded_args))
+                .with_output(procedure_output),
+        )];
+        let procedure_claim_contract = r#"{"schema_version":"procedure_claim_contract.v1","outcomes":{"success":{"all":[{"path":"output.ok","equals":true},{"path":"output.status","equals":"ok"}]},"failure":{"any":[{"path":"tool_failed","equals":true},{"path":"output.ok","equals":false}]}}}"#;
+        let mut history = vec![
+            ChatMessage::system(format!(
+                "Conversation policy procedure: This whatsapp conversation has a bound on-demand tenant job `ticket` scoped only to this group chat. Call whatsapp_run_policy_procedure.\n\nProcedure input contract:\n{{\"schema_version\":\"procedure_input_contract.v1\",\"required_current_turn_inputs\":[\"text\"],\"action\":\"create an external ticket\"}}\n\nProcedure claim contract:\n{procedure_claim_contract}",
+            )),
+            ChatMessage::user("Se rompió la bomba del subsuelo."),
+        ];
+        assert!(active_turn_satisfies_bound_procedure_runtime_input(
+            &history
+        ));
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:third_party",
+            Some("120363025123456789@g.us"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should repair the missing text procedure call");
+
+        assert_eq!(
+            result.output,
+            "Ticket creado con evidencia del procedimiento."
+        );
+        let recorded_args = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        assert_eq!(recorded_args.len(), 1);
+        assert_eq!(recorded_args[0]["chat_jid"], "120363025123456789@g.us");
+        assert_eq!(
+            recorded_args[0]["input"]["description"],
+            "Se rompió la bomba del subsuelo."
+        );
+        assert!(history.iter().any(|message| {
+            message.role == "system"
+                && message.content.contains(
+                    "A final response is not valid until this turn has a bound procedure decision",
+                )
+        }));
     }
 
     #[tokio::test]
@@ -9697,6 +13271,7 @@ Encontré estos 5 archivos en Google Drive:
     struct RecordingArgsTool {
         name: String,
         recorded_args: Arc<Mutex<Vec<serde_json::Value>>>,
+        output: Option<String>,
     }
 
     impl RecordingArgsTool {
@@ -9704,7 +13279,13 @@ Encontré estos 5 archivos en Google Drive:
             Self {
                 name: name.to_string(),
                 recorded_args,
+                output: None,
             }
+        }
+
+        fn with_output(mut self, output: impl Into<String>) -> Self {
+            self.output = Some(output.into());
+            self
         }
     }
 
@@ -9739,8 +13320,62 @@ Encontré estos 5 archivos en Google Drive:
                 .push(args.clone());
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: args.to_string(),
+                output: self.output.clone().unwrap_or_else(|| args.to_string()),
                 error: None,
+            })
+        }
+    }
+
+    struct FixedOutputTool {
+        name: String,
+        output: String,
+        success: bool,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl FixedOutputTool {
+        fn new(
+            name: &str,
+            output: impl Into<String>,
+            success: bool,
+            invocations: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                name: name.to_string(),
+                output: output.into(),
+                success,
+                invocations,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FixedOutputTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Returns a fixed output for regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: self.success,
+                output: self.output.clone(),
+                error: if self.success {
+                    None
+                } else {
+                    Some(self.output.clone())
+                },
             })
         }
     }
@@ -9936,6 +13571,7 @@ Encontré estos 5 archivos en Google Drive:
             "cli",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             3,
             None,
             None,
@@ -9993,6 +13629,7 @@ Encontré estos 5 archivos en Google Drive:
             "cli",
             None,
             &multimodal,
+            &crate::config::ReliabilityConfig::default(),
             3,
             None,
             None,
@@ -10043,6 +13680,7 @@ Encontré estos 5 archivos en Google Drive:
             "cli",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             3,
             None,
             None,
@@ -10179,6 +13817,7 @@ Encontré estos 5 archivos en Google Drive:
             "telegram",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10252,6 +13891,7 @@ Encontré estos 5 archivos en Google Drive:
             "telegram",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10323,6 +13963,7 @@ Encontré estos 5 archivos en Google Drive:
             "telegram",
             Some("chat-42"),
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10391,6 +14032,7 @@ Encontré estos 5 archivos en Google Drive:
             "telegram",
             Some("chat-42"),
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10473,6 +14115,7 @@ Encontré estos 5 archivos en Google Drive:
             "whatsapp",
             Some("120363409640193279@g.us"),
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10559,6 +14202,7 @@ Encontré estos 5 archivos en Google Drive:
             "whatsapp",
             Some("120363409640193279@g.us"),
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10604,7 +14248,10 @@ Encontré estos 5 archivos en Google Drive:
         let recorded_updates = Arc::new(Mutex::new(Vec::new()));
         let recorded_lists = Arc::new(Mutex::new(Vec::new()));
         let tools_registry: Vec<Box<dyn Tool>> = vec![
-            Box::new(RecordingArgsTool::new("cron_add", Arc::new(Mutex::new(Vec::new())))),
+            Box::new(RecordingArgsTool::new(
+                "cron_add",
+                Arc::new(Mutex::new(Vec::new())),
+            )),
             Box::new(RecordingArgsTool::new(
                 "cron_update",
                 Arc::clone(&recorded_updates),
@@ -10639,6 +14286,7 @@ Encontré estos 5 archivos en Google Drive:
             "whatsapp",
             Some("120363409640193279@g.us"),
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10654,7 +14302,10 @@ Encontré estos 5 archivos en Google Drive:
         .await
         .expect("cron_update followed by cron_list should satisfy schedule verification");
 
-        assert_eq!(result, "El monitor ya está activo y programado cada 2 minutos.");
+        assert_eq!(
+            result,
+            "El monitor ya está activo y programado cada 2 minutos."
+        );
         assert_eq!(
             recorded_updates
                 .lock()
@@ -10669,11 +14320,9 @@ Encontré estos 5 archivos en Google Drive:
                 .len(),
             1
         );
-        assert!(
-            !history.iter().any(|message| message
-                .content
-                .contains("final response claimed a scheduled delivery without creating"))
-        );
+        assert!(!history.iter().any(|message| message
+            .content
+            .contains("final response claimed a scheduled delivery without creating")));
     }
 
     #[tokio::test]
@@ -10716,6 +14365,7 @@ Encontré estos 5 archivos en Google Drive:
             "cli",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10787,6 +14437,7 @@ Encontré estos 5 archivos en Google Drive:
             "cli",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             10,
             None,
             None,
@@ -10854,6 +14505,7 @@ Encontré estos 5 archivos en Google Drive:
             "telegram",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -10920,6 +14572,7 @@ Encontré estos 5 archivos en Google Drive:
             "cli",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -11006,6 +14659,7 @@ Encontré estos 5 archivos en Google Drive:
             "cli",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -11069,6 +14723,7 @@ Encontré estos 5 archivos en Google Drive:
             "cli",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -11156,6 +14811,7 @@ Encontré estos 5 archivos en Google Drive:
             "telegram",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             Some(tx),
@@ -12171,9 +15827,7 @@ Tail"#;
         });
 
         let normalized = maybe_normalize_confirmed_service_builder_delegate_prompt(
-            &history,
-            "delegate",
-            &mut args,
+            &history, "delegate", &mut args,
         )
         .unwrap();
 
@@ -12275,7 +15929,9 @@ Tail"#;
         let cleared = clear_assistant_history_content_if_semantically_empty(&history_content);
         let parsed: serde_json::Value = serde_json::from_str(&cleared).unwrap();
 
-        assert!(parsed.get("content").is_some_and(serde_json::Value::is_null));
+        assert!(parsed
+            .get("content")
+            .is_some_and(serde_json::Value::is_null));
         assert_eq!(
             parsed
                 .get("tool_calls")
@@ -12303,6 +15959,19 @@ Tail"#;
         assert!(message.content.contains("INTERNAL REPAIR DIRECTIVE"));
         assert!(message.content.contains("not a user message"));
         assert!(message.content.contains("Do not quote, paraphrase"));
+    }
+
+    #[test]
+    fn side_effect_claim_repairs_require_policy_tools() {
+        assert!(!can_enforce_side_effect_claim_repairs_from_tool_names([
+            "shell",
+            "file_read",
+            "delegate",
+        ]));
+        assert!(can_enforce_side_effect_claim_repairs_from_tool_names([
+            "shell",
+            "whatsapp_configure_conversation_policy",
+        ]));
     }
 
     #[test]
@@ -12429,7 +16098,9 @@ Tail"#;
         .expect("auto compaction should succeed");
 
         assert!(compacted);
-        assert!(history.iter().any(|msg| msg.content.contains("Compaction summary")));
+        assert!(history
+            .iter()
+            .any(|msg| msg.content.contains("Compaction summary")));
     }
 
     #[test]
@@ -13703,6 +17374,7 @@ Let me check the result."#;
             "telegram",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             Some(tx),
@@ -13890,10 +17562,7 @@ Let me check the result."#;
         )
         .expect("checkpoint should persist");
 
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("continue"),
-        ];
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("continue")];
 
         let injected = maybe_inject_resume_from_persistent_checkpoint(
             &mut history,
@@ -13904,7 +17573,9 @@ Let me check the result."#;
 
         assert!(injected);
         assert_eq!(history[1].role, "system");
-        assert!(history[1].content.contains("CONTINUATION RESUME DIRECTIVE:"));
+        assert!(history[1]
+            .content
+            .contains("CONTINUATION RESUME DIRECTIVE:"));
         assert_eq!(history[2].role, "user");
     }
 
@@ -13966,7 +17637,9 @@ Let me check the result."#;
         assert_eq!(history[1].role, "user");
         assert_eq!(history[1].content, "Build the tenant service");
         assert_eq!(history[2].role, "assistant");
-        assert!(history[2].content.contains(CONTINUATION_CHECKPOINT_OPEN_TAG));
+        assert!(history[2]
+            .content
+            .contains(CONTINUATION_CHECKPOINT_OPEN_TAG));
         assert_eq!(history[3].role, "user");
         assert_eq!(history[3].content, "yes");
     }
@@ -14008,7 +17681,9 @@ Let me check the result."#;
         assert!(message.content.contains("[Continuation target]"));
         assert!(message.content.contains("kind: service_job"));
         assert!(message.content.contains("id: infobae-headlines-csv"));
-        assert!(message.content.contains("canonical_resume_signal: EXISTING_JOB: infobae-headlines-csv"));
+        assert!(message
+            .content
+            .contains("canonical_resume_signal: EXISTING_JOB: infobae-headlines-csv"));
     }
 
     #[test]
@@ -14034,8 +17709,12 @@ Let me check the result."#;
 
     #[test]
     fn looks_like_continue_request_rejects_feedback_prefixed_with_continue_keyword() {
-        assert!(!looks_like_continue_request("yes but use html instead of rss"));
-        assert!(!looks_like_continue_request("sí pero usa html en vez de rss"));
+        assert!(!looks_like_continue_request(
+            "yes but use html instead of rss"
+        ));
+        assert!(!looks_like_continue_request(
+            "sí pero usa html en vez de rss"
+        ));
         assert!(!looks_like_continue_request("y usa la version anterior"));
     }
 
@@ -14084,7 +17763,8 @@ Let me check the result."#;
     }
 
     #[test]
-    fn latest_effective_original_request_uses_previous_human_request_for_compact_checkpoint_resume() {
+    fn latest_effective_original_request_uses_previous_human_request_for_compact_checkpoint_resume()
+    {
         let history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("NEW_JOB: true\nImplement the recurring Infobae process"),
@@ -14106,7 +17786,9 @@ Let me check the result."#;
     fn user_preapproved_autonomous_continuation_ignores_runtime_user_messages() {
         let history = vec![
             ChatMessage::user("Dale y no preguntes mas"),
-            ChatMessage::user("[Tool results]\n<tool_result name=\"delegate\">checkpoint</tool_result>"),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"delegate\">checkpoint</tool_result>",
+            ),
             ChatMessage::user(format!("{AUTONOMOUS_CONTINUATION_USER_PREFIX}\ncontinue")),
         ];
 
@@ -14168,12 +17850,7 @@ Let me check the result."#;
             "prompt": "Continue the implementation"
         });
 
-        maybe_inject_delegate_resume_metadata(
-            &history,
-            "delegate",
-            &mut args,
-            Some("session-1"),
-        );
+        maybe_inject_delegate_resume_metadata(&history, "delegate", &mut args, Some("session-1"));
 
         let object = args.as_object().expect("args should stay as object");
         assert_eq!(
@@ -14356,6 +18033,7 @@ Let me check the result."#;
             "whatsapp",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -14378,7 +18056,9 @@ Let me check the result."#;
         assert!(history.iter().any(|message| {
             message.role == "assistant"
                 && message.content.contains(CONTINUATION_CHECKPOINT_OPEN_TAG)
-                && message.content.contains("(Y)es, (10x), or provide feedback")
+                && message
+                    .content
+                    .contains("(Y)es, (10x), or provide feedback")
         }));
     }
 
@@ -14427,10 +18107,7 @@ Let me check the result."#;
             checkpoint.clone(),
             delegate_invocations.clone(),
         ))];
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("yes"),
-        ];
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("yes")];
 
         let result = run_tool_call_loop(
             &provider,
@@ -14448,6 +18125,7 @@ Let me check the result."#;
             "whatsapp",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -14470,7 +18148,9 @@ Let me check the result."#;
         assert!(history.iter().any(|message| {
             message.role == "assistant"
                 && message.content.contains(CONTINUATION_CHECKPOINT_OPEN_TAG)
-                && message.content.contains("(Y)es, (10x), or provide feedback")
+                && message
+                    .content
+                    .contains("(Y)es, (10x), or provide feedback")
         }));
 
         let persisted = crate::agent::task_checkpoint_store::load_checkpoint(
@@ -14530,6 +18210,7 @@ Let me check the result."#;
             "whatsapp",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             4,
             None,
             None,
@@ -14550,7 +18231,9 @@ Let me check the result."#;
         assert!(result.continuation.is_none());
         assert!(history.iter().any(|message| {
             message.role == "system"
-                && message.content.contains("AUTONOMOUS CONTINUATION DIRECTIVE:")
+                && message
+                    .content
+                    .contains("AUTONOMOUS CONTINUATION DIRECTIVE:")
         }));
     }
 
@@ -14588,6 +18271,7 @@ Let me check the result."#;
             "whatsapp",
             None,
             &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
             1,
             None,
             None,

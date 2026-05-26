@@ -581,7 +581,9 @@ mod tests {
             .unwrap();
         assert!(result.success);
 
-        let content = tokio::fs::read_to_string(dir.join("out.txt")).await.unwrap();
+        let content = tokio::fs::read_to_string(dir.join("out.txt"))
+            .await
+            .unwrap();
         assert_eq!(content, "hello\nworld\n");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -600,7 +602,9 @@ mod tests {
             .unwrap();
         assert!(result.success);
 
-        let content = tokio::fs::read_to_string(dir.join("new.txt")).await.unwrap();
+        let content = tokio::fs::read_to_string(dir.join("new.txt"))
+            .await
+            .unwrap();
         assert_eq!(content, "created\n");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

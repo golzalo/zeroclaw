@@ -488,7 +488,15 @@ mod tests {
 
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
         tracker
-            .record_usage(TokenUsage::new("session/model", 1000, 0, 1000, 1.0, 0.0, 1.0))
+            .record_usage(TokenUsage::new(
+                "session/model",
+                1000,
+                0,
+                1000,
+                1.0,
+                0.0,
+                1.0,
+            ))
             .unwrap();
 
         let summary = tracker.get_summary().unwrap();

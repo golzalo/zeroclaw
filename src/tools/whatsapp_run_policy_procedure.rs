@@ -1,7 +1,6 @@
 use super::traits::{Tool, ToolResult};
-use crate::channels::whatsapp_observation::{
-    ConversationPolicyStatus, WhatsAppObservationService,
-};
+use super::whatsapp_configure_conversation_policy::WhatsAppConfigureConversationPolicyTool;
+use crate::channels::whatsapp_observation::{ConversationPolicyStatus, WhatsAppObservationService};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -52,17 +51,28 @@ impl WhatsAppRunPolicyProcedureTool {
         None
     }
 
+    fn invalid_policy_contract_result(
+        group_jid: &str,
+        contract_name: &str,
+        err: anyhow::Error,
+    ) -> ToolResult {
+        ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "WhatsApp policy for `{group_jid}` has invalid {contract_name}: {err}"
+            )),
+        }
+    }
+
     fn normalize_input_for_tenant_web(
         value: serde_json::Value,
         workspace_dir: &std::path::Path,
     ) -> serde_json::Value {
         match value {
-            serde_json::Value::String(input) => {
-                serde_json::Value::String(Self::normalize_string_for_tenant_web(
-                    &input,
-                    workspace_dir,
-                ))
-            }
+            serde_json::Value::String(input) => serde_json::Value::String(
+                Self::normalize_string_for_tenant_web(&input, workspace_dir),
+            ),
             serde_json::Value::Array(items) => serde_json::Value::Array(
                 items
                     .into_iter()
@@ -88,6 +98,31 @@ impl WhatsAppRunPolicyProcedureTool {
             }
             other => other,
         }
+    }
+
+    fn bind_runtime_chat_jid_to_input(
+        mut input: serde_json::Value,
+        chat_jid: &str,
+    ) -> serde_json::Value {
+        let serde_json::Value::Object(input_object) = &mut input else {
+            return input;
+        };
+
+        input_object.insert(
+            "chat_jid".to_string(),
+            serde_json::Value::String(chat_jid.to_string()),
+        );
+
+        for alias in ["chatJid", "group_jid", "groupJid"] {
+            if input_object.contains_key(alias) {
+                input_object.insert(
+                    alias.to_string(),
+                    serde_json::Value::String(chat_jid.to_string()),
+                );
+            }
+        }
+
+        input
     }
 
     fn dedupe_attachment_inputs(attachments: &mut Vec<serde_json::Value>) {
@@ -141,7 +176,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
             "properties": {
                 "chat_jid": {
                     "type": "string",
-                    "description": "Optional current WhatsApp group or direct chat JID. In WhatsApp channel turns, omit this; the runtime binds the current reply_target automatically. Direct/manual calls must provide it."
+                    "description": "Optional current WhatsApp group or direct chat JID. In WhatsApp channel turns, omit this; the runtime binds the current reply_target automatically and copies it into input.chat_jid before invoking the tenant job. Direct/manual calls must provide it."
                 },
                 "input": {
                     "type": "object",
@@ -250,6 +285,54 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
             });
         }
         if policy
+            .procedure_input_contract
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "WhatsApp policy for `{}` has no procedure input contract.",
+                    policy.group_jid
+                )),
+            });
+        }
+        if policy
+            .procedure_output_contract
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "WhatsApp policy for `{}` has no procedure output contract.",
+                    policy.group_jid
+                )),
+            });
+        }
+        if policy
+            .procedure_claim_contract
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "WhatsApp policy for `{}` has no procedure claim contract.",
+                    policy.group_jid
+                )),
+            });
+        }
+        if policy
             .procedure_sop
             .as_deref()
             .map(str::trim)
@@ -265,6 +348,58 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
                 )),
             });
         }
+        if let Some(input_schema) = policy.procedure_input_schema.as_deref() {
+            if let Err(err) =
+                WhatsAppConfigureConversationPolicyTool::validate_procedure_input_schema(
+                    input_schema,
+                )
+            {
+                return Ok(Self::invalid_policy_contract_result(
+                    &policy.group_jid,
+                    "procedure input schema",
+                    err,
+                ));
+            }
+        }
+        if let Some(input_contract) = policy.procedure_input_contract.as_deref() {
+            if let Err(err) =
+                WhatsAppConfigureConversationPolicyTool::validate_procedure_input_contract(
+                    input_contract,
+                )
+            {
+                return Ok(Self::invalid_policy_contract_result(
+                    &policy.group_jid,
+                    "procedure input contract",
+                    err,
+                ));
+            }
+        }
+        if let Some(output_contract) = policy.procedure_output_contract.as_deref() {
+            if let Err(err) =
+                WhatsAppConfigureConversationPolicyTool::validate_procedure_output_contract(
+                    output_contract,
+                )
+            {
+                return Ok(Self::invalid_policy_contract_result(
+                    &policy.group_jid,
+                    "procedure output contract",
+                    err,
+                ));
+            }
+        }
+        if let Some(claim_contract) = policy.procedure_claim_contract.as_deref() {
+            if let Err(err) =
+                WhatsAppConfigureConversationPolicyTool::validate_procedure_claim_contract(
+                    claim_contract,
+                )
+            {
+                return Ok(Self::invalid_policy_contract_result(
+                    &policy.group_jid,
+                    "procedure claim contract",
+                    err,
+                ));
+            }
+        }
         let job_slug = match WhatsAppObservationService::normalize_procedure_job_slug(job_slug) {
             Ok(slug) => slug,
             Err(err) => {
@@ -276,6 +411,7 @@ impl Tool for WhatsAppRunPolicyProcedureTool {
             }
         };
 
+        let input = Self::bind_runtime_chat_jid_to_input(input, chat_jid);
         let input = Self::normalize_input_for_tenant_web(input, &self.workspace_dir);
         let body_text = match serde_json::to_string(&input) {
             Ok(body_text) => body_text,
@@ -384,6 +520,8 @@ mod tests {
                     procedure_summary: None,
                     procedure_input_schema: None,
                     procedure_input_contract: None,
+                    procedure_output_contract: None,
+                    procedure_claim_contract: None,
                     procedure_sop: None,
                     canonical_phone: None,
                     rotate_after_bytes: 512 * 1024,
@@ -396,6 +534,49 @@ mod tests {
                 },
             )]))
             .unwrap();
+    }
+
+    fn add_procedure_contracts(
+        service: &WhatsAppObservationService,
+        jid: &str,
+        missing: Option<&str>,
+    ) {
+        let mut policies = service.load_observed_groups();
+        let policy = policies.get_mut(jid).unwrap();
+        policy.procedure_input_schema = Some(r#"{"type":"object"}"#.to_string());
+        policy.procedure_input_contract = Some(
+            r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["text"],"on_invalid_input":"Send text."}"#
+                .to_string(),
+        );
+        policy.procedure_output_contract = Some(
+            r#"{"schema_version":"procedure_output_contract.v1","result_fields":["ok","status"],"outcomes":{"success":"ok","blocked":"blocked"}}"#
+                .to_string(),
+        );
+        policy.procedure_claim_contract = Some(
+            r#"{"schema_version":"procedure_claim_contract.v1","outcomes":{"success":{"all":[{"path":"ok","equals":true},{"path":"status","equals":"ok"}]},"blocked":{"any":[{"path":"ok","equals":false},{"path":"tool_failed","equals":true}]}}}"#
+                .to_string(),
+        );
+        policy.procedure_sop = Some("Run the bound procedure and reply from evidence.".to_string());
+        match missing {
+            Some("procedure_input_schema") => policy.procedure_input_schema = None,
+            Some("procedure_input_contract") => policy.procedure_input_contract = None,
+            Some("procedure_output_contract") => policy.procedure_output_contract = None,
+            Some("procedure_claim_contract") => policy.procedure_claim_contract = None,
+            Some("procedure_sop") => policy.procedure_sop = None,
+            Some(_) | None => {}
+        }
+        service.save_observed_groups(&policies).unwrap();
+    }
+
+    fn mutate_policy(
+        service: &WhatsAppObservationService,
+        jid: &str,
+        update: impl FnOnce(&mut ObservedGroupConfig),
+    ) {
+        let mut policies = service.load_observed_groups();
+        let policy = policies.get_mut(jid).unwrap();
+        update(policy);
+        service.save_observed_groups(&policies).unwrap();
     }
 
     #[tokio::test]
@@ -449,7 +630,10 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("cannot run reply procedures"));
+        assert!(result
+            .error
+            .unwrap()
+            .contains("cannot run reply procedures"));
     }
 
     #[tokio::test]
@@ -476,7 +660,10 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("No active WhatsApp conversation policy"));
+        assert!(result
+            .error
+            .unwrap()
+            .contains("No active WhatsApp conversation policy"));
     }
 
     #[tokio::test]
@@ -504,6 +691,247 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("no procedure input schema"));
+    }
+
+    #[tokio::test]
+    async fn rejects_bound_procedure_without_input_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        write_policy(
+            &service,
+            "120363025123456789@g.us",
+            ConversationMode::MentionReply,
+            Some("demo-job"),
+        );
+        add_procedure_contracts(
+            &service,
+            "120363025123456789@g.us",
+            Some("procedure_input_contract"),
+        );
+
+        let tool = WhatsAppRunPolicyProcedureTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "chat_jid": "120363025123456789@g.us",
+                "input": {}
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("procedure input contract"));
+    }
+
+    #[tokio::test]
+    async fn rejects_bound_procedure_without_output_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        write_policy(
+            &service,
+            "120363025123456789@g.us",
+            ConversationMode::MentionReply,
+            Some("demo-job"),
+        );
+        add_procedure_contracts(
+            &service,
+            "120363025123456789@g.us",
+            Some("procedure_output_contract"),
+        );
+
+        let tool = WhatsAppRunPolicyProcedureTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "chat_jid": "120363025123456789@g.us",
+                "input": {}
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("procedure output contract"));
+    }
+
+    #[tokio::test]
+    async fn rejects_bound_procedure_without_claim_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        write_policy(
+            &service,
+            "120363025123456789@g.us",
+            ConversationMode::MentionReply,
+            Some("demo-job"),
+        );
+        add_procedure_contracts(
+            &service,
+            "120363025123456789@g.us",
+            Some("procedure_claim_contract"),
+        );
+
+        let tool = WhatsAppRunPolicyProcedureTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "chat_jid": "120363025123456789@g.us",
+                "input": {}
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("procedure claim contract"));
+    }
+
+    #[tokio::test]
+    async fn rejects_bound_procedure_with_invalid_input_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        write_policy(
+            &service,
+            "120363025123456789@g.us",
+            ConversationMode::MentionReply,
+            Some("demo-job"),
+        );
+        add_procedure_contracts(&service, "120363025123456789@g.us", None);
+        mutate_policy(&service, "120363025123456789@g.us", |policy| {
+            policy.procedure_input_schema = Some("Use the latest attachment.".to_string());
+        });
+
+        let tool = WhatsAppRunPolicyProcedureTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "chat_jid": "120363025123456789@g.us",
+                "input": {}
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("invalid procedure input schema"));
+    }
+
+    #[tokio::test]
+    async fn rejects_bound_procedure_with_invalid_input_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        write_policy(
+            &service,
+            "120363025123456789@g.us",
+            ConversationMode::MentionReply,
+            Some("demo-job"),
+        );
+        add_procedure_contracts(&service, "120363025123456789@g.us", None);
+        mutate_policy(&service, "120363025123456789@g.us", |policy| {
+            policy.procedure_input_contract = Some(
+                r#"{"schema_version":"procedure_input_contract.v1","required_current_turn_inputs":["latest file"],"on_invalid_input":"Send text."}"#
+                    .to_string(),
+            );
+        });
+
+        let tool = WhatsAppRunPolicyProcedureTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "chat_jid": "120363025123456789@g.us",
+                "input": {}
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("invalid procedure input contract"));
+    }
+
+    #[tokio::test]
+    async fn rejects_bound_procedure_with_invalid_output_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        write_policy(
+            &service,
+            "120363025123456789@g.us",
+            ConversationMode::MentionReply,
+            Some("demo-job"),
+        );
+        add_procedure_contracts(&service, "120363025123456789@g.us", None);
+        mutate_policy(&service, "120363025123456789@g.us", |policy| {
+            policy.procedure_output_contract = Some(
+                r#"{"schema_version":"procedure_output_contract.v1","result_fields":["ok"],"outcomes":{"success":"ok"}}"#
+                    .to_string(),
+            );
+        });
+
+        let tool = WhatsAppRunPolicyProcedureTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "chat_jid": "120363025123456789@g.us",
+                "input": {}
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("invalid procedure output contract"));
+    }
+
+    #[tokio::test]
+    async fn rejects_bound_procedure_with_invalid_claim_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        write_policy(
+            &service,
+            "120363025123456789@g.us",
+            ConversationMode::MentionReply,
+            Some("demo-job"),
+        );
+        add_procedure_contracts(&service, "120363025123456789@g.us", None);
+        mutate_policy(&service, "120363025123456789@g.us", |policy| {
+            policy.procedure_claim_contract = Some(
+                r#"{"schema_version":"procedure_claim_contract.v1","claims":{"success":"Trust ok text."}}"#
+                    .to_string(),
+            );
+        });
+
+        let tool = WhatsAppRunPolicyProcedureTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({
+                "chat_jid": "120363025123456789@g.us",
+                "input": {}
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("invalid procedure claim contract"));
     }
 
     #[tokio::test]
@@ -614,5 +1042,29 @@ mod tests {
             attachments[1]["path"],
             "/workspace/attachments/whatsapp/b.jpg"
         );
+    }
+
+    #[test]
+    fn binds_runtime_chat_jid_into_procedure_input_body() {
+        let input = json!({
+            "chat_jid": "stale@g.us",
+            "chatJid": "also-stale@g.us",
+            "group_jid": "old@g.us",
+            "attachments": [
+                {
+                    "path": "/workspace/attachments/whatsapp/a.pdf"
+                }
+            ]
+        });
+
+        let normalized = WhatsAppRunPolicyProcedureTool::bind_runtime_chat_jid_to_input(
+            input,
+            "120363025123456789@g.us",
+        );
+
+        assert_eq!(normalized["chat_jid"], "120363025123456789@g.us");
+        assert_eq!(normalized["chatJid"], "120363025123456789@g.us");
+        assert_eq!(normalized["group_jid"], "120363025123456789@g.us");
+        assert!(normalized.get("groupJid").is_none());
     }
 }

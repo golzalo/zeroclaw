@@ -401,8 +401,7 @@ pub fn run_traces(
             Some(false) => "fail",
             None => "-",
         };
-        let message = event.message.unwrap_or_default();
-        let preview = truncate_for_display(&message, 80);
+        let preview = runtime_trace_event_preview(&event);
         println!(
             "- {} | {} | {} | {} | {}",
             event.timestamp, event.id, event.event_type, success, preview
@@ -1007,6 +1006,88 @@ fn truncate_for_display(input: &str, max_chars: usize) -> String {
     }
 }
 
+fn runtime_trace_event_preview(
+    event: &crate::observability::runtime_trace::RuntimeTraceEvent,
+) -> String {
+    if event.event_type == "bound_procedure_terminal_reply_from_evidence_ledger" {
+        return runtime_trace_bound_procedure_preview(event);
+    }
+
+    truncate_for_display(event.message.as_deref().unwrap_or_default(), 80)
+}
+
+fn runtime_trace_bound_procedure_preview(
+    event: &crate::observability::runtime_trace::RuntimeTraceEvent,
+) -> String {
+    let payload = &event.payload;
+    let null_value = serde_json::Value::Null;
+    let evidence = payload.get("evidence").unwrap_or(&null_value);
+    let input = payload
+        .get("input_bundle")
+        .and_then(|bundle| bundle.get("current_turn_input"))
+        .unwrap_or(&null_value);
+
+    let outcome = payload
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let tool = evidence
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let reason = evidence
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let claim_present = evidence
+        .get("claim_contract_present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let claim_matched = evidence
+        .get("claim_contract_matched")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let used_delivery_text = evidence
+        .get("used_delivery_text")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let ref_count = input
+        .get("ref_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    let input_flags = [
+        ("text", "has_text"),
+        ("attachment", "has_attachment"),
+        ("document", "has_document"),
+        ("visual", "has_visual_analysis"),
+        ("normalized", "has_normalized_document"),
+    ]
+    .into_iter()
+    .filter_map(|(label, key)| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .filter(|value| *value)
+            .map(|_| label)
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+
+    let input_flags = if input_flags.is_empty() {
+        "none".to_string()
+    } else {
+        input_flags
+    };
+
+    truncate_for_display(
+        &format!(
+            "outcome={outcome} input={input_flags} refs={ref_count} tool={tool} reason={reason} claim_present={claim_present} claim_matched={claim_matched} delivery_text={used_delivery_text}"
+        ),
+        240,
+    )
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
@@ -1251,6 +1332,54 @@ mod tests {
     fn truncate_for_display_preserves_utf8_boundaries() {
         let preview = truncate_for_display("🙂example-alpha-build", 3);
         assert_eq!(preview, "🙂ex…");
+    }
+
+    #[test]
+    fn runtime_trace_event_preview_summarizes_bound_procedure_ledger() {
+        let event = crate::observability::runtime_trace::RuntimeTraceEvent {
+            id: "trace-1".to_string(),
+            timestamp: "2026-05-24T00:00:00Z".to_string(),
+            event_type: "bound_procedure_terminal_reply_from_evidence_ledger".to_string(),
+            channel: Some("whatsapp".to_string()),
+            provider: Some("openrouter".to_string()),
+            model: Some("@preset/main".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            success: Some(true),
+            message: None,
+            payload: serde_json::json!({
+                "outcome": "success",
+                "evidence": {
+                    "tool": "whatsapp_run_policy_procedure",
+                    "tool_success": true,
+                    "output_json_parseable": true,
+                    "claim_contract_present": true,
+                    "claim_contract_matched": true,
+                    "used_delivery_text": true,
+                    "reason": "claim_contract_matched"
+                },
+                "input_bundle": {
+                    "current_turn_input": {
+                        "has_text": false,
+                        "has_attachment": true,
+                        "has_document": true,
+                        "has_visual_analysis": false,
+                        "has_normalized_document": false,
+                        "ref_count": 3
+                    }
+                }
+            }),
+        };
+
+        let preview = runtime_trace_event_preview(&event);
+
+        assert!(preview.contains("outcome=success"));
+        assert!(preview.contains("tool=whatsapp_run_policy_procedure"));
+        assert!(preview.contains("reason=claim_contract_matched"));
+        assert!(preview.contains("claim_present=true"));
+        assert!(preview.contains("claim_matched=true"));
+        assert!(preview.contains("delivery_text=true"));
+        assert!(preview.contains("input=attachment,document"));
+        assert!(preview.contains("refs=3"));
     }
 
     #[test]

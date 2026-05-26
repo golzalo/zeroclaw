@@ -608,8 +608,8 @@ mod tests {
     fn html_format_keeps_image_markup() {
         let html =
             "<html><body><article><h1>Title</h1><img src=\"hero.jpg\" alt=\"hero\" /></article></body></html>";
-        let text = extract_html_for_llm(html, "https://example.com/page", HtmlOutputFormat::Html)
-            .unwrap();
+        let text =
+            extract_html_for_llm(html, "https://example.com/page", HtmlOutputFormat::Html).unwrap();
         assert!(text.contains("<img"));
         assert!(text.contains("hero.jpg"));
     }

@@ -77,7 +77,8 @@ pub async fn consolidate_turn(
     let response = provider
         .chat_with_system_response(Some(CONSOLIDATION_SYSTEM_PROMPT), &truncated, model, 0.1)
         .await?;
-    let usage = provider_usage_to_consolidation_usage(response.usage.as_ref(), started_at.elapsed());
+    let usage =
+        provider_usage_to_consolidation_usage(response.usage.as_ref(), started_at.elapsed());
     maybe_record_consolidation_usage(
         provider_name,
         model,
@@ -205,7 +206,8 @@ async fn do_consolidate_dump(
     let response = provider
         .chat_with_system_response(Some(&system_prompt), &truncated, model, 0.1)
         .await?;
-    let usage = provider_usage_to_consolidation_usage(response.usage.as_ref(), started_at.elapsed());
+    let usage =
+        provider_usage_to_consolidation_usage(response.usage.as_ref(), started_at.elapsed());
     maybe_record_consolidation_usage(
         provider_name,
         model,
@@ -308,18 +310,17 @@ pub async fn run_recovery_sweep(
                 }
             }
         } else if name.ends_with(".pending.md") {
-            if let Err(e) =
-                consolidate_dump_file(
-                    &path,
-                    provider,
-                    provider_name,
-                    model,
-                    prices,
-                    memory,
-                    workspace_dir,
-                    prompt_file,
-                )
-                .await
+            if let Err(e) = consolidate_dump_file(
+                &path,
+                provider,
+                provider_name,
+                model,
+                prices,
+                memory,
+                workspace_dir,
+                prompt_file,
+            )
+            .await
             {
                 tracing::debug!("Recovery sweep: failed to consolidate {}: {e}", name);
             }
@@ -381,7 +382,11 @@ async fn maybe_record_consolidation_usage(
         if let Err(error) = remote_budget
             .consume_explicit_usage(
                 Some("memory:consolidation"),
-                &format!("zeroclaw:memory:consolidation:{}:{}", scope_suffix, uuid::Uuid::new_v4()),
+                &format!(
+                    "zeroclaw:memory:consolidation:{}:{}",
+                    scope_suffix,
+                    uuid::Uuid::new_v4()
+                ),
                 "instance_memory",
                 provider_name,
                 model,
