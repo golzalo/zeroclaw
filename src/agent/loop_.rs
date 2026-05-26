@@ -7739,7 +7739,7 @@ struct ToolExecutionOutcome {
     duration: Duration,
 }
 
-const TOOL_RESULT_HISTORY_CHAR_LIMIT: usize = 12_000;
+const TOOL_RESULT_HISTORY_CHAR_LIMIT: usize = 60_000;
 
 fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
