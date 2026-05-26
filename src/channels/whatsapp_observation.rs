@@ -2,11 +2,13 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const DEFAULT_ROTATE_AFTER_BYTES: u64 = 512 * 1024;
 const DEFAULT_KEEP_LOG_SEGMENTS: usize = 8;
+static OBSERVED_GROUP_LOG_APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub use crate::channels::conversation_policy::{
     ConversationChatKind, ConversationMode, ConversationPolicyStatus, ConversationProcedureMetadata,
@@ -955,6 +957,10 @@ impl WhatsAppObservationService {
         if trimmed.is_empty() {
             return Ok(());
         }
+        let _append_guard = OBSERVED_GROUP_LOG_APPEND_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| anyhow!("Observed group log append lock poisoned"))?;
         let timestamp = chrono::Utc::now().to_rfc3339();
         let mut groups = self.load_observed_groups();
         if let Some(group) = groups.get_mut(group_jid) {
@@ -978,6 +984,7 @@ impl WhatsAppObservationService {
         let path = self.observed_group_log_path(group_jid);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .map_err(|e| anyhow!("Failed to open observed group log {}: {e}", path.display()))?;
@@ -998,7 +1005,31 @@ impl WhatsAppObservationService {
             content: trimmed.to_string(),
         })
         .map_err(|e| anyhow!("Failed to serialize observed group message: {e}"))?;
-        writeln!(file, "{line}").map_err(|e| {
+        let mut record = line.into_bytes();
+        record.push(b'\n');
+        if file
+            .metadata()
+            .map_err(|e| anyhow!("Failed to stat observed group log {}: {e}", path.display()))?
+            .len()
+            > 0
+        {
+            file.seek(SeekFrom::End(-1)).map_err(|e| {
+                anyhow!("Failed to inspect observed group log {}: {e}", path.display())
+            })?;
+            let mut last_byte = [0_u8; 1];
+            file.read_exact(&mut last_byte).map_err(|e| {
+                anyhow!("Failed to read observed group log {}: {e}", path.display())
+            })?;
+            if last_byte[0] != b'\n' {
+                file.write_all(b"\n").map_err(|e| {
+                    anyhow!(
+                        "Failed to repair observed group log boundary {}: {e}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        file.write_all(&record).map_err(|e| {
             anyhow!(
                 "Failed to append observed group log {}: {e}",
                 path.display()
@@ -2146,6 +2177,69 @@ mod tests {
         assert!(entry.mentions_agent);
         assert_eq!(entry.quoted_message_id.as_deref(), Some("wamid-parent"));
         assert_eq!(entry.content, "Hola equipo");
+    }
+
+    #[test]
+    fn append_observed_group_message_preserves_jsonl_boundary_after_unterminated_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        let group_jid = "120363025123456789@g.us";
+        let path = service.observed_group_log_path(group_jid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"seed\":true}").unwrap();
+
+        service
+            .append_observed_group_message(
+                group_jid,
+                "user",
+                "+5491112345678",
+                "Hola equipo",
+            )
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "{\"seed\":true}");
+        let entry: ObservedGroupMessage = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(entry.content, "Hola equipo");
+    }
+
+    #[test]
+    fn append_observed_group_message_serializes_concurrent_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().to_path_buf();
+        let group_jid = "120363025123456789@g.us";
+        let mut handles = Vec::new();
+
+        for index in 0..24 {
+            let service = WhatsAppObservationService::new(workspace.clone());
+            handles.push(std::thread::spawn(move || {
+                service
+                    .append_observed_group_message(
+                        group_jid,
+                        "user",
+                        "+5491112345678",
+                        &format!("mensaje {index}"),
+                    )
+                    .unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let service = WhatsAppObservationService::new(workspace);
+        let raw = std::fs::read_to_string(service.observed_group_log_path(group_jid)).unwrap();
+        let contents = raw
+            .lines()
+            .map(|line| serde_json::from_str::<ObservedGroupMessage>(line).unwrap().content)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(contents.len(), 24);
+        for index in 0..24 {
+            assert!(contents.contains(&format!("mensaje {index}")));
+        }
     }
 
     #[test]
