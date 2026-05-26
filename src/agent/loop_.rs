@@ -9214,10 +9214,13 @@ pub(crate) async fn run_tool_call_loop(
                 let progress_msg = if outcome.success {
                     format!("\u{2705} {} ({secs}s)\n", call.name)
                 } else if let Some(ref reason) = outcome.error_reason {
+                    let prefers_spanish = prefers_spanish_for_user_message(history, None, None);
+                    let user_facing_reason =
+                        user_facing_tool_failure_reason(&call.name, reason, prefers_spanish);
                     format!(
                         "\u{274c} {} ({secs}s): {}\n",
                         call.name,
-                        truncate_with_ellipsis(reason, 200)
+                        truncate_with_ellipsis(&user_facing_reason, 200)
                     )
                 } else {
                     format!("\u{274c} {} ({secs}s)\n", call.name)
@@ -17554,6 +17557,82 @@ Let me check the result."#;
         );
 
         assert_eq!(result, "I could not execute that command.");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_hides_procedure_sidecar_failure_in_on_delta() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"whatsapp_configure_conversation_policy","arguments":{"procedure_job_slug":"spend-guard"}}
+</tool_call>"#,
+            "I could not activate the process.",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+            "whatsapp_configure_conversation_policy",
+            "Missing procedure artifact(s) for a procedure-backed policy: procedure_input_schema, procedure_claim_contract. Pass the complete sidecar set in one configure call.",
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("configure this process"),
+        ];
+        let observer = NoopObserver;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should complete");
+
+        let mut deltas = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            deltas.push(msg);
+        }
+        let all_deltas = deltas.join("");
+
+        assert!(
+            all_deltas.contains("process handoff is incomplete"),
+            "on_delta messages should use the product failure summary, got: {all_deltas}"
+        );
+        assert!(
+            !all_deltas.contains("procedure_claim_contract"),
+            "on_delta messages should not expose procedure sidecar internals, got: {all_deltas}"
+        );
+        assert!(
+            !all_deltas.contains("sidecar"),
+            "on_delta messages should not expose sidecar internals, got: {all_deltas}"
+        );
+
+        assert_eq!(result, "I could not activate the process.");
     }
 
     // ── filter_by_allowed_tools tests ─────────────────────────────────────
