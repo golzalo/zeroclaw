@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::channels::whatsapp_observation::{
-    ConversationMode, ConversationProcedureMetadata, WhatsAppObservationService,
+    ConversationMode, ConversationProcedureMetadata, ObservedGroupConfig,
+    WhatsAppObservationService,
 };
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
@@ -1041,6 +1042,31 @@ impl WhatsAppConfigureConversationPolicyTool {
         Ok(())
     }
 
+    fn reject_unconfirmed_procedure_replacement(
+        existing: Option<&ObservedGroupConfig>,
+        new_slug: Option<&str>,
+        replace_existing_procedure: bool,
+    ) -> anyhow::Result<()> {
+        let Some(new_slug) = new_slug.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        let Some(existing_slug) = existing
+            .and_then(|policy| policy.procedure_job_slug.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+
+        if existing_slug == new_slug || replace_existing_procedure {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "Conversation already has active process `{existing_slug}`. Replacing it with `{new_slug}` requires explicit user confirmation."
+        );
+    }
+
     fn verify_policy_readback(
         service: &WhatsAppObservationService,
         chat_jid: &str,
@@ -1313,6 +1339,10 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     "type": "boolean",
                     "description": "When true, remove any existing procedure binding from this policy."
                 },
+                "replace_existing_procedure": {
+                    "type": "boolean",
+                    "description": "Set true only after the user explicitly confirmed replacing a different active process already bound to this conversation. Reconfiguring the same procedure slug does not require this."
+                },
                 "reply_to_all": {
                     "type": "boolean",
                     "description": "When true, the agent answers every inbound message in this conversation. When false, the agent answers only messages that explicitly include @s86. Required — the skill must clarify with the user before calling."
@@ -1388,6 +1418,10 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
             .get("reply_to_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let replace_existing_procedure = args
+            .get("replace_existing_procedure")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
 
         let service = WhatsAppObservationService::new(self.workspace_dir.clone());
 
@@ -1429,6 +1463,17 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     }
                 }
                 let existing = service.observed_group_config(&group.group_jid);
+                if let Err(err) = Self::reject_unconfirmed_procedure_replacement(
+                    existing.as_ref(),
+                    procedure_job_slug.as_deref(),
+                    replace_existing_procedure,
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(err.to_string()),
+                    });
+                }
                 let skill_name = match service.resolve_workspace_skill_name(
                     args.get("skill_name").and_then(|value| value.as_str()),
                     existing
@@ -1566,6 +1611,17 @@ impl Tool for WhatsAppConfigureConversationPolicyTool {
                     .or(resolved_name)
                     .unwrap_or_else(|| chat_jid.clone());
                 let existing = service.conversation_policy_for_target(&chat_jid);
+                if let Err(err) = Self::reject_unconfirmed_procedure_replacement(
+                    existing.as_ref(),
+                    procedure_job_slug.as_deref(),
+                    replace_existing_procedure,
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(err.to_string()),
+                    });
+                }
                 let skill_name = match service.resolve_workspace_skill_name(
                     args.get("skill_name").and_then(|value| value.as_str()),
                     existing
@@ -1978,6 +2034,159 @@ mod tests {
             .as_deref()
             .is_some_and(|contract| contract.contains("procedure_claim_contract.v1")));
         assert!(result.output.contains("Procedure: spend-guard"));
+    }
+
+    #[tokio::test]
+    async fn configure_group_policy_rejects_silent_procedure_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        write_tenant_job_fixture(temp.path(), "spend-guard");
+        write_tenant_job_fixture(temp.path(), "invoice-guard");
+        let skill_dir = temp.path().join("skills").join("whatsapp_mention_reply");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: whatsapp_mention_reply\ndescription: Mention reply\n---\n# Mention Reply\n",
+        )
+        .unwrap();
+
+        let service = WhatsAppObservationService::new(temp.path().to_path_buf());
+        service
+            .save_visible_groups(&[VisibleGroupRecord {
+                group_jid: "120363025123456789@g.us".into(),
+                group_name: "Los Pibes".into(),
+                linked_parent_jid: None,
+                is_parent: false,
+                is_default_sub_group: false,
+                cached_at: chrono::Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let tool = WhatsAppConfigureConversationPolicyTool::new(
+            temp.path().to_path_buf(),
+            Arc::new(SecurityPolicy::default()),
+        );
+
+        let first = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "skill_name": "whatsapp_mention_reply",
+                "procedure_job_slug": "spend-guard",
+                "procedure_summary": "Validates spend messages.",
+                "procedure_input_schema": { "type": "object" },
+                "procedure_input_contract": {
+                    "schema_version": "procedure_input_contract.v1",
+                    "required_current_turn_inputs": ["text"],
+                    "on_invalid_input": "Ask for the missing spend details."
+                },
+                "procedure_output_contract": valid_output_contract(),
+                "procedure_claim_contract": {
+                    "schema_version": "procedure_claim_contract.v1",
+                    "outcomes": {
+                        "success": {
+                            "all": [{ "path": "ok", "equals": true }]
+                        },
+                        "blocked": {
+                            "any": [{ "path": "status", "equals": "blocked" }]
+                        }
+                    }
+                },
+                "procedure_minimum_valid_call": valid_minimum_valid_call(),
+                "procedure_sop": "Extract valid input, run the procedure, and reply from the result.",
+                "reply_to_all": false
+            }))
+            .await
+            .unwrap();
+        assert!(first.success);
+
+        let silent_replace = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "skill_name": "whatsapp_mention_reply",
+                "procedure_job_slug": "invoice-guard",
+                "procedure_summary": "Processes invoices.",
+                "procedure_input_schema": { "type": "object" },
+                "procedure_input_contract": {
+                    "schema_version": "procedure_input_contract.v1",
+                    "required_current_turn_inputs": ["attachments[]"],
+                    "on_invalid_input": "Ask for an invoice attachment."
+                },
+                "procedure_output_contract": valid_output_contract(),
+                "procedure_claim_contract": {
+                    "schema_version": "procedure_claim_contract.v1",
+                    "outcomes": {
+                        "success": {
+                            "all": [{ "path": "ok", "equals": true }]
+                        },
+                        "blocked": {
+                            "any": [{ "path": "status", "equals": "blocked" }]
+                        }
+                    }
+                },
+                "procedure_minimum_valid_call": valid_minimum_valid_call(),
+                "procedure_sop": "Extract valid input, run the procedure, and reply from the result.",
+                "reply_to_all": false
+            }))
+            .await
+            .unwrap();
+
+        assert!(!silent_replace.success);
+        let error = silent_replace.error.unwrap_or_default();
+        assert!(error.contains("active process `spend-guard`"));
+        assert!(error.contains("`invoice-guard` requires explicit user confirmation"));
+        let observed = service
+            .observed_group_config("120363025123456789@g.us")
+            .unwrap();
+        assert_eq!(observed.procedure_job_slug.as_deref(), Some("spend-guard"));
+
+        let confirmed_replace = tool
+            .execute(json!({
+                "target_kind": "group",
+                "group_name": "Los Pibes",
+                "mode": "mention_reply",
+                "delivery_chat_jid": "120363408016257691@g.us",
+                "skill_name": "whatsapp_mention_reply",
+                "procedure_job_slug": "invoice-guard",
+                "procedure_summary": "Processes invoices.",
+                "procedure_input_schema": { "type": "object" },
+                "procedure_input_contract": {
+                    "schema_version": "procedure_input_contract.v1",
+                    "required_current_turn_inputs": ["attachments[]"],
+                    "on_invalid_input": "Ask for an invoice attachment."
+                },
+                "procedure_output_contract": valid_output_contract(),
+                "procedure_claim_contract": {
+                    "schema_version": "procedure_claim_contract.v1",
+                    "outcomes": {
+                        "success": {
+                            "all": [{ "path": "ok", "equals": true }]
+                        },
+                        "blocked": {
+                            "any": [{ "path": "status", "equals": "blocked" }]
+                        }
+                    }
+                },
+                "procedure_minimum_valid_call": valid_minimum_valid_call(),
+                "procedure_sop": "Extract valid input, run the procedure, and reply from the result.",
+                "reply_to_all": false,
+                "replace_existing_procedure": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(confirmed_replace.success);
+        let observed = service
+            .observed_group_config("120363025123456789@g.us")
+            .unwrap();
+        assert_eq!(
+            observed.procedure_job_slug.as_deref(),
+            Some("invoice-guard")
+        );
     }
 
     #[tokio::test]
