@@ -114,7 +114,6 @@ impl PromptSection for IdentitySection {
             "AGENTS.md",
             "SOUL.md",
             "TOOLS.md",
-            "IDENTITY.md",
             "USER.md",
             "HEARTBEAT.md",
             "BOOTSTRAP.md",

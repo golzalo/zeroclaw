@@ -253,8 +253,14 @@ const SKILL_GATED_TOOL_NAMES: &[&str] = &[
     "screenshot",
     "image_info",
     "image_generate",
+    "whatsapp_configure_conversation_policy",
     "whatsapp_create_topic_group",
     "whatsapp_enable_community",
+    "whatsapp_list_direct_chats",
+    "whatsapp_list_groups",
+    "whatsapp_list_observed_groups",
+    "whatsapp_start_direct_conversation",
+    "whatsapp_unobserve_group",
 ];
 
 pub fn is_skill_gated_tool(name: &str) -> bool {
@@ -1260,6 +1266,7 @@ mod tests {
             Box::new(NamedTool("shell")),
             Box::new(NamedTool("web_fetch")),
             Box::new(NamedTool("cron_add")),
+            Box::new(NamedTool("delegate")),
             Box::new(NamedTool("read_skill")),
         ];
 
@@ -1273,6 +1280,7 @@ mod tests {
         let inactive_names: Vec<&str> = inactive.iter().map(|tool| tool.name.as_str()).collect();
         assert!(inactive_names.contains(&"shell"));
         assert!(inactive_names.contains(&"cron_add"));
+        assert!(inactive_names.contains(&"delegate"));
         assert!(inactive_names.contains(&"read_skill"));
         assert!(!inactive_names.contains(&"web_fetch"));
 
@@ -1290,6 +1298,7 @@ mod tests {
         );
         let active_names: Vec<&str> = active.iter().map(|tool| tool.name.as_str()).collect();
         assert!(active_names.contains(&"web_fetch"));
+        assert!(active_names.contains(&"delegate"));
     }
 
     #[test]

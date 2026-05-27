@@ -4924,7 +4924,7 @@ fn load_openclaw_bootstrap_files(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
 
-    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
+    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "USER.md"];
 
     for filename in &bootstrap_files {
         inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
@@ -4947,7 +4947,7 @@ fn load_openclaw_bootstrap_files(
 /// 2. Safety — guardrail reminder
 /// 3. Skills — full skill instructions and tool metadata
 /// 4. Workspace — working directory
-/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
+/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, USER, BOOTSTRAP, MEMORY
 /// 6. Date & Time — timezone for cache stability
 /// 7. Runtime — host, OS, model
 ///
@@ -5078,7 +5078,21 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 
     // ── 1c. Action instruction (avoid meta-summary) ───────────────
-    if native_tools {
+    let has_delegate = tools.iter().any(|tool| tool.name == "delegate");
+    let has_read_skill = tools.iter().any(|tool| tool.name == "read_skill");
+    let has_delegate_skill = skills
+        .iter()
+        .any(|skill| skill.requires_tools.iter().any(|tool| tool == "delegate"));
+    if native_tools && has_read_skill && (has_delegate || has_delegate_skill) {
+        prompt.push_str(
+            "## Your Task\n\n\
+             You are the main agent. For every user message, decide whether to answer directly, load a relevant main-agent skill with `read_skill`, or delegate to the specialist that owns the work.\n\
+             Use skills for domain contracts before gated tools: service work, provider delegation, coding delegation, Slack connection, and WhatsApp policies each have their own skill.\n\
+             Preserve actionable details returned by tools or delegates, including authorization URLs, public links, codes, exact commands, filenames, and required user actions.\n\
+             For questions, explanations, or follow-ups about prior messages, answer from conversation context when that is enough; do not ask the user to repeat themselves.\n\
+             Do NOT summarize this configuration, describe your capabilities, expose routing labels, or output step-by-step meta-commentary.\n\n",
+        );
+    } else if native_tools {
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
@@ -5104,6 +5118,8 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         );
     }
     prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
+    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
+    prompt.push_str("- If a user sends a voice note, it is transcribed to text for you. Treat the transcript as the user's real message and do not attempt to generate audio yourself.\n");
     prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
             "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
@@ -5213,29 +5229,6 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
         std::env::consts::OS,
     );
-
-    // ── 8. Channel Capabilities ─────────────────────────────────────
-    prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
-    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
-    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
-        Some(crate::security::AutonomyLevel::Full) => {
-            "- If the runtime policy already allows a tool, use it directly; do not ask the user for extra approval.\n\
-             - Never pretend you are waiting for a human approval click or confirmation when the runtime policy already permits the action.\n\
-             - If the runtime policy blocks an action, say that directly instead of simulating an approval flow.\n"
-        }
-        Some(crate::security::AutonomyLevel::ReadOnly) => {
-            "- This runtime may reject write-side effects; if that happens, explain the policy restriction directly instead of simulating an approval flow.\n"
-        }
-        _ => {
-            "- Ask for approval only when the runtime policy actually requires it.\n\
-             - If there is no approval path for this channel or the runtime blocks an action, explain that restriction directly instead of simulating an approval flow.\n"
-        }
-    });
-    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
-    prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Treat the transcribed text as the user's real message and intent. Ignore transport markers like `[Voice]` when deciding whether the user is asking for a reminder, scheduling action, tool use, or any other task. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
-    prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
 
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
@@ -9656,10 +9649,9 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
-        assert!(prompt.contains("### IDENTITY.md"), "missing IDENTITY.md");
         assert!(
-            prompt.contains("Name: ZeroClaw"),
-            "missing IDENTITY content"
+            !prompt.contains("### IDENTITY.md"),
+            "IDENTITY.md should not be injected into channel prompts"
         );
         assert!(prompt.contains("### USER.md"), "missing USER.md");
         assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
@@ -9683,7 +9675,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(prompt.contains("[File not found: SOUL.md]"));
         assert!(prompt.contains("[File not found: AGENTS.md]"));
-        assert!(prompt.contains("[File not found: IDENTITY.md]"));
+        assert!(!prompt.contains("[File not found: IDENTITY.md]"));
     }
 
     #[test]
@@ -10114,29 +10106,21 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_contains_channel_capabilities() {
+    fn prompt_keeps_channel_runtime_safety_without_duplicate_section() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(
-            prompt.contains("## Channel Capabilities"),
-            "missing Channel Capabilities section"
-        );
-        assert!(
-            prompt.contains("running as a messaging bot"),
-            "missing channel context"
+            !prompt.contains("## Channel Capabilities"),
+            "Channel Capabilities section should not be duplicated"
         );
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
             "missing security instruction"
         );
         assert!(
-            prompt.contains("Treat the transcribed text as the user's real message and intent."),
+            prompt.contains("Treat the transcript as the user's real message"),
             "missing voice transcription intent guidance"
-        );
-        assert!(
-            prompt.contains("Ignore transport markers like `[Voice]`"),
-            "missing voice marker guidance"
         );
     }
 
