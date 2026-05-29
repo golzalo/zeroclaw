@@ -462,6 +462,11 @@ pub struct DelegateToolConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_delegate_agentic_timeout_secs")]
     pub agentic_timeout_secs: u64,
+    /// Delegate agent names that must return a valid terminal
+    /// `subagent_work_result.v1` WORK_RESULT envelope. Agents not listed here
+    /// remain warn-only for rollout safety.
+    #[serde(default)]
+    pub required_contract_agents: Vec<String>,
 }
 
 impl Default for DelegateToolConfig {
@@ -469,6 +474,7 @@ impl Default for DelegateToolConfig {
         Self {
             timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
             agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            required_contract_agents: Vec::new(),
         }
     }
 }
@@ -7925,6 +7931,29 @@ impl Config {
         }
         if self.delegate.agentic_timeout_secs == 0 {
             anyhow::bail!("delegate.agentic_timeout_secs must be greater than 0");
+        }
+        let configured_agent_names = self
+            .agents
+            .keys()
+            .map(|agent_name| agent_name.trim().to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let mut required_contract_agents = std::collections::HashSet::new();
+        for (i, agent_name) in self.delegate.required_contract_agents.iter().enumerate() {
+            let normalized = agent_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("delegate.required_contract_agents[{i}] must not be empty");
+            }
+            let normalized_key = normalized.to_ascii_lowercase();
+            if !configured_agent_names.contains(&normalized_key) {
+                anyhow::bail!(
+                    "delegate.required_contract_agents[{i}] references unknown agent: {normalized}"
+                );
+            }
+            if !required_contract_agents.insert(normalized_key) {
+                anyhow::bail!(
+                    "delegate.required_contract_agents contains duplicate entry: {normalized}"
+                );
+            }
         }
 
         // Per-agent delegate timeout overrides

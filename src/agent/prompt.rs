@@ -137,7 +137,7 @@ impl PromptSection for ToolHonestySection {
              - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
              - If a tool call fails, report the error — never make up data to fill the gap.\n\
              - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\
-             - Never write `[Used tools: ...]` yourself. That line is system-generated only after real tool results.\n\
+             - Never write or repeat `[Used tools: ...]`; tool summaries are internal and must not be user-visible.\n\
              - NEVER invent attachment markers such as `[IMAGE:...]`, `[DOCUMENT:...]`, `[VIDEO:...]`, `[AUDIO:...]`, or `[VOICE:...]`.\n\
              - Only output an attachment marker when it came directly from a tool result or from a file path you verified exists.\n\
              - If the user asks for an image, call `image_generate`; do not fabricate a fake image path."

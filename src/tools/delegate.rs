@@ -165,6 +165,188 @@ fn normalize_delegate_prompt(agent_name: &str, prompt: &str) -> String {
     prompt.to_string()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubagentWorkResultContractStatus {
+    Valid,
+    Missing,
+    Invalid(Vec<String>),
+}
+
+fn extract_terminal_work_result_value(output: &str) -> Result<Option<serde_json::Value>, String> {
+    let Some((_, payload)) = output.rsplit_once("WORK_RESULT:") else {
+        return Ok(None);
+    };
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Err("empty_work_result_payload".to_string());
+    }
+    serde_json::from_str::<serde_json::Value>(payload)
+        .map(Some)
+        .map_err(|error| format!("invalid_work_result_json: {error}"))
+}
+
+fn json_string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_subagent_work_result_contract(output: &str) -> SubagentWorkResultContractStatus {
+    let value = match extract_terminal_work_result_value(output) {
+        Ok(Some(value)) => value,
+        Ok(None) => return SubagentWorkResultContractStatus::Missing,
+        Err(error) => return SubagentWorkResultContractStatus::Invalid(vec![error]),
+    };
+
+    let Some(object) = value.as_object() else {
+        return SubagentWorkResultContractStatus::Invalid(vec![
+            "work_result_payload_must_be_object".to_string(),
+        ]);
+    };
+
+    let mut issues = Vec::new();
+
+    if json_string_field(object, "schema_version") != Some("subagent_work_result.v1") {
+        issues.push("schema_version_must_be_subagent_work_result_v1".to_string());
+    }
+
+    let status = json_string_field(object, "status");
+    let allowed_statuses = [
+        "done",
+        "needs_user_action",
+        "needs_clarification",
+        "needs_confirmation",
+        "blocked",
+        "handoff",
+        "incomplete",
+    ];
+    match status {
+        Some(value) if allowed_statuses.contains(&value) => {}
+        Some(value) => issues.push(format!("unknown_status:{value}")),
+        None => issues.push("missing_status".to_string()),
+    }
+
+    for key in ["owner", "operation", "user_message"] {
+        if json_string_field(object, key).is_none() {
+            issues.push(format!("missing_{key}"));
+        }
+    }
+
+    let evidence = object.get("evidence").and_then(serde_json::Value::as_array);
+    if evidence.is_none() {
+        issues.push("evidence_must_be_array".to_string());
+    }
+    if status == Some("done") && evidence.is_none_or(Vec::is_empty) {
+        issues.push("done_requires_non_empty_evidence".to_string());
+    }
+
+    let next_action = object
+        .get("next_action")
+        .and_then(serde_json::Value::as_object);
+    let next_action_type = next_action.and_then(|action| json_string_field(action, "type"));
+    let allowed_next_actions = [
+        "finish",
+        "ask_user",
+        "redelegate_same",
+        "delegate_other",
+        "main_tool",
+        "bind_policy",
+        "schedule_announce",
+        "retry",
+    ];
+
+    match next_action_type {
+        Some(value) if allowed_next_actions.contains(&value) => {}
+        Some(value) => issues.push(format!("unknown_next_action:{value}")),
+        None => issues.push("missing_next_action_type".to_string()),
+    }
+
+    if matches!(
+        status,
+        Some("needs_user_action" | "needs_clarification" | "needs_confirmation")
+    ) && next_action_type != Some("ask_user")
+    {
+        issues.push("needs_status_requires_ask_user_next_action".to_string());
+    }
+
+    if matches!(next_action_type, Some("delegate_other" | "main_tool")) {
+        let target = next_action.and_then(|action| json_string_field(action, "target"));
+        if target.is_none() {
+            issues.push("next_action_target_required".to_string());
+        }
+    }
+
+    if status == Some("handoff") && next_action_type == Some("finish") {
+        issues.push("handoff_must_not_finish".to_string());
+    }
+
+    if issues.is_empty() {
+        SubagentWorkResultContractStatus::Valid
+    } else {
+        SubagentWorkResultContractStatus::Invalid(issues)
+    }
+}
+
+fn trace_subagent_work_result_contract(
+    agent_name: &str,
+    output: &str,
+) -> SubagentWorkResultContractStatus {
+    let output_len = output.len();
+    let status = validate_subagent_work_result_contract(output);
+    match &status {
+        SubagentWorkResultContractStatus::Valid => {
+            eprintln!(
+                "subagent_work_result_contract status=valid agent={} contract=subagent_work_result.v1 output_len={}",
+                agent_name, output_len
+            );
+            tracing::info!(
+                target: "zeroclaw::tools::delegate",
+                agent = agent_name,
+                contract = "subagent_work_result.v1",
+                output_len,
+                "subagent_work_result_contract: valid terminal WORK_RESULT envelope"
+            );
+        }
+        SubagentWorkResultContractStatus::Missing => {
+            eprintln!(
+                "subagent_work_result_contract status=missing agent={} contract=subagent_work_result.v1 warning=missing_work_result output_len={}",
+                agent_name, output_len
+            );
+            tracing::warn!(
+                target: "zeroclaw::tools::delegate",
+                agent = agent_name,
+                contract = "subagent_work_result.v1",
+                warning = "missing_work_result",
+                output_len,
+                "subagent_work_result_contract: missing terminal WORK_RESULT envelope"
+            );
+        }
+        SubagentWorkResultContractStatus::Invalid(issues) => {
+            eprintln!(
+                "subagent_work_result_contract status=invalid agent={} contract=subagent_work_result.v1 warning=invalid_work_result issues={} output_len={}",
+                agent_name,
+                issues.join(","),
+                output_len
+            );
+            tracing::warn!(
+                target: "zeroclaw::tools::delegate",
+                agent = agent_name,
+                contract = "subagent_work_result.v1",
+                warning = "invalid_work_result",
+                issues = ?issues,
+                output_len,
+                "subagent_work_result_contract: invalid WORK_RESULT envelope"
+            );
+        }
+    }
+    status
+}
+
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
@@ -312,6 +494,55 @@ impl DelegateTool {
     /// Callers can push additional tools (e.g. MCP wrappers) after construction.
     pub fn parent_tools_handle(&self) -> Arc<RwLock<Vec<Arc<dyn Tool>>>> {
         Arc::clone(&self.parent_tools)
+    }
+
+    fn requires_subagent_work_result_contract(&self, agent_name: &str) -> bool {
+        let agent_name = agent_name.trim();
+        self.delegate_config
+            .required_contract_agents
+            .iter()
+            .any(|required| required.trim().eq_ignore_ascii_case(agent_name))
+    }
+
+    fn required_contract_failure_tool_result(
+        &self,
+        agent_name: &str,
+        status: &SubagentWorkResultContractStatus,
+        output_len: usize,
+    ) -> Option<ToolResult> {
+        if !self.requires_subagent_work_result_contract(agent_name) {
+            return None;
+        }
+
+        let reason = match status {
+            SubagentWorkResultContractStatus::Valid => return None,
+            SubagentWorkResultContractStatus::Missing => "missing_work_result".to_string(),
+            SubagentWorkResultContractStatus::Invalid(issues) => {
+                format!("invalid_work_result:{}", issues.join(","))
+            }
+        };
+
+        eprintln!(
+            "subagent_work_result_contract status=blocked agent={} contract=subagent_work_result.v1 enforcement=required reason={} output_len={}",
+            agent_name, reason, output_len
+        );
+        tracing::warn!(
+            target: "zeroclaw::tools::delegate",
+            agent = agent_name,
+            contract = "subagent_work_result.v1",
+            enforcement = "required",
+            reason = reason,
+            output_len,
+            "subagent_work_result_contract: blocked required delegate result"
+        );
+
+        Some(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "The specialist result from agent '{agent_name}' could not be safely validated, so it was not used. No changes were made from that result. Retry the request or ask the user for a fresh attempt."
+            )),
+        })
     }
 }
 
@@ -581,6 +812,14 @@ impl Tool for DelegateTool {
                 let mut rendered = response.text_or_empty().to_string();
                 if rendered.trim().is_empty() {
                     rendered = "[Empty response]".to_string();
+                }
+                let contract_status = trace_subagent_work_result_contract(agent_name, &rendered);
+                if let Some(result) = self.required_contract_failure_tool_result(
+                    agent_name,
+                    &contract_status,
+                    rendered.len(),
+                ) {
+                    return Ok(result);
                 }
                 if let Some(remote_budget) = remote_budget.as_ref() {
                     let usage = response.usage.unwrap_or_default();
@@ -934,6 +1173,17 @@ impl DelegateTool {
                 } else {
                     rendered.clone()
                 };
+                let contract_status =
+                    trace_subagent_work_result_contract(agent_name, &rendered_output);
+                if response.continuation.is_none() {
+                    if let Some(result) = self.required_contract_failure_tool_result(
+                        agent_name,
+                        &contract_status,
+                        rendered_output.len(),
+                    ) {
+                        return Ok(result);
+                    }
+                }
                 let status_suffix = if response.continuation.is_some() {
                     ", continuation checkpoint"
                 } else {
@@ -1096,6 +1346,232 @@ mod tests {
             },
         );
         agents
+    }
+
+    #[test]
+    fn subagent_work_result_contract_accepts_valid_terminal_envelope() {
+        let output = r#"PROVIDER_RESULT:
+STATUS: done
+
+WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "drive",
+  "operation": "read",
+  "user_message": "Encontré 1 archivo.",
+  "evidence": [
+    {
+      "type": "api_response",
+      "summary": "Drive list returned one file.",
+      "ref": "drive:list"
+    }
+  ],
+  "next_action": {
+    "type": "finish",
+    "reason": "The read operation completed."
+  }
+}"#;
+
+        assert_eq!(
+            validate_subagent_work_result_contract(output),
+            SubagentWorkResultContractStatus::Valid
+        );
+    }
+
+    #[test]
+    fn subagent_work_result_contract_warns_when_missing() {
+        assert_eq!(
+            validate_subagent_work_result_contract("PROVIDER_RESULT:\nSTATUS: done"),
+            SubagentWorkResultContractStatus::Missing
+        );
+    }
+
+    #[test]
+    fn subagent_work_result_contract_rejects_done_without_evidence() {
+        let output = r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "mail",
+  "operation": "read",
+  "user_message": "Leí los correos.",
+  "evidence": [],
+  "next_action": {
+    "type": "finish",
+    "reason": "Done."
+  }
+}"#;
+
+        let status = validate_subagent_work_result_contract(output);
+
+        assert!(matches!(
+            status,
+            SubagentWorkResultContractStatus::Invalid(issues)
+                if issues.contains(&"done_requires_non_empty_evidence".to_string())
+        ));
+    }
+
+    #[test]
+    fn subagent_work_result_contract_rejects_non_terminal_json_trailer() {
+        let output = r#"WORK_RESULT:
+{"schema_version":"subagent_work_result.v1","status":"blocked","owner":"service_builder","operation":"create","user_message":"Bloqueado.","evidence":[],"next_action":{"type":"finish","reason":"blocked"}}
+extra prose"#;
+
+        let status = validate_subagent_work_result_contract(output);
+
+        assert!(matches!(
+            status,
+            SubagentWorkResultContractStatus::Invalid(issues)
+                if issues.iter().any(|issue| issue.starts_with("invalid_work_result_json"))
+        ));
+    }
+
+    #[test]
+    fn subagent_work_result_contract_enforces_ask_user_for_user_action() {
+        let output = r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "needs_user_action",
+  "owner": "mail",
+  "operation": "connect",
+  "user_message": "Autorizá Gmail.",
+  "evidence": [
+    {
+      "type": "auth_link",
+      "summary": "Generated auth link.",
+      "ref": "https://accounts.google.com/o/oauth2/v2/auth?state=abc"
+    }
+  ],
+  "next_action": {
+    "type": "redelegate_same",
+    "reason": "Retry."
+  }
+}"#;
+
+        let status = validate_subagent_work_result_contract(output);
+
+        assert!(matches!(
+            status,
+            SubagentWorkResultContractStatus::Invalid(issues)
+                if issues.contains(&"needs_status_requires_ask_user_next_action".to_string())
+        ));
+    }
+
+    #[test]
+    fn subagent_work_result_contract_requires_delegate_other_target() {
+        let output = r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "blocked",
+  "owner": "drive",
+  "operation": "read",
+  "user_message": "Necesito delegar a otro agente.",
+  "evidence": [
+    {
+      "type": "api_response",
+      "summary": "Drive request needs another owner.",
+      "ref": "drive:route"
+    }
+  ],
+  "next_action": {
+    "type": "delegate_other",
+    "reason": "Another agent owns the next step."
+  }
+}"#;
+
+        let status = validate_subagent_work_result_contract(output);
+
+        assert!(matches!(
+            status,
+            SubagentWorkResultContractStatus::Invalid(issues)
+                if issues.contains(&"next_action_target_required".to_string())
+        ));
+    }
+
+    #[test]
+    fn required_contract_blocks_missing_result_for_configured_agent() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security()).with_delegate_config(
+            DelegateToolConfig {
+                required_contract_agents: vec!["researcher".to_string()],
+                ..DelegateToolConfig::default()
+            },
+        );
+
+        let result = tool
+            .required_contract_failure_tool_result(
+                "researcher",
+                &SubagentWorkResultContractStatus::Missing,
+                42,
+            )
+            .expect("required agent should be blocked");
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        let error = result
+            .error
+            .expect("blocking result should explain failure");
+        assert!(error.contains("could not be safely validated"));
+        assert!(!error.contains("PROVIDER_RESULT"));
+        assert!(!error.contains("WORK_RESULT:"));
+    }
+
+    #[test]
+    fn required_contract_allows_valid_result_for_configured_agent() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security()).with_delegate_config(
+            DelegateToolConfig {
+                required_contract_agents: vec!["researcher".to_string()],
+                ..DelegateToolConfig::default()
+            },
+        );
+
+        assert!(tool
+            .required_contract_failure_tool_result(
+                "researcher",
+                &SubagentWorkResultContractStatus::Valid,
+                42,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn required_contract_blocks_invalid_result_for_configured_agent() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security()).with_delegate_config(
+            DelegateToolConfig {
+                required_contract_agents: vec!["researcher".to_string()],
+                ..DelegateToolConfig::default()
+            },
+        );
+
+        let result = tool
+            .required_contract_failure_tool_result(
+                "researcher",
+                &SubagentWorkResultContractStatus::Invalid(vec![
+                    "done_requires_non_empty_evidence".to_string(),
+                ]),
+                42,
+            )
+            .expect("required invalid result should be blocked");
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        let error = result
+            .error
+            .expect("blocking result should explain failure");
+        assert!(error.contains("could not be safely validated"));
+    }
+
+    #[test]
+    fn required_contract_keeps_optional_agents_warn_only() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+
+        assert!(tool
+            .required_contract_failure_tool_result(
+                "researcher",
+                &SubagentWorkResultContractStatus::Missing,
+                42,
+            )
+            .is_none());
     }
 
     #[derive(Default)]
@@ -2274,5 +2750,43 @@ mod tests {
             },
         );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validation_accepts_required_contract_agents_for_known_agents() {
+        let mut config = crate::config::Config::default();
+        config.agents = sample_agents();
+        config.delegate.required_contract_agents = vec!["researcher".to_string()];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validation_rejects_unknown_required_contract_agent() {
+        let mut config = crate::config::Config::default();
+        config.agents = sample_agents();
+        config.delegate.required_contract_agents = vec!["missing".to_string()];
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}")
+                .contains("delegate.required_contract_agents[0] references unknown agent: missing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_duplicate_required_contract_agents() {
+        let mut config = crate::config::Config::default();
+        config.agents = sample_agents();
+        config.delegate.required_contract_agents =
+            vec!["researcher".to_string(), "RESEARCHER".to_string()];
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}")
+                .contains("delegate.required_contract_agents contains duplicate entry: RESEARCHER"),
+            "unexpected error: {err}"
+        );
     }
 }
