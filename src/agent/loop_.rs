@@ -129,6 +129,55 @@ const SCHEDULING_SUCCESS_HINTS: &[&str] = &[
     "ya pasaron",
 ];
 
+const GENERIC_COMPLETION_SUCCESS_HINTS: &[&str] = &[
+    "completed",
+    "completo",
+    "completado",
+    "done",
+    "hecho",
+    "listo",
+    "quedo",
+    "success",
+    "terminado",
+    "verified",
+    "verificado",
+    "ya esta",
+];
+
+const GENERIC_COMPLETION_NEGATION_HINTS: &[&str] = &[
+    "blocked",
+    "bloqueado",
+    "cannot",
+    "can't",
+    "could not",
+    "couldn't",
+    "no confirm",
+    "no evidence",
+    "no esta listo",
+    "no pude",
+    "no se pudo",
+    "no voy a marcar",
+    "not completed",
+    "not confirmed",
+    "not done",
+    "sin confirmar",
+    "sin evidencia",
+    "unconfirmed",
+    "without evidence",
+];
+
+const FINAL_RESPONSE_INTERNAL_WRAPPER_HINTS: &[&str] = &[
+    "WORK_RESULT",
+    "PROVIDER_RESULT",
+    "STEP:",
+    "STATUS:",
+    "http_request",
+    "web_search_tool",
+    "tool_call",
+    "subagent",
+    "subagente",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PromptFileUsage {
     pub path: String,
@@ -2275,6 +2324,242 @@ fn tool_call_allowed_for_required_delegate_contract_repair(
     false
 }
 
+fn active_required_delegate_contract_failure_agent(
+    pending_agent: &Option<String>,
+    failures: &HashMap<String, usize>,
+) -> Option<String> {
+    pending_agent
+        .as_ref()
+        .filter(|agent| failures.get(*agent).is_some_and(|count| *count > 0))
+        .cloned()
+}
+
+#[derive(Debug, Clone)]
+struct TerminalWorkResult {
+    status: String,
+    owner: Option<String>,
+    user_message: String,
+    evidence_count: usize,
+    evidence_summaries: Vec<String>,
+    next_action_type: Option<String>,
+    next_action_target: Option<String>,
+    continuity_job_slug: Option<String>,
+}
+
+impl TerminalWorkResult {
+    fn requires_user_response(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "needs_user_action" | "needs_clarification" | "needs_confirmation"
+        ) && self.next_action_type.as_deref() == Some("ask_user")
+    }
+
+    fn is_done_without_evidence(&self) -> bool {
+        self.status == "done" && self.evidence_count == 0
+    }
+
+    fn is_service_builder_policy_bind_handoff(&self) -> bool {
+        self.status == "handoff"
+            && self
+                .owner
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case("service_builder"))
+            && self.next_action_type.as_deref() == Some("bind_policy")
+    }
+}
+
+fn json_object_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn terminal_work_result(output: &str) -> Option<TerminalWorkResult> {
+    let (_, payload) = output.rsplit_once("WORK_RESULT:")?;
+    let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+    let object = value.as_object()?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        != Some("subagent_work_result.v1")
+    {
+        return None;
+    }
+
+    let status = json_object_string_field(object, "status")?;
+    let user_message = json_object_string_field(object, "user_message")?;
+    let evidence_summaries = object
+        .get("evidence")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|summary| !summary.is_empty())
+                        .map(ToString::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let evidence_count = object
+        .get("evidence")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let next_action = object
+        .get("next_action")
+        .and_then(serde_json::Value::as_object);
+    let continuity = object
+        .get("continuity")
+        .and_then(serde_json::Value::as_object);
+
+    Some(TerminalWorkResult {
+        status,
+        owner: json_object_string_field(object, "owner"),
+        user_message,
+        evidence_count,
+        evidence_summaries,
+        next_action_type: next_action.and_then(|action| json_object_string_field(action, "type")),
+        next_action_target: next_action
+            .and_then(|action| json_object_string_field(action, "target")),
+        continuity_job_slug: continuity.and_then(|continuity| {
+            json_object_string_field(continuity, "job_slug")
+                .or_else(|| json_object_string_field(continuity, "target_id"))
+        }),
+    })
+}
+
+fn terminal_work_result_user_message(output: &str) -> Option<String> {
+    terminal_work_result(output).map(|result| result.user_message)
+}
+
+fn response_claims_generic_completion_success(display_text: &str) -> bool {
+    let normalized = normalize_provider_keyword_text(display_text);
+    GENERIC_COMPLETION_SUCCESS_HINTS
+        .iter()
+        .any(|hint| normalized.contains(hint))
+        && !GENERIC_COMPLETION_NEGATION_HINTS
+            .iter()
+            .any(|hint| normalized.contains(hint))
+}
+
+fn response_contains_internal_wrapper_hint(display_text: &str) -> bool {
+    let lowered = display_text.to_ascii_lowercase();
+    FINAL_RESPONSE_INTERNAL_WRAPPER_HINTS
+        .iter()
+        .any(|hint| display_text.contains(hint) || lowered.contains(&hint.to_ascii_lowercase()))
+}
+
+fn should_replace_final_response_with_work_result(
+    result: &TerminalWorkResult,
+    display_text: &str,
+) -> bool {
+    if result.requires_user_response() {
+        return display_text.trim() != result.user_message.trim();
+    }
+    response_contains_internal_wrapper_hint(display_text)
+}
+
+fn unverified_work_result_completion_message(history: &[ChatMessage]) -> String {
+    if prefers_spanish_for_user_message(history, None, None) {
+        "No pude confirmar que la tarea esté completa con evidencia de este turno. No voy a marcarla como completada hasta tener una evidencia verificable.".to_string()
+    } else {
+        "I could not confirm that the task is complete from current-turn evidence. I will not mark it done until there is verifiable evidence.".to_string()
+    }
+}
+
+fn procedure_policy_bind_job_slug(args: &serde_json::Value) -> Option<String> {
+    args.get("procedure_job_slug")
+        .or_else(|| args.get("job_slug"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn procedure_policy_bind_args_present(args: &serde_json::Value) -> bool {
+    procedure_policy_bind_job_slug(args).is_some()
+        || [
+            "procedure_input_schema",
+            "procedure_input_contract",
+            "procedure_output_contract",
+            "procedure_claim_contract",
+            "procedure_minimum_valid_call",
+            "procedure_sop",
+        ]
+        .iter()
+        .any(|key| args.get(*key).is_some())
+}
+
+fn service_builder_handoff_allows_procedure_policy_bind(
+    result: &TerminalWorkResult,
+    raw_output: &str,
+    args: &serde_json::Value,
+) -> bool {
+    if !result.is_service_builder_policy_bind_handoff()
+        || result.evidence_count == 0
+        || result.next_action_target.as_deref() != Some("whatsapp_configure_conversation_policy")
+    {
+        return false;
+    }
+
+    let Some(requested_slug) = procedure_policy_bind_job_slug(args) else {
+        return false;
+    };
+    let requested_slug_lower = requested_slug.to_ascii_lowercase();
+    let raw_lower = raw_output.to_ascii_lowercase();
+    let summaries = result.evidence_summaries.join("\n");
+    let summaries_lower = summaries.to_ascii_lowercase();
+    let slug_matches = result
+        .continuity_job_slug
+        .as_deref()
+        .is_some_and(|slug| slug.eq_ignore_ascii_case(&requested_slug))
+        || raw_lower.contains(&requested_slug_lower);
+    let has_verified_done = (raw_lower.contains("step: done")
+        || summaries_lower.contains("step: done"))
+        && (raw_lower.contains("status: verified")
+            || raw_lower.contains("status: scheduled")
+            || summaries_lower.contains("status: verified")
+            || summaries_lower.contains("status: scheduled")
+            || summaries_lower.contains("verified")
+            || summaries_lower.contains("scheduled"));
+
+    slug_matches && has_verified_done
+}
+
+fn unverified_procedure_policy_bind_reason(
+    tool_name: &str,
+    args: &serde_json::Value,
+    latest_handoff: Option<&(TerminalWorkResult, String)>,
+) -> Option<&'static str> {
+    if tool_name != "whatsapp_configure_conversation_policy"
+        || !procedure_policy_bind_args_present(args)
+    {
+        return None;
+    }
+
+    let Some((result, raw_output)) = latest_handoff else {
+        return Some(
+            "procedure policy binding requires a verified service_builder handoff from this turn",
+        );
+    };
+    if service_builder_handoff_allows_procedure_policy_bind(result, raw_output, args) {
+        None
+    } else {
+        Some("procedure policy binding blocked because the service_builder handoff is not verified or does not match the requested procedure")
+    }
+}
+
 fn can_enforce_delegation_contract(tools_registry: &[Box<dyn Tool>]) -> bool {
     let has_read_skill = tools_registry
         .iter()
@@ -2418,14 +2703,42 @@ fn required_delegate_contract_blocker_message(
     agent: &str,
     attempts: usize,
 ) -> String {
-    if prefers_spanish_for_user_message(history, None, None) {
-        format!(
-            "No pude completar esta solicitud porque el subagente `{agent}` no devolvio un resultado verificable despues de {attempts} intentos. No use ese resultado, no hice cambios y corte el flujo para evitar responder con informacion no validada."
-        )
+    let retried = attempts > 1;
+    let retry_phrase_es = if retried {
+        " despues de reintentar"
     } else {
-        format!(
-            "I could not complete this request because subagent `{agent}` did not return a verifiable result after {attempts} attempts. I did not use that result, did not make changes, and stopped rather than answering from unvalidated information."
-        )
+        ""
+    };
+    let retry_phrase_en = if retried { " after retrying" } else { "" };
+
+    if prefers_spanish_for_user_message(history, None, None) {
+        if agent.eq_ignore_ascii_case("service_builder") {
+            format!(
+                "No pude completar esta solicitud de servicio con un resultado verificable{retry_phrase_es}. No implemente, programe, vincule ni escribi cambios, y corte el flujo para evitar responder con informacion no validada."
+            )
+        } else if provider_delegation_target_from_agent_name(agent).is_some() {
+            format!(
+                "No pude completar esta solicitud con un resultado verificable{retry_phrase_es}. No use datos no validados ni hice cambios, y corte el flujo para evitar responder con informacion no validada. Podes pedir un nuevo intento o un nuevo enlace de autorizacion."
+            )
+        } else {
+            format!(
+                "No pude completar esta solicitud con un resultado verificable{retry_phrase_es}. No use informacion no validada ni hice cambios, y corte el flujo para evitar una respuesta insegura."
+            )
+        }
+    } else {
+        if agent.eq_ignore_ascii_case("service_builder") {
+            format!(
+                "I could not complete this service request with a verifiable result{retry_phrase_en}. I did not implement, schedule, bind, or write changes, and stopped rather than answering from unvalidated information."
+            )
+        } else if provider_delegation_target_from_agent_name(agent).is_some() {
+            format!(
+                "I could not complete this request with a verifiable result{retry_phrase_en}. I did not use unvalidated data or make changes, and stopped rather than answering from unvalidated information. You can ask me to retry or generate a new authorization link."
+            )
+        } else {
+            format!(
+                "I could not complete this request with a verifiable result{retry_phrase_en}. I did not use unvalidated information or make changes, and stopped rather than giving an unsafe answer."
+            )
+        }
     }
 }
 
@@ -8602,6 +8915,10 @@ pub(crate) async fn run_tool_call_loop(
     let mut repeated_tool_failures: HashMap<(String, String, String), usize> = HashMap::new();
     let mut required_delegate_contract_failures: HashMap<String, usize> = HashMap::new();
     let mut pending_required_delegate_contract_failure_agent: Option<String> = None;
+    let mut required_delegate_contract_repair_user_message: Option<String> = None;
+    let mut latest_delegate_work_result_for_final: Option<TerminalWorkResult> = None;
+    let mut unverified_delegate_completion_blocker: Option<String> = None;
+    let mut latest_service_builder_policy_bind_handoff: Option<(TerminalWorkResult, String)> = None;
 
     'tool_loop: for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -8922,6 +9239,7 @@ pub(crate) async fn run_tool_call_loop(
             !native_tool_calls.is_empty(),
         );
         let mut display_text = strip_tool_result_blocks(&display_text);
+        let mut forced_final_response_from_work_result: Option<String> = None;
 
         if !tool_calls.is_empty()
             && response_is_semantically_empty(&display_text)
@@ -8976,6 +9294,42 @@ pub(crate) async fn run_tool_call_loop(
                         "tool": synthesized_call.name.as_str(),
                         "attachment_count": attachment_count,
                         "input_bundle": bound_procedure_input_bundle(history).trace_payload(),
+                        "arguments": scrub_credentials(&synthesized_call.arguments.to_string()),
+                    }),
+                );
+                tool_calls.push(synthesized_call);
+                display_text.clear();
+                assistant_history_content =
+                    build_synthesized_tool_call_history_content(use_native_tools, &tool_calls);
+            }
+        }
+
+        if tool_calls.is_empty() {
+            if let Some(pending_agent) = active_required_delegate_contract_failure_agent(
+                &pending_required_delegate_contract_failure_agent,
+                &required_delegate_contract_failures,
+            ) {
+                let synthesized_call = synthesize_required_delegate_contract_repair_tool_call(
+                    history,
+                    &pending_agent,
+                    service_delegation_contract_loaded,
+                    provider_delegation_contract_loaded,
+                );
+                runtime_trace::record_event(
+                    "required_delegate_contract_direct_reply_blocked",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "agent": pending_agent,
+                        "tool": synthesized_call.name.as_str(),
+                        "blocked_response_excerpt": scrub_credentials(
+                            &truncate_with_ellipsis(&display_text, 600)
+                        ),
                         "arguments": scrub_credentials(&synthesized_call.arguments.to_string()),
                     }),
                 );
@@ -9074,15 +9428,10 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if !tool_calls.is_empty() {
-            if let Some(pending_agent) = pending_required_delegate_contract_failure_agent
-                .as_ref()
-                .filter(|agent| {
-                    required_delegate_contract_failures
-                        .get(*agent)
-                        .is_some_and(|count| *count > 0)
-                })
-                .cloned()
-            {
+            if let Some(pending_agent) = active_required_delegate_contract_failure_agent(
+                &pending_required_delegate_contract_failure_agent,
+                &required_delegate_contract_failures,
+            ) {
                 if tool_calls.iter().any(|call| {
                     !tool_call_allowed_for_required_delegate_contract_repair(call, &pending_agent)
                 }) {
@@ -9120,6 +9469,40 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
+        if !tool_calls.is_empty() {
+            if let Some(result) = latest_delegate_work_result_for_final
+                .as_ref()
+                .filter(|result| result.requires_user_response())
+            {
+                let replacement = result.user_message.clone();
+                runtime_trace::record_event(
+                    "work_result_user_action_tool_calls_blocked",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "status": result.status.as_str(),
+                        "next_action": result.next_action_type.as_deref(),
+                        "blocked_tool_calls": tool_calls
+                            .iter()
+                            .map(|call| call.name.as_str())
+                            .collect::<Vec<_>>(),
+                        "replacement_excerpt": scrub_credentials(
+                            &truncate_with_ellipsis(&replacement, 600)
+                        ),
+                    }),
+                );
+                tool_calls.clear();
+                display_text = replacement.clone();
+                forced_final_response_from_work_result = Some(replacement);
+                assistant_history_content = display_text.clone();
+            }
+        }
+
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
@@ -9134,6 +9517,63 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            let mut final_response_replacement = forced_final_response_from_work_result.clone();
+            if final_response_replacement.is_none() {
+                if let Some(blocker) = unverified_delegate_completion_blocker.as_ref() {
+                    if response_claims_generic_completion_success(&display_text) {
+                        runtime_trace::record_event(
+                            "work_result_done_without_evidence_final_response_blocked",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(true),
+                            None,
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "original_text_excerpt": scrub_credentials(
+                                    &truncate_with_ellipsis(&display_text, 600)
+                                ),
+                                "replacement_excerpt": scrub_credentials(
+                                    &truncate_with_ellipsis(blocker, 600)
+                                ),
+                            }),
+                        );
+                        display_text = blocker.clone();
+                        final_response_replacement = Some(blocker.clone());
+                    }
+                }
+            }
+
+            if final_response_replacement.is_none() {
+                if let Some(result) = latest_delegate_work_result_for_final.as_ref() {
+                    if should_replace_final_response_with_work_result(result, &display_text) {
+                        runtime_trace::record_event(
+                            "work_result_final_response_replaced",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(true),
+                            None,
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "status": result.status.as_str(),
+                                "next_action": result.next_action_type.as_deref(),
+                                "original_text_excerpt": scrub_credentials(
+                                    &truncate_with_ellipsis(&display_text, 600)
+                                ),
+                                "replacement_excerpt": scrub_credentials(
+                                    &truncate_with_ellipsis(&result.user_message, 600)
+                                ),
+                            }),
+                        );
+                        display_text = result.user_message.clone();
+                        final_response_replacement = Some(display_text.clone());
+                    }
+                }
+            }
+
             if response_is_semantically_empty(&display_text)
                 && (recent_service_builder_context(history) || user_requested_scheduling(history))
             {
@@ -9293,7 +9733,12 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            let pending_delegate_user_action = latest_delegate_work_result_for_final
+                .as_ref()
+                .is_some_and(|result| result.requires_user_response());
+
             if user_requested_scheduling(history)
+                && !pending_delegate_user_action
                 && response_claims_schedule_success(&display_text)
                 // Only enforce cron_add/cron_list when the agent actually has cron_add available.
                 // Subagents like service_builder schedule via supercronic and must not be required
@@ -9478,6 +9923,36 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            let mut final_history_content = response_text.clone();
+            if let Some(replacement) = final_response_replacement.as_ref() {
+                final_history_content = replacement.clone();
+            } else if let Some(repair_user_message) =
+                required_delegate_contract_repair_user_message.as_ref()
+            {
+                if display_text.trim() != repair_user_message.trim() {
+                    runtime_trace::record_event(
+                        "required_delegate_contract_final_response_replaced",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(true),
+                        None,
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "original_text_excerpt": scrub_credentials(
+                                &truncate_with_ellipsis(&display_text, 600)
+                            ),
+                            "replacement_excerpt": scrub_credentials(
+                                &truncate_with_ellipsis(repair_user_message, 600)
+                            ),
+                        }),
+                    );
+                    display_text = repair_user_message.clone();
+                    final_history_content = display_text.clone();
+                }
+            }
+
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -9518,7 +9993,7 @@ pub(crate) async fn run_tool_call_loop(
                     let _ = tx.send(chunk).await;
                 }
             }
-            history.push(ChatMessage::assistant(response_text.clone()));
+            history.push(ChatMessage::assistant(final_history_content));
             if let (Some(workspace_dir), Some(scope_key)) = (
                 workspace_dir,
                 continuation_scope
@@ -9683,15 +10158,10 @@ pub(crate) async fn run_tool_call_loop(
                     }),
                 );
             }
-            if let Some(pending_agent) = pending_required_delegate_contract_failure_agent
-                .as_ref()
-                .filter(|agent| {
-                    required_delegate_contract_failures
-                        .get(*agent)
-                        .is_some_and(|count| *count > 0)
-                })
-                .cloned()
-            {
+            if let Some(pending_agent) = active_required_delegate_contract_failure_agent(
+                &pending_required_delegate_contract_failure_agent,
+                &required_delegate_contract_failures,
+            ) {
                 if let Some(normalized_prompt) =
                     maybe_normalize_required_delegate_contract_repair_prompt(
                         history,
@@ -9828,6 +10298,38 @@ pub(crate) async fn run_tool_call_loop(
                     bound_procedure_tool_input_violation_repair_prompt(&violation),
                 ));
                 continue 'tool_loop;
+            }
+
+            if let Some(reason) = unverified_procedure_policy_bind_reason(
+                &tool_name,
+                &tool_args,
+                latest_service_builder_policy_bind_handoff.as_ref(),
+            ) {
+                runtime_trace::record_event(
+                    "tool_call_blocked_unverified_policy_bind",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(reason),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "tool": tool_name.clone(),
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                    }),
+                );
+                ordered_results[idx] = Some((
+                    tool_name.clone(),
+                    call.tool_call_id.clone(),
+                    ToolExecutionOutcome {
+                        output: String::new(),
+                        success: false,
+                        error_reason: Some(reason.to_string()),
+                        duration: Duration::ZERO,
+                    },
+                ));
+                continue;
             }
 
             // ── Approval hook ────────────────────────────────
@@ -10014,6 +10516,74 @@ pub(crate) async fn run_tool_call_loop(
             if outcome.success {
                 if call.name == "delegate" {
                     if let Some(agent) = delegate_agent_name_from_args(&call.arguments) {
+                        if let Some(work_result) = terminal_work_result(&outcome.output) {
+                            if work_result.is_done_without_evidence() {
+                                let blocker = unverified_work_result_completion_message(history);
+                                runtime_trace::record_event(
+                                    "work_result_done_without_evidence_observed",
+                                    Some(channel_name),
+                                    Some(provider_name),
+                                    Some(model),
+                                    Some(&turn_id),
+                                    Some(false),
+                                    Some("delegate returned done without current-turn evidence"),
+                                    serde_json::json!({
+                                        "iteration": iteration + 1,
+                                        "agent": agent.as_str(),
+                                        "owner": work_result.owner.as_deref(),
+                                        "user_message_excerpt": scrub_credentials(
+                                            &truncate_with_ellipsis(&work_result.user_message, 600)
+                                        ),
+                                    }),
+                                );
+                                unverified_delegate_completion_blocker = Some(blocker);
+                            } else {
+                                unverified_delegate_completion_blocker = None;
+                            }
+
+                            if work_result.is_service_builder_policy_bind_handoff() {
+                                latest_service_builder_policy_bind_handoff =
+                                    Some((work_result.clone(), outcome.output.clone()));
+                            } else if agent.eq_ignore_ascii_case("service_builder") {
+                                latest_service_builder_policy_bind_handoff = None;
+                            }
+
+                            if work_result.requires_user_response()
+                                || work_result.next_action_type.as_deref() == Some("finish")
+                            {
+                                latest_delegate_work_result_for_final = Some(work_result.clone());
+                            }
+                        }
+                        let repaired_required_contract =
+                            pending_required_delegate_contract_failure_agent
+                                .as_deref()
+                                .is_some_and(|pending| pending.eq_ignore_ascii_case(&agent))
+                                && required_delegate_contract_failures
+                                    .get(&agent)
+                                    .is_some_and(|count| *count > 0);
+                        if repaired_required_contract {
+                            if let Some(user_message) =
+                                terminal_work_result_user_message(&outcome.output)
+                            {
+                                runtime_trace::record_event(
+                                    "required_delegate_contract_repair_user_message_captured",
+                                    Some(channel_name),
+                                    Some(provider_name),
+                                    Some(model),
+                                    Some(&turn_id),
+                                    Some(true),
+                                    None,
+                                    serde_json::json!({
+                                        "iteration": iteration + 1,
+                                        "agent": agent,
+                                        "user_message_excerpt": scrub_credentials(
+                                            &truncate_with_ellipsis(&user_message, 600)
+                                        ),
+                                    }),
+                                );
+                                required_delegate_contract_repair_user_message = Some(user_message);
+                            }
+                        }
                         required_delegate_contract_failures.remove(&agent);
                         if pending_required_delegate_contract_failure_agent
                             .as_deref()
@@ -14761,6 +15331,734 @@ outcomes:
         }
     }
 
+    fn successful_tool_result(output: impl Into<String>) -> crate::tools::ToolResult {
+        crate::tools::ToolResult {
+            success: true,
+            output: output.into(),
+            error: None,
+        }
+    }
+
+    fn work_result_done_without_evidence() -> String {
+        r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "drive",
+  "operation": "read",
+  "user_message": "Done.",
+  "evidence": [],
+  "next_action": {
+    "type": "finish",
+    "reason": "The read completed."
+  }
+}"#
+        .to_string()
+    }
+
+    fn work_result_needs_user_action() -> String {
+        r#"PROVIDER_RESULT:
+STATUS: needs_user_action
+USER_MESSAGE: Autoriza Gmail con https://example.test/oauth
+
+WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "needs_user_action",
+  "owner": "mail",
+  "operation": "read",
+  "user_message": "Autoriza Gmail con https://example.test/oauth",
+  "evidence": [
+    {
+      "type": "auth_link",
+      "summary": "Generated current-turn OAuth link.",
+      "ref": "mail:oauth"
+    }
+  ],
+  "next_action": {
+    "type": "ask_user",
+    "reason": "Gmail authorization is required."
+  }
+}"#
+        .to_string()
+    }
+
+    fn work_result_done_with_wrapper() -> String {
+        r#"PROVIDER_RESULT:
+STATUS: done
+USER_MESSAGE: Encontré 3 archivos: A, B y C.
+
+WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "drive",
+  "operation": "read",
+  "user_message": "Encontré 3 archivos: A, B y C.",
+  "evidence": [
+    {
+      "type": "api_response",
+      "summary": "Drive list returned three visible files.",
+      "ref": "drive:list"
+    }
+  ],
+  "next_action": {
+    "type": "finish",
+    "reason": "Read-only request completed."
+  }
+}"#
+        .to_string()
+    }
+
+    fn service_builder_unverified_bind_handoff() -> String {
+        r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "handoff",
+  "owner": "service_builder",
+  "operation": "create",
+  "user_message": "The procedure needs policy binding.",
+  "evidence": [],
+  "next_action": {
+    "type": "bind_policy",
+    "target": "whatsapp_configure_conversation_policy",
+    "reason": "Bind the policy."
+  },
+  "continuity": {
+    "job_slug": "invoice-router"
+  }
+}"#
+        .to_string()
+    }
+
+    fn service_builder_verified_bind_handoff() -> String {
+        r#"STEP: done
+TARGET_ID: invoice-router
+STATUS: verified
+PROCEDURE:
+procedure_job_slug: invoice-router
+
+WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "handoff",
+  "owner": "service_builder",
+  "operation": "create",
+  "user_message": "The procedure is verified and ready for policy binding.",
+  "evidence": [
+    {
+      "type": "job_status",
+      "summary": "Procedure returned STEP: done with STATUS: verified.",
+      "ref": "invoice-router"
+    }
+  ],
+  "next_action": {
+    "type": "bind_policy",
+    "target": "whatsapp_configure_conversation_policy",
+    "reason": "Main owns policy binding."
+  },
+  "continuity": {
+    "job_slug": "invoice-router"
+  }
+}"#
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_done_work_result_without_evidence_success_claim() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"drive","prompt":"Replay invalid done without evidence."}}
+</tool_call>"#,
+            "Done.",
+        ]);
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![successful_tool_result(work_result_done_without_evidence())],
+        );
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(delegate_tool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("test invalid done result"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should block the unsupported success claim");
+
+        assert!(result.output.contains("could not confirm"));
+        assert!(!result.output.eq("Done."));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_tools_after_needs_user_action_work_result() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"mail","prompt":"Read latest Gmail."}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"mail","prompt":"Retry despite OAuth being required."}}
+</tool_call>"#,
+        ]);
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![successful_tool_result(work_result_needs_user_action())],
+        );
+        let delegate_args = delegate_tool.recorded_args();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(delegate_tool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("leer ultimo Gmail"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should stop after user action is required");
+
+        assert_eq!(
+            result.output,
+            "Autoriza Gmail con https://example.test/oauth"
+        );
+        assert_eq!(
+            delegate_args
+                .lock()
+                .expect("delegate args lock should be valid")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_replaces_wrapper_leak_with_work_result_user_message() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"drive","prompt":"List files."}}
+</tool_call>"#,
+            "PROVIDER_RESULT:\nSTATUS: done\nWORK_RESULT:\n{\"schema_version\":\"subagent_work_result.v1\"}",
+        ]);
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![successful_tool_result(work_result_done_with_wrapper())],
+        );
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(delegate_tool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("listame archivos"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should replace wrapper leakage");
+
+        assert_eq!(result.output, "Encontré 3 archivos: A, B y C.");
+        assert!(!result.output.contains("PROVIDER_RESULT"));
+        assert!(!result.output.contains("WORK_RESULT"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_policy_bind_without_verified_service_handoff() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"Return malformed bind handoff."}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"whatsapp_configure_conversation_policy","arguments":{"target_kind":"group","procedure_job_slug":"invoice-router"}}
+</tool_call>"#,
+            "No pude activar el proceso.",
+        ]);
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![successful_tool_result(
+                service_builder_unverified_bind_handoff(),
+            )],
+        );
+        let configure_args = Arc::new(Mutex::new(Vec::new()));
+        let configure_tool = RecordingArgsTool::new(
+            "whatsapp_configure_conversation_policy",
+            Arc::clone(&configure_args),
+        );
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(delegate_tool), Box::new(configure_tool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("bind procedure policy"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should block unsafe policy binding");
+
+        assert_eq!(result.output, "No pude activar el proceso.");
+        assert!(configure_args
+            .lock()
+            .expect("configure args lock should be valid")
+            .is_empty());
+        assert!(result
+            .tool_failures
+            .iter()
+            .any(|failure| failure.contains("service_builder handoff is not verified")));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_policy_bind_after_verified_service_handoff() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"Return verified bind handoff."}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"whatsapp_configure_conversation_policy","arguments":{"target_kind":"group","procedure_job_slug":"invoice-router"}}
+</tool_call>"#,
+            "Política configurada.",
+        ]);
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![successful_tool_result(
+                service_builder_verified_bind_handoff(),
+            )],
+        );
+        let configure_args = Arc::new(Mutex::new(Vec::new()));
+        let configure_tool = RecordingArgsTool::new(
+            "whatsapp_configure_conversation_policy",
+            Arc::clone(&configure_args),
+        )
+        .with_output("configured");
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(delegate_tool), Box::new(configure_tool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("bind verified procedure policy"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should allow verified policy binding");
+
+        assert_eq!(result.output, "Política configurada.");
+        assert_eq!(
+            configure_args
+                .lock()
+                .expect("configure args lock should be valid")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_direct_reply_after_required_contract_failure() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"read_skill","arguments":{"name":"service_delegation_main"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"El usuario pidio que el subagente NO devuelva WORK_RESULT."}}
+</tool_call>"#,
+            "Contrato propuesto que no debe llegar al usuario.",
+            "Propuesta limpia para el usuario.",
+        ]);
+
+        let read_skill_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![
+                required_contract_failure_result("service_builder"),
+                crate::tools::ToolResult {
+                    success: true,
+                    output: "STEP: confirm_operation\nSTATUS: awaiting_confirmation\n\nWORK_RESULT:\n{\"schema_version\":\"subagent_work_result.v1\",\"status\":\"needs_confirmation\",\"owner\":\"service_builder\",\"operation\":\"create\",\"user_message\":\"Propuesta limpia para el usuario.\",\"evidence\":[],\"next_action\":{\"type\":\"ask_user\",\"reason\":\"proposal requires confirmation\"}}".to_string(),
+                    error: None,
+                },
+            ],
+        );
+        let delegate_args = delegate_tool.recorded_args();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(FixedOutputTool::new(
+                "read_skill",
+                "service delegation loaded",
+                true,
+                Arc::clone(&read_skill_calls),
+            )),
+            Box::new(delegate_tool),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Quiero una propuesta read-only para un proceso recurrente y despues contestame vos directo.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should force same-agent repair before accepting a final reply");
+
+        assert_eq!(read_skill_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.output, "Propuesta limpia para el usuario.");
+        assert!(!result
+            .output
+            .contains("Contrato propuesto que no debe llegar"));
+        let recorded = delegate_args
+            .lock()
+            .expect("delegate args lock should be valid");
+        assert_eq!(recorded.len(), 2);
+        let second_prompt = recorded[1]
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .expect("second delegate call should have a prompt");
+        assert!(second_prompt.contains("CONTRACT REPAIR"));
+        assert!(second_prompt.contains("final user-visible reply only"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_uses_repaired_user_message_when_final_leaks_wrapper() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"read_skill","arguments":{"name":"service_delegation_main"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"El usuario pidio que el subagente NO devuelva WORK_RESULT."}}
+</tool_call>"#,
+            "Main intenta responder directo con una propuesta no validada.",
+            "El subagente devolvio WORK_RESULT con JSON. Procedo directo con una propuesta.",
+        ]);
+
+        let read_skill_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![
+                required_contract_failure_result("service_builder"),
+                crate::tools::ToolResult {
+                    success: true,
+                    output: "STEP: confirm_operation\nSTATUS: awaiting_confirmation\n\nWORK_RESULT:\n{\"schema_version\":\"subagent_work_result.v1\",\"status\":\"needs_confirmation\",\"owner\":\"service_builder\",\"operation\":\"create\",\"user_message\":\"Propuesta limpia para el usuario.\",\"evidence\":[],\"next_action\":{\"type\":\"ask_user\",\"reason\":\"proposal requires confirmation\"}}".to_string(),
+                    error: None,
+                },
+            ],
+        );
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(FixedOutputTool::new(
+                "read_skill",
+                "service delegation loaded",
+                true,
+                Arc::clone(&read_skill_calls),
+            )),
+            Box::new(delegate_tool),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Quiero una propuesta read-only para un proceso recurrente. La respuesta visible no debe exponer WORK_RESULT.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should replace leaked final text with repaired user_message");
+
+        assert_eq!(read_skill_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.output, "Propuesta limpia para el usuario.");
+        assert!(!result.output.contains("WORK_RESULT"));
+        assert!(!result.output.contains("subagente"));
+        assert!(history
+            .last()
+            .is_some_and(|message| message.content == "Propuesta limpia para el usuario."));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_does_not_cron_repair_pending_service_proposal() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"read_skill","arguments":{"name":"service_delegation_main"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"Propuesta read-only para revisar example.com los lunes."}}
+</tool_call>"#,
+            "Propuesta provisoria sin contrato.",
+            "Listo, queda programado y te avisare solo si falla.",
+        ]);
+
+        let read_skill_calls = Arc::new(AtomicUsize::new(0));
+        let cron_add_args = Arc::new(Mutex::new(Vec::new()));
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![
+                required_contract_failure_result("service_builder"),
+                crate::tools::ToolResult {
+                    success: true,
+                    output: "STEP: confirm_operation\nSTATUS: awaiting_confirmation\n\nWORK_RESULT:\n{\"schema_version\":\"subagent_work_result.v1\",\"status\":\"needs_confirmation\",\"owner\":\"service_builder\",\"operation\":\"create\",\"user_message\":\"Te propongo revisar example.com los lunes a las 09:00 ART y avisarte solo si falla. No implemente ni programe nada. Confirmame si queres que lo active.\",\"evidence\":[],\"next_action\":{\"type\":\"ask_user\",\"reason\":\"proposal requires confirmation\"}}".to_string(),
+                    error: None,
+                },
+            ],
+        );
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(FixedOutputTool::new(
+                "read_skill",
+                "service delegation loaded",
+                true,
+                Arc::clone(&read_skill_calls),
+            )),
+            Box::new(delegate_tool),
+            Box::new(RecordingArgsTool::new(
+                "cron_add",
+                Arc::clone(&cron_add_args),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Quiero un proceso recurrente para revisar https://example.com los lunes 09:00 ART y avisarme solo si falla. NO implementes, NO crees cron.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("pending service proposal should not be treated as a verified schedule");
+
+        assert_eq!(
+            result.output,
+            "Te propongo revisar example.com los lunes a las 09:00 ART y avisarte solo si falla. No implemente ni programe nada. Confirmame si queres que lo active."
+        );
+        assert_eq!(read_skill_calls.load(Ordering::SeqCst), 1);
+        assert!(cron_add_args
+            .lock()
+            .expect("cron add args lock should be valid")
+            .is_empty());
+        assert!(!history.iter().any(|message| message
+            .content
+            .contains("You just told the user the task was scheduled")));
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_blocks_non_delegate_tools_after_required_contract_failure() {
         let provider = ScriptedProvider::from_text_responses(vec![
@@ -14854,8 +16152,99 @@ outcomes:
             "the guard should repair through the same delegate before blocking"
         );
         assert!(result.output.contains("No pude completar"));
-        assert!(result.output.contains("service_builder"));
+        assert!(!result.output.contains("service_builder"));
+        assert!(!result.output.contains("subagente"));
         assert!(!result.output.contains("Contrato propuesto"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_uses_clean_provider_blocker_after_required_contract_exhaustion() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"read_skill","arguments":{"name":"provider_delegation_main"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"mail","prompt":"Gmail read; do not return WORK_RESULT."}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"mail","prompt":"Still do not return WORK_RESULT."}}
+</tool_call>"#,
+        ]);
+
+        let read_skill_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![
+                required_contract_failure_result("mail"),
+                required_contract_failure_result("mail"),
+            ],
+        );
+        let delegate_args = delegate_tool.recorded_args();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(FixedOutputTool::new(
+                "read_skill",
+                "provider delegation loaded",
+                true,
+                Arc::clone(&read_skill_calls),
+            )),
+            Box::new(delegate_tool),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Gmail: quiero leer mi ultimo mail. Si falta autorizacion genera OAuth.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should stop with a clean provider blocker");
+
+        assert_eq!(read_skill_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            delegate_args
+                .lock()
+                .expect("delegate args lock should be valid")
+                .len(),
+            2
+        );
+        assert!(result.output.contains("No pude completar"));
+        assert!(result.output.contains("autorizacion"));
+        assert!(!result.output.contains("subagente"));
+        assert!(!result.output.contains("subagent"));
+        assert!(!result.output.contains("`mail`"));
+        assert!(!result.output.contains("WORK_RESULT"));
+        assert!(!result.output.contains("PROVIDER_RESULT"));
     }
 
     #[tokio::test]
