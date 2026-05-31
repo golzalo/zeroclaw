@@ -820,6 +820,13 @@ struct TurnSideEffectPolicy {
     no_mutation_guardrails: NoMutationGuardrailsConfig,
 }
 
+#[derive(Debug, Clone)]
+struct DelegateNoMutationPolicy {
+    block_delegate: bool,
+    policy_prompt: Option<String>,
+    block_message: Option<String>,
+}
+
 fn turn_side_effect_policy(history: &[ChatMessage]) -> TurnSideEffectPolicy {
     let no_mutation_guardrails = runtime_guardrails_config().no_mutation;
     let no_mutation = no_mutation_guardrails.enabled
@@ -890,6 +897,51 @@ fn http_request_matches_allowed_write_exception(
         })
 }
 
+fn delegate_agent_name(arguments: &serde_json::Value) -> Option<&str> {
+    arguments
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+}
+
+fn no_mutation_delegate_policy_for_agent(
+    guardrails: &NoMutationGuardrailsConfig,
+    agent: &str,
+) -> DelegateNoMutationPolicy {
+    let scoped_policy = guardrails
+        .delegate_agent_policies
+        .iter()
+        .find(|(configured_agent, _)| agent.eq_ignore_ascii_case(configured_agent.trim()))
+        .map(|(_, policy)| policy);
+
+    let block_delegate = scoped_policy.is_some_and(|policy| policy.block_delegate);
+    let policy_prompt = scoped_policy
+        .and_then(|policy| policy.policy_prompt.as_deref())
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            guardrails
+                .delegate_policy_agents
+                .iter()
+                .any(|configured| agent.eq_ignore_ascii_case(configured.trim()))
+                .then(|| guardrails.delegate_policy_prompt.trim().to_string())
+        })
+        .filter(|prompt| !prompt.is_empty());
+    let block_message = scoped_policy
+        .and_then(|policy| policy.block_message.as_deref())
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(ToString::to_string);
+
+    DelegateNoMutationPolicy {
+        block_delegate,
+        policy_prompt,
+        block_message,
+    }
+}
+
 fn turn_policy_blocks_tool_call(
     policy: &TurnSideEffectPolicy,
     tool_name: &str,
@@ -908,6 +960,21 @@ fn turn_policy_blocks_tool_call(
         return Some(format!(
             "Turn no-mutation policy blocked mutating tool `{tool_name}`. The latest user message forbids implementation, scheduling, binding, file writes, or other side effects."
         ));
+    }
+
+    if tool_name.eq_ignore_ascii_case("delegate") {
+        if let Some(agent) = delegate_agent_name(arguments) {
+            let delegate_policy =
+                no_mutation_delegate_policy_for_agent(&policy.no_mutation_guardrails, agent);
+            if delegate_policy.block_delegate {
+                let reason = delegate_policy.block_message.unwrap_or_else(|| {
+                    format!(
+                        "Turn no-mutation policy blocked delegation to `{agent}`. The latest user message forbids implementation, scheduling, binding, file writes, or other side effects."
+                    )
+                });
+                return Some(reason);
+            }
+        }
     }
 
     if tool_name.eq_ignore_ascii_case("http_request") {
@@ -936,34 +1003,28 @@ fn maybe_enforce_no_mutation_service_builder_delegate_prompt(
         return None;
     }
 
+    let agent = delegate_agent_name(tool_args)?.to_string();
+    let delegate_policy =
+        no_mutation_delegate_policy_for_agent(&policy.no_mutation_guardrails, &agent);
+
     let args = tool_args.as_object_mut()?;
-    let agent = args
-        .get("agent")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    if !policy
-        .no_mutation_guardrails
-        .delegate_policy_agents
-        .iter()
-        .any(|configured| agent.eq_ignore_ascii_case(configured.trim()))
-    {
-        return None;
-    }
 
     let prompt = args
         .get("prompt")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if normalize_text_for_matching(prompt).contains("no_mutation: true") {
+
+    let policy_prompt = delegate_policy.policy_prompt?;
+    let normalized_prompt_for_matching = normalize_text_for_matching(prompt);
+    let normalized_policy_prompt = normalize_text_for_matching(&policy_prompt);
+    if !normalized_policy_prompt.is_empty()
+        && normalized_prompt_for_matching.contains(&normalized_policy_prompt)
+    {
         return None;
     }
-
-    let policy_prompt = policy
-        .no_mutation_guardrails
-        .delegate_policy_prompt
-        .trim();
-    if policy_prompt.is_empty() {
+    if normalized_policy_prompt.contains("runtime_no_mutation_policy")
+        && normalized_prompt_for_matching.contains("no_mutation: true")
+    {
         return None;
     }
 
@@ -16533,7 +16594,68 @@ WORK_RESULT:
             "method": "POST",
             "url": "http://host.docker.internal:3001/custom/oauth?provider=google"
         });
-        assert!(turn_policy_blocks_tool_call(&policy, "http_request", &custom_oauth_link).is_none());
+        assert!(
+            turn_policy_blocks_tool_call(&policy, "http_request", &custom_oauth_link).is_none()
+        );
+    }
+
+    #[test]
+    fn no_mutation_policy_blocks_configured_delegate_agent() {
+        let mut guardrails = NoMutationGuardrailsConfig::default();
+        guardrails.delegate_agent_policies.insert(
+            "coder".to_string(),
+            crate::config::NoMutationDelegateAgentPolicyConfig {
+                block_delegate: true,
+                policy_prompt: None,
+                block_message: Some("No delego a coder en turnos read-only.".to_string()),
+            },
+        );
+        let policy = TurnSideEffectPolicy {
+            no_mutation: true,
+            no_mutation_guardrails: guardrails,
+        };
+        let delegate_args = serde_json::json!({
+            "agent": "coder",
+            "prompt": "NO_MUTATION: revisar sin cambiar archivos"
+        });
+
+        let blocker = turn_policy_blocks_tool_call(&policy, "delegate", &delegate_args)
+            .expect("configured delegate agent should be blocked");
+        assert!(blocker.contains("No delego a coder"));
+    }
+
+    #[test]
+    fn no_mutation_delegate_prompt_uses_scoped_agent_policy() {
+        let mut guardrails = NoMutationGuardrailsConfig::default();
+        guardrails.delegate_agent_policies.insert(
+            "service_builder".to_string(),
+            crate::config::NoMutationDelegateAgentPolicyConfig {
+                block_delegate: false,
+                policy_prompt: Some(
+                    "STAGE9_SCOPED_POLICY:\nNO_MUTATION: true\nUse scoped rules.".to_string(),
+                ),
+                block_message: None,
+            },
+        );
+        let policy = TurnSideEffectPolicy {
+            no_mutation: true,
+            no_mutation_guardrails: guardrails,
+        };
+        let mut delegate_args = serde_json::json!({
+            "agent": "service_builder",
+            "prompt": "Preparar propuesta read-only.\nNO_MUTATION: true"
+        });
+
+        let normalized = maybe_enforce_no_mutation_service_builder_delegate_prompt(
+            &policy,
+            "delegate",
+            &mut delegate_args,
+        )
+        .expect("scoped policy prompt should be injected");
+
+        assert!(normalized.contains("STAGE9_SCOPED_POLICY"));
+        assert!(normalized.contains("NO_MUTATION: true"));
+        assert!(!normalized.contains("forbids implementation"));
     }
 
     #[test]

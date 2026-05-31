@@ -631,6 +631,13 @@ pub struct NoMutationGuardrailsConfig {
     /// Delegate agent names whose prompt should receive the runtime policy.
     #[serde(default = "default_no_mutation_delegate_policy_agents")]
     pub delegate_policy_agents: Vec<String>,
+    /// Per delegate-agent overrides for no-mutation behavior.
+    ///
+    /// Use `[runtime_guardrails.no_mutation.delegate_agent_policies.<agent>]`
+    /// to override the injected policy prompt or to block delegation entirely
+    /// for an agent while the current turn is read-only.
+    #[serde(default)]
+    pub delegate_agent_policies: HashMap<String, NoMutationDelegateAgentPolicyConfig>,
     /// Prompt section appended to configured delegate calls under no-mutation.
     #[serde(default = "default_no_mutation_policy_prompt")]
     pub delegate_policy_prompt: String,
@@ -652,11 +659,28 @@ impl Default for NoMutationGuardrailsConfig {
             allowed_http_write_url_substrings:
                 default_no_mutation_allowed_http_write_url_substrings(),
             delegate_policy_agents: default_no_mutation_delegate_policy_agents(),
+            delegate_agent_policies: HashMap::new(),
             delegate_policy_prompt: default_no_mutation_policy_prompt(),
             success_claim_hints: default_no_mutation_success_claim_hints(),
             success_negation_hints: default_no_mutation_success_negation_hints(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct NoMutationDelegateAgentPolicyConfig {
+    /// Block delegation to this agent while the latest user turn is no-mutation.
+    #[serde(default)]
+    pub block_delegate: bool,
+    /// Optional custom policy prompt for this agent. When omitted, the global
+    /// `delegate_policy_prompt` is used for agents listed in
+    /// `delegate_policy_agents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_prompt: Option<String>,
+    /// Optional user-safe reason included in runtime traces when delegation is
+    /// blocked. Keep this free of internal details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_message: Option<String>,
 }
 
 impl NoMutationGuardrailsConfig {
@@ -693,6 +717,7 @@ impl NoMutationGuardrailsConfig {
             "runtime_guardrails.no_mutation.success_negation_hints",
             &self.success_negation_hints,
         )?;
+        self.validate_delegate_agent_policies()?;
 
         for (i, method) in self.read_only_http_methods.iter().enumerate() {
             let normalized = method.trim();
@@ -717,6 +742,51 @@ impl NoMutationGuardrailsConfig {
             anyhow::bail!(
                 "runtime_guardrails.no_mutation.delegate_policy_prompt must include NO_MUTATION: true"
             );
+        }
+
+        Ok(())
+    }
+
+    fn validate_delegate_agent_policies(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for (agent, policy) in &self.delegate_agent_policies {
+            let normalized_agent = agent.trim();
+            if normalized_agent.is_empty() {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.delegate_agent_policies contains an empty agent name"
+                );
+            }
+            let agent_key = normalized_agent.to_ascii_lowercase();
+            if !seen.insert(agent_key) {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.delegate_agent_policies contains duplicate agent entry: {normalized_agent}"
+                );
+            }
+
+            if let Some(prompt) = policy.policy_prompt.as_deref() {
+                let normalized_prompt = prompt.trim();
+                if normalized_prompt.is_empty() {
+                    anyhow::bail!(
+                        "runtime_guardrails.no_mutation.delegate_agent_policies.{normalized_agent}.policy_prompt must not be empty"
+                    );
+                }
+                if !normalized_prompt
+                    .to_ascii_lowercase()
+                    .contains("no_mutation: true")
+                {
+                    anyhow::bail!(
+                        "runtime_guardrails.no_mutation.delegate_agent_policies.{normalized_agent}.policy_prompt must include NO_MUTATION: true"
+                    );
+                }
+            }
+
+            if let Some(message) = policy.block_message.as_deref() {
+                if message.trim().is_empty() {
+                    anyhow::bail!(
+                        "runtime_guardrails.no_mutation.delegate_agent_policies.{normalized_agent}.block_message must not be empty"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -9330,6 +9400,27 @@ mod tests {
         let error = c
             .validate()
             .expect_err("delegate policy prompt without marker should fail");
+        assert!(error.to_string().contains("NO_MUTATION: true"));
+    }
+
+    #[test]
+    async fn config_validate_requires_scoped_no_mutation_prompt_marker() {
+        let mut c = Config::default();
+        c.runtime_guardrails
+            .no_mutation
+            .delegate_agent_policies
+            .insert(
+                "service_builder".to_string(),
+                NoMutationDelegateAgentPolicyConfig {
+                    block_delegate: false,
+                    policy_prompt: Some("Scoped read-only policy.".to_string()),
+                    block_message: None,
+                },
+            );
+
+        let error = c
+            .validate()
+            .expect_err("scoped policy prompt without marker should fail");
         assert!(error.to_string().contains("NO_MUTATION: true"));
     }
 

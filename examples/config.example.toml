@@ -28,6 +28,10 @@ allowed_http_write_url_substrings = ["/cloud/providers/", "/authorization-link"]
 # Delegate agents that receive the runtime no-mutation policy in their prompt.
 delegate_policy_agents = ["service_builder"]
 
+# Optional per-agent override. Set block_delegate = true to fail closed instead.
+[runtime_guardrails.no_mutation.delegate_agent_policies.service_builder]
+policy_prompt = "RUNTIME_NO_MUTATION_POLICY:\nNO_MUTATION: true\nThis service_builder turn is read-only. Return a proposal or blocker only, and do not claim implementation, scheduling, binding, or file writes without verified current-turn evidence."
+
 # ── Delegate Agent Configuration ────────────────────────────────
 # Define individual sub-agents that can be invoked via the delegate tool.
 # Each agent can override the global timeout values.
