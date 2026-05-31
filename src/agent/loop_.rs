@@ -1,7 +1,7 @@
 use crate::agent::side_effect_claims::{SideEffectClaimTracker, UnverifiedSideEffectClaim};
 use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
-use crate::config::Config;
+use crate::config::{runtime_guardrails_config, Config, NoMutationGuardrailsConfig};
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
@@ -484,100 +484,6 @@ const SERVICE_BUILDER_COMPLETION_HINTS: &[&str] = &[
     "ya está listo",
 ];
 
-const NO_MUTATION_REQUEST_HINTS: &[&str] = &[
-    "do not bind",
-    "do not create",
-    "do not edit",
-    "do not implement",
-    "do not mutate",
-    "do not schedule",
-    "do not write",
-    "no bind",
-    "no crear",
-    "no crees",
-    "no cron",
-    "no edites",
-    "no files",
-    "no implement",
-    "no implementes",
-    "no job",
-    "no mutation",
-    "no programes",
-    "no schedule",
-    "no escribas",
-    "no_mutation",
-    "read only",
-    "read-only",
-    "solo propuesta",
-    "solo read-only",
-    "sin crear",
-    "sin implementar",
-    "sin modificar",
-    "sin programar",
-];
-
-const NO_MUTATION_MUTATING_TOOL_NAMES: &[&str] = &[
-    "cron_add",
-    "cron_remove",
-    "cron_update",
-    "file_edit",
-    "file_write",
-    "whatsapp_configure_conversation_policy",
-    "whatsapp_create_topic_group",
-    "whatsapp_observe_group",
-    "whatsapp_start_direct_conversation",
-    "whatsapp_unobserve_group",
-];
-
-const NO_MUTATION_SUCCESS_CLAIM_HINTS: &[&str] = &[
-    "active",
-    "activo",
-    "completado",
-    "configurado",
-    "creado",
-    "done",
-    "hecho",
-    "implementado",
-    "linked",
-    "listo",
-    "programado",
-    "scheduled",
-    "vinculado",
-    "ya esta",
-    "ya está",
-];
-
-const NO_MUTATION_SUCCESS_NEGATION_HINTS: &[&str] = &[
-    "did not",
-    "i did not",
-    "no active",
-    "no configure",
-    "no configured",
-    "no cree",
-    "no cree ningun",
-    "no creé",
-    "no creé ningún",
-    "no hice",
-    "no implemente",
-    "no implementé",
-    "no programe",
-    "no programé",
-    "no vincul",
-    "not active",
-    "not configured",
-    "not created",
-    "not implemented",
-    "not linked",
-    "not scheduled",
-    "sin configurar",
-    "sin crear",
-    "sin implementar",
-    "sin programar",
-    "without creating",
-    "without implementing",
-    "without scheduling",
-];
-
 const CONTINUATION_CHECKPOINT_OPEN_TAG: &str = "<continuation_checkpoint>";
 const CONTINUATION_CHECKPOINT_CLOSE_TAG: &str = "</continuation_checkpoint>";
 const CONTINUATION_CHECKPOINT_REF_OPEN_TAG: &str = "<continuation_checkpoint_ref>";
@@ -908,21 +814,43 @@ fn user_requested_scheduling(history: &[ChatMessage]) -> bool {
         .any(|hint| last_user.contains(hint))
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct TurnSideEffectPolicy {
     no_mutation: bool,
+    no_mutation_guardrails: NoMutationGuardrailsConfig,
 }
 
 fn turn_side_effect_policy(history: &[ChatMessage]) -> TurnSideEffectPolicy {
-    let no_mutation = latest_human_user_message(history).is_some_and(message_requests_no_mutation);
-    TurnSideEffectPolicy { no_mutation }
+    let no_mutation_guardrails = runtime_guardrails_config().no_mutation;
+    let no_mutation = no_mutation_guardrails.enabled
+        && latest_human_user_message(history).is_some_and(|message| {
+            message_requests_no_mutation_with_config(message, &no_mutation_guardrails)
+        });
+    TurnSideEffectPolicy {
+        no_mutation,
+        no_mutation_guardrails,
+    }
 }
 
 fn message_requests_no_mutation(message: &str) -> bool {
+    let no_mutation_guardrails = runtime_guardrails_config().no_mutation;
+    message_requests_no_mutation_with_config(message, &no_mutation_guardrails)
+}
+
+fn message_requests_no_mutation_with_config(
+    message: &str,
+    guardrails: &NoMutationGuardrailsConfig,
+) -> bool {
+    if !guardrails.enabled {
+        return false;
+    }
+
     let normalized = normalize_text_for_matching(message);
-    NO_MUTATION_REQUEST_HINTS
+    guardrails
+        .request_hints
         .iter()
-        .any(|hint| normalized.contains(hint))
+        .map(|hint| normalize_text_for_matching(hint))
+        .any(|hint| !hint.is_empty() && normalized.contains(&hint))
 }
 
 fn http_request_method(arguments: &serde_json::Value) -> String {
@@ -934,23 +862,36 @@ fn http_request_method(arguments: &serde_json::Value) -> String {
         .to_ascii_uppercase()
 }
 
-fn http_request_is_read_only(method: &str) -> bool {
-    matches!(method, "GET" | "HEAD" | "OPTIONS")
+fn http_request_is_read_only(method: &str, guardrails: &NoMutationGuardrailsConfig) -> bool {
+    guardrails
+        .read_only_http_methods
+        .iter()
+        .any(|candidate| method.eq_ignore_ascii_case(candidate.trim()))
 }
 
-fn http_request_is_current_auth_link_request(arguments: &serde_json::Value) -> bool {
+fn http_request_matches_allowed_write_exception(
+    arguments: &serde_json::Value,
+    guardrails: &NoMutationGuardrailsConfig,
+) -> bool {
+    if guardrails.allowed_http_write_url_substrings.is_empty() {
+        return false;
+    }
+
     arguments
         .get("url")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|url| {
             let normalized = url.to_ascii_lowercase();
-            normalized.contains("/cloud/providers/")
-                && normalized.contains("/authorization-link")
+            guardrails
+                .allowed_http_write_url_substrings
+                .iter()
+                .map(|substring| substring.trim().to_ascii_lowercase())
+                .all(|substring| !substring.is_empty() && normalized.contains(&substring))
         })
 }
 
 fn turn_policy_blocks_tool_call(
-    policy: TurnSideEffectPolicy,
+    policy: &TurnSideEffectPolicy,
     tool_name: &str,
     arguments: &serde_json::Value,
 ) -> Option<String> {
@@ -958,7 +899,9 @@ fn turn_policy_blocks_tool_call(
         return None;
     }
 
-    if NO_MUTATION_MUTATING_TOOL_NAMES
+    if policy
+        .no_mutation_guardrails
+        .blocked_tools
         .iter()
         .any(|blocked| tool_name.eq_ignore_ascii_case(blocked))
     {
@@ -969,8 +912,11 @@ fn turn_policy_blocks_tool_call(
 
     if tool_name.eq_ignore_ascii_case("http_request") {
         let method = http_request_method(arguments);
-        if !http_request_is_read_only(&method)
-            && !http_request_is_current_auth_link_request(arguments)
+        if !http_request_is_read_only(&method, &policy.no_mutation_guardrails)
+            && !http_request_matches_allowed_write_exception(
+                arguments,
+                &policy.no_mutation_guardrails,
+            )
         {
             return Some(format!(
                 "Turn no-mutation policy blocked non-read HTTP method `{method}`. Only read-only HTTP requests or explicit OAuth authorization-link generation are allowed in this turn."
@@ -982,7 +928,7 @@ fn turn_policy_blocks_tool_call(
 }
 
 fn maybe_enforce_no_mutation_service_builder_delegate_prompt(
-    policy: TurnSideEffectPolicy,
+    policy: &TurnSideEffectPolicy,
     tool_name: &str,
     tool_args: &mut serde_json::Value,
 ) -> Option<String> {
@@ -996,7 +942,12 @@ fn maybe_enforce_no_mutation_service_builder_delegate_prompt(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
-    if !agent.eq_ignore_ascii_case("service_builder") {
+    if !policy
+        .no_mutation_guardrails
+        .delegate_policy_agents
+        .iter()
+        .any(|configured| agent.eq_ignore_ascii_case(configured.trim()))
+    {
         return None;
     }
 
@@ -1008,9 +959,15 @@ fn maybe_enforce_no_mutation_service_builder_delegate_prompt(
         return None;
     }
 
-    let normalized_prompt = format!(
-        "{prompt}\n\nRUNTIME_NO_MUTATION_POLICY:\nNO_MUTATION: true\nThe latest user message forbids implementation, scheduling, binding, file writes, job creation, cron creation, and other side effects. Treat this as a read-only proposal/blocker turn. Return a terminal WORK_RESULT user_message that does not claim anything was created, scheduled, active, configured, or linked unless the latest verified evidence already proves it."
-    );
+    let policy_prompt = policy
+        .no_mutation_guardrails
+        .delegate_policy_prompt
+        .trim();
+    if policy_prompt.is_empty() {
+        return None;
+    }
+
+    let normalized_prompt = format!("{prompt}\n\n{policy_prompt}");
     args.insert(
         "prompt".to_string(),
         serde_json::Value::String(normalized_prompt.clone()),
@@ -1018,14 +975,21 @@ fn maybe_enforce_no_mutation_service_builder_delegate_prompt(
     Some(normalized_prompt)
 }
 
-fn response_claims_no_mutation_side_effect_success(display_text: &str) -> bool {
+fn response_claims_no_mutation_side_effect_success(
+    display_text: &str,
+    guardrails: &NoMutationGuardrailsConfig,
+) -> bool {
     let normalized = normalize_text_for_matching(display_text);
-    NO_MUTATION_SUCCESS_CLAIM_HINTS
+    guardrails
+        .success_claim_hints
         .iter()
-        .any(|hint| normalized.contains(hint))
-        && !NO_MUTATION_SUCCESS_NEGATION_HINTS
+        .map(|hint| normalize_text_for_matching(hint))
+        .any(|hint| !hint.is_empty() && normalized.contains(&hint))
+        && !guardrails
+            .success_negation_hints
             .iter()
-            .any(|hint| normalized.contains(hint))
+            .map(|hint| normalize_text_for_matching(hint))
+            .any(|hint| !hint.is_empty() && normalized.contains(&hint))
 }
 
 fn no_mutation_success_claim_blocker_message(history: &[ChatMessage]) -> String {
@@ -9961,7 +9925,10 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             if turn_side_effect_policy.no_mutation
-                && response_claims_no_mutation_side_effect_success(&display_text)
+                && response_claims_no_mutation_side_effect_success(
+                    &display_text,
+                    &turn_side_effect_policy.no_mutation_guardrails,
+                )
             {
                 let blocker = no_mutation_success_claim_blocker_message(history);
                 runtime_trace::record_event(
@@ -10445,7 +10412,7 @@ pub(crate) async fn run_tool_call_loop(
             }
             if let Some(normalized_prompt) =
                 maybe_enforce_no_mutation_service_builder_delegate_prompt(
-                    turn_side_effect_policy,
+                    &turn_side_effect_policy,
                     &tool_name,
                     &mut tool_args,
                 )
@@ -10467,7 +10434,7 @@ pub(crate) async fn run_tool_call_loop(
                 );
             }
             if let Some(blocked) =
-                turn_policy_blocks_tool_call(turn_side_effect_policy, &tool_name, &tool_args)
+                turn_policy_blocks_tool_call(&turn_side_effect_policy, &tool_name, &tool_args)
             {
                 runtime_trace::record_event(
                     "tool_call_blocked_by_turn_side_effect_policy",
@@ -16520,20 +16487,70 @@ WORK_RESULT:
 
     #[test]
     fn no_mutation_policy_blocks_provider_writes_but_allows_oauth_link() {
-        let policy = TurnSideEffectPolicy { no_mutation: true };
+        let policy = TurnSideEffectPolicy {
+            no_mutation: true,
+            no_mutation_guardrails: NoMutationGuardrailsConfig::default(),
+        };
 
         let provider_write = serde_json::json!({
             "method": "POST",
             "url": "http://host.docker.internal:3001/instances/i/actors/a/mail/providers/google/drafts",
             "body": {"to": "ana@example.com"}
         });
-        assert!(turn_policy_blocks_tool_call(policy, "http_request", &provider_write).is_some());
+        assert!(turn_policy_blocks_tool_call(&policy, "http_request", &provider_write).is_some());
 
         let oauth_link = serde_json::json!({
             "method": "POST",
             "url": "http://host.docker.internal:3001/instances/i/actors/a/cloud/providers/google/authorization-link?service=mail"
         });
-        assert!(turn_policy_blocks_tool_call(policy, "http_request", &oauth_link).is_none());
+        assert!(turn_policy_blocks_tool_call(&policy, "http_request", &oauth_link).is_none());
+    }
+
+    #[test]
+    fn no_mutation_policy_uses_configured_tool_and_http_exceptions() {
+        let policy = TurnSideEffectPolicy {
+            no_mutation: true,
+            no_mutation_guardrails: NoMutationGuardrailsConfig {
+                blocked_tools: vec!["custom_mutator".to_string()],
+                allowed_http_write_url_substrings: vec!["/custom/oauth".to_string()],
+                ..NoMutationGuardrailsConfig::default()
+            },
+        };
+
+        let args = serde_json::json!({});
+        assert!(turn_policy_blocks_tool_call(&policy, "custom_mutator", &args).is_some());
+        assert!(turn_policy_blocks_tool_call(&policy, "cron_add", &args).is_none());
+
+        let default_oauth_link = serde_json::json!({
+            "method": "POST",
+            "url": "http://host.docker.internal:3001/instances/i/actors/a/cloud/providers/google/authorization-link?service=mail"
+        });
+        assert!(
+            turn_policy_blocks_tool_call(&policy, "http_request", &default_oauth_link).is_some()
+        );
+
+        let custom_oauth_link = serde_json::json!({
+            "method": "POST",
+            "url": "http://host.docker.internal:3001/custom/oauth?provider=google"
+        });
+        assert!(turn_policy_blocks_tool_call(&policy, "http_request", &custom_oauth_link).is_none());
+    }
+
+    #[test]
+    fn no_mutation_detection_uses_configured_request_hints() {
+        let guardrails = NoMutationGuardrailsConfig {
+            request_hints: vec!["modo espejo".to_string()],
+            ..NoMutationGuardrailsConfig::default()
+        };
+
+        assert!(message_requests_no_mutation_with_config(
+            "Trabajemos en modo espejo: solo propuesta.",
+            &guardrails
+        ));
+        assert!(!message_requests_no_mutation_with_config(
+            "NO implementes nada por ahora.",
+            &guardrails
+        ));
     }
 
     #[tokio::test]
