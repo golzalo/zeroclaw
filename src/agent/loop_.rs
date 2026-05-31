@@ -484,6 +484,100 @@ const SERVICE_BUILDER_COMPLETION_HINTS: &[&str] = &[
     "ya está listo",
 ];
 
+const NO_MUTATION_REQUEST_HINTS: &[&str] = &[
+    "do not bind",
+    "do not create",
+    "do not edit",
+    "do not implement",
+    "do not mutate",
+    "do not schedule",
+    "do not write",
+    "no bind",
+    "no crear",
+    "no crees",
+    "no cron",
+    "no edites",
+    "no files",
+    "no implement",
+    "no implementes",
+    "no job",
+    "no mutation",
+    "no programes",
+    "no schedule",
+    "no escribas",
+    "no_mutation",
+    "read only",
+    "read-only",
+    "solo propuesta",
+    "solo read-only",
+    "sin crear",
+    "sin implementar",
+    "sin modificar",
+    "sin programar",
+];
+
+const NO_MUTATION_MUTATING_TOOL_NAMES: &[&str] = &[
+    "cron_add",
+    "cron_remove",
+    "cron_update",
+    "file_edit",
+    "file_write",
+    "whatsapp_configure_conversation_policy",
+    "whatsapp_create_topic_group",
+    "whatsapp_observe_group",
+    "whatsapp_start_direct_conversation",
+    "whatsapp_unobserve_group",
+];
+
+const NO_MUTATION_SUCCESS_CLAIM_HINTS: &[&str] = &[
+    "active",
+    "activo",
+    "completado",
+    "configurado",
+    "creado",
+    "done",
+    "hecho",
+    "implementado",
+    "linked",
+    "listo",
+    "programado",
+    "scheduled",
+    "vinculado",
+    "ya esta",
+    "ya está",
+];
+
+const NO_MUTATION_SUCCESS_NEGATION_HINTS: &[&str] = &[
+    "did not",
+    "i did not",
+    "no active",
+    "no configure",
+    "no configured",
+    "no cree",
+    "no cree ningun",
+    "no creé",
+    "no creé ningún",
+    "no hice",
+    "no implemente",
+    "no implementé",
+    "no programe",
+    "no programé",
+    "no vincul",
+    "not active",
+    "not configured",
+    "not created",
+    "not implemented",
+    "not linked",
+    "not scheduled",
+    "sin configurar",
+    "sin crear",
+    "sin implementar",
+    "sin programar",
+    "without creating",
+    "without implementing",
+    "without scheduling",
+];
+
 const CONTINUATION_CHECKPOINT_OPEN_TAG: &str = "<continuation_checkpoint>";
 const CONTINUATION_CHECKPOINT_CLOSE_TAG: &str = "</continuation_checkpoint>";
 const CONTINUATION_CHECKPOINT_REF_OPEN_TAG: &str = "<continuation_checkpoint_ref>";
@@ -812,6 +906,134 @@ fn user_requested_scheduling(history: &[ChatMessage]) -> bool {
     SCHEDULING_REQUEST_HINTS
         .iter()
         .any(|hint| last_user.contains(hint))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TurnSideEffectPolicy {
+    no_mutation: bool,
+}
+
+fn turn_side_effect_policy(history: &[ChatMessage]) -> TurnSideEffectPolicy {
+    let no_mutation = latest_human_user_message(history).is_some_and(message_requests_no_mutation);
+    TurnSideEffectPolicy { no_mutation }
+}
+
+fn message_requests_no_mutation(message: &str) -> bool {
+    let normalized = normalize_text_for_matching(message);
+    NO_MUTATION_REQUEST_HINTS
+        .iter()
+        .any(|hint| normalized.contains(hint))
+}
+
+fn http_request_method(arguments: &serde_json::Value) -> String {
+    arguments
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("GET")
+        .trim()
+        .to_ascii_uppercase()
+}
+
+fn http_request_is_read_only(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD" | "OPTIONS")
+}
+
+fn http_request_is_current_auth_link_request(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|url| {
+            let normalized = url.to_ascii_lowercase();
+            normalized.contains("/cloud/providers/")
+                && normalized.contains("/authorization-link")
+        })
+}
+
+fn turn_policy_blocks_tool_call(
+    policy: TurnSideEffectPolicy,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    if !policy.no_mutation {
+        return None;
+    }
+
+    if NO_MUTATION_MUTATING_TOOL_NAMES
+        .iter()
+        .any(|blocked| tool_name.eq_ignore_ascii_case(blocked))
+    {
+        return Some(format!(
+            "Turn no-mutation policy blocked mutating tool `{tool_name}`. The latest user message forbids implementation, scheduling, binding, file writes, or other side effects."
+        ));
+    }
+
+    if tool_name.eq_ignore_ascii_case("http_request") {
+        let method = http_request_method(arguments);
+        if !http_request_is_read_only(&method)
+            && !http_request_is_current_auth_link_request(arguments)
+        {
+            return Some(format!(
+                "Turn no-mutation policy blocked non-read HTTP method `{method}`. Only read-only HTTP requests or explicit OAuth authorization-link generation are allowed in this turn."
+            ));
+        }
+    }
+
+    None
+}
+
+fn maybe_enforce_no_mutation_service_builder_delegate_prompt(
+    policy: TurnSideEffectPolicy,
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+) -> Option<String> {
+    if !policy.no_mutation || !tool_name.eq_ignore_ascii_case("delegate") {
+        return None;
+    }
+
+    let args = tool_args.as_object_mut()?;
+    let agent = args
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !agent.eq_ignore_ascii_case("service_builder") {
+        return None;
+    }
+
+    let prompt = args
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if normalize_text_for_matching(prompt).contains("no_mutation: true") {
+        return None;
+    }
+
+    let normalized_prompt = format!(
+        "{prompt}\n\nRUNTIME_NO_MUTATION_POLICY:\nNO_MUTATION: true\nThe latest user message forbids implementation, scheduling, binding, file writes, job creation, cron creation, and other side effects. Treat this as a read-only proposal/blocker turn. Return a terminal WORK_RESULT user_message that does not claim anything was created, scheduled, active, configured, or linked unless the latest verified evidence already proves it."
+    );
+    args.insert(
+        "prompt".to_string(),
+        serde_json::Value::String(normalized_prompt.clone()),
+    );
+    Some(normalized_prompt)
+}
+
+fn response_claims_no_mutation_side_effect_success(display_text: &str) -> bool {
+    let normalized = normalize_text_for_matching(display_text);
+    NO_MUTATION_SUCCESS_CLAIM_HINTS
+        .iter()
+        .any(|hint| normalized.contains(hint))
+        && !NO_MUTATION_SUCCESS_NEGATION_HINTS
+            .iter()
+            .any(|hint| normalized.contains(hint))
+}
+
+fn no_mutation_success_claim_blocker_message(history: &[ChatMessage]) -> String {
+    if prefers_spanish_for_user_message(history, None, None) {
+        "No hice cambios ni ejecuté acciones de implementación en este turno porque el pedido estaba marcado como read-only/no-mutation. Puedo dejar una propuesta o blocker, pero no voy a confirmar ningún estado de ejecución sin evidencia verificable.".to_string()
+    } else {
+        "I did not make changes or perform implementation actions in this turn because the request was read-only/no-mutation. I can provide a proposal or blocker, but I will not confirm any execution state without verified evidence.".to_string()
+    }
 }
 
 fn response_claims_schedule_success(display_text: &str) -> bool {
@@ -1788,6 +2010,10 @@ fn latest_confirmed_pending_service_builder_contract(
         })?;
 
     if !looks_like_service_contract_confirmation(&latest_user.content) {
+        return None;
+    }
+
+    if message_requests_no_mutation(&latest_user.content) {
         return None;
     }
 
@@ -8919,6 +9145,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut latest_delegate_work_result_for_final: Option<TerminalWorkResult> = None;
     let mut unverified_delegate_completion_blocker: Option<String> = None;
     let mut latest_service_builder_policy_bind_handoff: Option<(TerminalWorkResult, String)> = None;
+    let turn_side_effect_policy = turn_side_effect_policy(history);
 
     'tool_loop: for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -9733,11 +9960,40 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            if turn_side_effect_policy.no_mutation
+                && response_claims_no_mutation_side_effect_success(&display_text)
+            {
+                let blocker = no_mutation_success_claim_blocker_message(history);
+                runtime_trace::record_event(
+                    "final_response_no_mutation_success_claim_blocked",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    Some(
+                        "assistant claimed a mutation or completion while the latest user turn forbids side effects",
+                    ),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "original_text_excerpt": scrub_credentials(
+                            &truncate_with_ellipsis(&display_text, 600)
+                        ),
+                        "replacement_excerpt": scrub_credentials(
+                            &truncate_with_ellipsis(&blocker, 600)
+                        ),
+                    }),
+                );
+                display_text = blocker.clone();
+                final_response_replacement = Some(blocker);
+            }
+
             let pending_delegate_user_action = latest_delegate_work_result_for_final
                 .as_ref()
                 .is_some_and(|result| result.requires_user_response());
 
             if user_requested_scheduling(history)
+                && final_response_replacement.is_none()
                 && !pending_delegate_user_action
                 && response_claims_schedule_success(&display_text)
                 // Only enforce cron_add/cron_list when the agent actually has cron_add available.
@@ -10162,11 +10418,11 @@ pub(crate) async fn run_tool_call_loop(
                 &pending_required_delegate_contract_failure_agent,
                 &required_delegate_contract_failures,
             ) {
-                if let Some(normalized_prompt) =
-                    maybe_normalize_required_delegate_contract_repair_prompt(
-                        history,
-                        &pending_agent,
-                        &tool_name,
+            if let Some(normalized_prompt) =
+                maybe_normalize_required_delegate_contract_repair_prompt(
+                    history,
+                    &pending_agent,
+                    &tool_name,
                         &mut tool_args,
                     )
                 {
@@ -10186,6 +10442,68 @@ pub(crate) async fn run_tool_call_loop(
                         }),
                     );
                 }
+            }
+            if let Some(normalized_prompt) =
+                maybe_enforce_no_mutation_service_builder_delegate_prompt(
+                    turn_side_effect_policy,
+                    &tool_name,
+                    &mut tool_args,
+                )
+            {
+                runtime_trace::record_event(
+                    "no_mutation_service_builder_delegate_prompt_enforced",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "prompt": scrub_credentials(
+                            &truncate_with_ellipsis(&normalized_prompt, 1200)
+                        ),
+                    }),
+                );
+            }
+            if let Some(blocked) =
+                turn_policy_blocks_tool_call(turn_side_effect_policy, &tool_name, &tool_args)
+            {
+                runtime_trace::record_event(
+                    "tool_call_blocked_by_turn_side_effect_policy",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(&blocked),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "tool": tool_name.clone(),
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "no_mutation": turn_side_effect_policy.no_mutation,
+                    }),
+                );
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(format!(
+                            "\u{274c} {}: {}\n",
+                            tool_name,
+                            truncate_with_ellipsis(&scrub_credentials(&blocked), 200)
+                        ))
+                        .await;
+                }
+                ordered_results[idx] = Some((
+                    tool_name.clone(),
+                    call.tool_call_id.clone(),
+                    ToolExecutionOutcome {
+                        output: String::new(),
+                        success: false,
+                        error_reason: Some(blocked),
+                        duration: Duration::ZERO,
+                    },
+                ));
+                continue;
             }
             if let Some(blocked) = blocked_tenant_service_execution_cron_add(&tool_name, &tool_args)
             {
@@ -16057,6 +16375,165 @@ WORK_RESULT:
         assert!(!history.iter().any(|message| message
             .content
             .contains("You just told the user the task was scheduled")));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_cron_add_under_no_mutation_policy() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"check example.com","schedule":{"kind":"cron","expr":"0 9 * * 1"}}}
+</tool_call>"#,
+            "Listo, quedó programado y activo.",
+        ]);
+
+        let cron_add_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&cron_add_args),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Propuesta read-only para revisar https://example.com los lunes. NO implementes, NO crees cron/job/schedule/bind/files.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("no-mutation policy should block root cron_add and finish safely");
+
+        assert!(cron_add_args
+            .lock()
+            .expect("cron add args lock should be valid")
+            .is_empty());
+        assert!(result.output.contains("No hice cambios"));
+        assert!(!result.output.contains("quedó programado y activo"));
+        assert!(result.tool_failures.iter().any(|failure| {
+            failure.contains("no-mutation policy") && failure.contains("cron_add")
+        }));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_no_mutation_into_service_builder_delegate_prompt() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"Preparar propuesta para revisar example.com los lunes."}}
+</tool_call>"#,
+            "Respuesta con wrapper potencial.",
+        ]);
+
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![crate::tools::ToolResult {
+                success: true,
+                output: "STEP: confirm_operation\nSTATUS: awaiting_confirmation\n\nWORK_RESULT:\n{\"schema_version\":\"subagent_work_result.v1\",\"status\":\"needs_confirmation\",\"owner\":\"service_builder\",\"operation\":\"create\",\"user_message\":\"Te dejo una propuesta read-only. No implemente, no programe y no cree archivos. Confirmame si queres avanzar.\",\"evidence\":[],\"next_action\":{\"type\":\"ask_user\",\"reason\":\"proposal requires confirmation\"}}".to_string(),
+                error: None,
+            }],
+        );
+        let delegate_args = delegate_tool.recorded_args();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(delegate_tool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Propuesta read-only para revisar https://example.com los lunes. NO implementes, no cron, no files, no bind.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("service_builder delegate prompt should be normalized under no-mutation");
+
+        assert_eq!(
+            result.output,
+            "Te dejo una propuesta read-only. No implemente, no programe y no cree archivos. Confirmame si queres avanzar."
+        );
+        let recorded = delegate_args
+            .lock()
+            .expect("delegate args lock should be valid");
+        assert_eq!(recorded.len(), 1);
+        let prompt = recorded[0]
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .expect("delegate prompt should be present");
+        assert!(prompt.contains("RUNTIME_NO_MUTATION_POLICY"));
+        assert!(prompt.contains("NO_MUTATION: true"));
+        assert!(prompt.contains("forbids implementation"));
+    }
+
+    #[test]
+    fn no_mutation_policy_blocks_provider_writes_but_allows_oauth_link() {
+        let policy = TurnSideEffectPolicy { no_mutation: true };
+
+        let provider_write = serde_json::json!({
+            "method": "POST",
+            "url": "http://host.docker.internal:3001/instances/i/actors/a/mail/providers/google/drafts",
+            "body": {"to": "ana@example.com"}
+        });
+        assert!(turn_policy_blocks_tool_call(policy, "http_request", &provider_write).is_some());
+
+        let oauth_link = serde_json::json!({
+            "method": "POST",
+            "url": "http://host.docker.internal:3001/instances/i/actors/a/cloud/providers/google/authorization-link?service=mail"
+        });
+        assert!(turn_policy_blocks_tool_call(policy, "http_request", &oauth_link).is_none());
     }
 
     #[tokio::test]
