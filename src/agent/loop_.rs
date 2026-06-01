@@ -39,6 +39,7 @@ const REQUIRED_DELEGATE_CONTRACT_FAILURE_PHRASE: &str = "could not be safely val
 const MAX_PROVIDER_DELEGATION_CONTRACT_REPAIRS_PER_TURN: usize = 2;
 const MAX_SERVICE_DELEGATION_CONTRACT_REPAIRS_PER_TURN: usize = 2;
 const MAX_VISIBLE_REPLY_CONTRACT_REPAIRS_PER_TURN: usize = 2;
+const MAX_VISIBLE_REPLY_QUALITY_REPAIRS_PER_TURN: usize = 2;
 const PROVIDER_DELEGATION_MAIN_SKILL: &str = "provider_delegation_main";
 const SERVICE_DELEGATION_MAIN_SKILL: &str = "service_delegation_main";
 
@@ -195,6 +196,39 @@ const LOW_INFORMATION_FINAL_RESPONSE_HINTS: &[&str] = &[
     "scheduled",
     "verified",
     "verificado",
+];
+
+const LOW_VALUE_VISIBLE_REPLY_PHRASES: &[&str] = &[
+    "all set",
+    "completed",
+    "correcto",
+    "process complete",
+    "proceso completo",
+    "response is clean",
+    "respuesta limpia",
+    "todo correcto",
+];
+
+const COMPLETED_WORK_RESULT_CONTRADICTION_HINTS: &[&str] = &[
+    "confirmacion explicita",
+    "confirmation",
+    "contrato",
+    "espera confirmacion",
+    "espero confirmacion",
+    "no cree",
+    "no cree archivos",
+    "no creé",
+    "no creé archivos",
+    "no files created",
+    "no files were created",
+    "no hice",
+    "no hice cambios",
+    "no hice mutaciones",
+    "no implemente",
+    "no implementé",
+    "propuesta",
+    "propuse",
+    "ready to create",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2386,6 +2420,9 @@ fn service_delegation_required_from_message(message: &str) -> bool {
     if message_has_tool_first_directive_block(message) {
         return true;
     }
+    if provider_message_describes_local_file_mutation(&normalized) {
+        return false;
+    }
 
     let has_service_noun = contains_any_keyword(
         &normalized,
@@ -2710,6 +2747,11 @@ impl TerminalWorkResult {
         self.status == "done" && self.evidence_count == 0
     }
 
+    fn blocks_followup_tool_calls(&self) -> bool {
+        self.requires_user_response()
+            || (self.status == "done" && self.next_action_type.as_deref() == Some("finish"))
+    }
+
     fn is_service_builder_policy_bind_handoff(&self) -> bool {
         self.status == "handoff"
             && self
@@ -2734,7 +2776,8 @@ fn json_object_string_field(
 
 fn terminal_work_result(output: &str) -> Option<TerminalWorkResult> {
     let (_, payload) = output.rsplit_once("WORK_RESULT:")?;
-    let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+    let mut deserializer = serde_json::Deserializer::from_str(payload.trim());
+    let value = serde_json::Value::deserialize(&mut deserializer).ok()?;
     let object = value.as_object()?;
     if object
         .get("schema_version")
@@ -2795,6 +2838,29 @@ fn terminal_work_result_user_message(output: &str) -> Option<String> {
     terminal_work_result(output).map(|result| result.user_message)
 }
 
+fn terminal_work_result_from_tool_message_content(content: &str) -> Option<TerminalWorkResult> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(inner_content) = value.get("content").and_then(serde_json::Value::as_str) {
+            if let Some(result) = terminal_work_result(inner_content) {
+                return Some(result);
+            }
+        }
+    }
+
+    terminal_work_result(content)
+}
+
+fn latest_blocking_delegate_work_result_from_history(
+    history: &[ChatMessage],
+) -> Option<TerminalWorkResult> {
+    history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| terminal_work_result_from_tool_message_content(&message.content))
+        .find(TerminalWorkResult::blocks_followup_tool_calls)
+}
+
 fn response_claims_generic_completion_success(display_text: &str) -> bool {
     let normalized = normalize_provider_keyword_text(display_text);
     GENERIC_COMPLETION_SUCCESS_HINTS
@@ -2842,6 +2908,94 @@ fn response_is_low_information_final_response(display_text: &str) -> bool {
         .any(|hint| token == *hint)
 }
 
+fn is_combining_mark(ch: char) -> bool {
+    let value = ch as u32;
+    matches!(
+        value,
+        0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+    )
+}
+
+fn is_overlay_combining_mark(ch: char) -> bool {
+    matches!(ch as u32, 0x0334..=0x0338)
+}
+
+fn is_invisible_format_mark(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0xFE00..=0xFE0F | 0xFEFF
+    )
+}
+
+fn strip_combining_and_format_marks(display_text: &str) -> String {
+    display_text
+        .chars()
+        .filter(|ch| !is_combining_mark(*ch) && !is_invisible_format_mark(*ch))
+        .collect()
+}
+
+fn response_contains_obfuscated_unicode(display_text: &str) -> bool {
+    let mut alphanumeric_count = 0usize;
+    let mut combining_count = 0usize;
+    let mut overlay_count = 0usize;
+    let mut format_count = 0usize;
+
+    for ch in display_text.chars() {
+        if ch.is_alphanumeric() {
+            alphanumeric_count += 1;
+        }
+        if is_combining_mark(ch) {
+            combining_count += 1;
+        }
+        if is_overlay_combining_mark(ch) {
+            overlay_count += 1;
+        }
+        if is_invisible_format_mark(ch) {
+            format_count += 1;
+        }
+    }
+
+    overlay_count > 0
+        || format_count > 0
+        || (combining_count >= 4 && combining_count * 2 >= alphanumeric_count.max(1))
+}
+
+fn response_is_low_value_visible_reply(display_text: &str) -> bool {
+    let stripped = strip_combining_and_format_marks(display_text);
+    let token = stripped_visible_reply_token(&stripped);
+    if LOW_VALUE_VISIBLE_REPLY_PHRASES
+        .iter()
+        .any(|phrase| token == *phrase)
+    {
+        return true;
+    }
+
+    let normalized = normalize_provider_keyword_text(&stripped);
+    normalized.contains("la respuesta visible no expone")
+        || normalized.contains("respuesta visible no expone")
+        || normalized.contains("visible response does not expose")
+}
+
+fn visible_reply_quality_issue(display_text: &str) -> Option<&'static str> {
+    if response_is_semantically_empty(display_text) {
+        return Some("semantically_empty");
+    }
+    if response_contains_obfuscated_unicode(display_text) {
+        return Some("obfuscated_unicode");
+    }
+    if response_is_low_information_final_response(display_text) {
+        return Some("low_information_placeholder");
+    }
+    if response_is_low_value_visible_reply(display_text) {
+        return Some("low_value_placeholder");
+    }
+    None
+}
+
 fn latest_user_message_requests_no_internal_wrappers(history: &[ChatMessage]) -> bool {
     let Some(message) = latest_user_message(history) else {
         return false;
@@ -2875,6 +3029,60 @@ fn latest_user_message_requests_no_internal_wrappers(history: &[ChatMessage]) ->
     .any(|hint| lowered.contains(hint))
 }
 
+fn latest_user_message_requests_visible_quality(history: &[ChatMessage]) -> bool {
+    let Some(message) = latest_user_message(history) else {
+        return false;
+    };
+    let lowered = normalize_provider_keyword_text(message);
+    [
+        "legible",
+        "normal",
+        "obfusc",
+        "quality gate",
+        "texto raro",
+        "util",
+        "useful",
+        "zalgo",
+    ]
+    .iter()
+    .any(|hint| lowered.contains(hint))
+}
+
+fn visible_reply_quality_issue_requires_repair(
+    history: &[ChatMessage],
+    display_text: &str,
+) -> Option<&'static str> {
+    let issue = visible_reply_quality_issue(display_text)?;
+    match issue {
+        "semantically_empty" | "obfuscated_unicode" => Some(issue),
+        _ if latest_user_message_requests_visible_quality(history)
+            || latest_user_message_requests_no_internal_wrappers(history) =>
+        {
+            Some(issue)
+        }
+        _ => None,
+    }
+}
+
+fn is_user_visible_final_response_channel(channel_name: &str) -> bool {
+    let normalized = channel_name.trim().to_ascii_lowercase();
+    !normalized.is_empty() && !normalized.starts_with("delegate")
+}
+
+fn response_contradicts_completed_work_result(
+    result: &TerminalWorkResult,
+    display_text: &str,
+) -> bool {
+    if result.status.as_str() != "done" || result.next_action_type.as_deref() != Some("finish") {
+        return false;
+    }
+
+    let normalized = normalize_provider_keyword_text(display_text);
+    COMPLETED_WORK_RESULT_CONTRADICTION_HINTS
+        .iter()
+        .any(|hint| normalized.contains(hint))
+}
+
 fn should_replace_final_response_with_work_result(
     result: &TerminalWorkResult,
     display_text: &str,
@@ -2883,6 +3091,9 @@ fn should_replace_final_response_with_work_result(
         return display_text.trim() != result.user_message.trim();
     }
     response_contains_internal_wrapper_hint(display_text)
+        || response_contradicts_completed_work_result(result, display_text)
+        || (visible_reply_quality_issue(display_text).is_some()
+            && visible_reply_quality_issue(&result.user_message).is_none())
         || (response_is_low_information_final_response(display_text)
             && !response_is_low_information_final_response(&result.user_message))
 }
@@ -9002,9 +9213,16 @@ async fn execute_one_tool(
                     duration,
                 })
             } else {
+                let output = if call_name == "delegate" && terminal_work_result(&r.output).is_some()
+                {
+                    scrub_credentials(&r.output)
+                } else {
+                    let reason = r.error.as_ref().unwrap_or(&r.output);
+                    format!("Error: {}", scrub_credentials(reason))
+                };
                 let reason = r.error.unwrap_or(r.output);
                 Ok(ToolExecutionOutcome {
-                    output: format!("Error: {reason}"),
+                    output,
                     success: false,
                     error_reason: Some(scrub_credentials(&reason)),
                     duration,
@@ -9325,6 +9543,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut service_delegation_contract_loaded = false;
     let mut service_delegation_contract_repair_attempts = 0usize;
     let mut visible_reply_contract_repair_attempts = 0usize;
+    let mut visible_reply_quality_repair_attempts = 0usize;
     let mut bound_procedure_terminal_reply: Option<BoundProcedureTerminalReply> = None;
     let mut side_effect_claims = SideEffectClaimTracker::default();
     let mut requests = Vec::new();
@@ -9349,6 +9568,11 @@ pub(crate) async fn run_tool_call_loop(
             .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(ToolLoopCancelled.into());
+        }
+
+        if latest_delegate_work_result_for_final.is_none() {
+            latest_delegate_work_result_for_final =
+                latest_blocking_delegate_work_result_from_history(history);
         }
 
         // Check if model switch was requested via model_switch tool.
@@ -9761,6 +9985,7 @@ pub(crate) async fn run_tool_call_loop(
 
         if tool_calls.is_empty()
             && !service_delegation_satisfied
+            && latest_delegate_work_result_for_final.is_none()
             && can_enforce_service_delegation_contract(tools_registry)
             && latest_service_delegation_required(history)
             && service_delegation_contract_repair_attempts
@@ -9891,11 +10116,11 @@ pub(crate) async fn run_tool_call_loop(
         if !tool_calls.is_empty() {
             if let Some(result) = latest_delegate_work_result_for_final
                 .as_ref()
-                .filter(|result| result.requires_user_response())
+                .filter(|result| result.blocks_followup_tool_calls())
             {
                 let replacement = result.user_message.clone();
                 runtime_trace::record_event(
-                    "work_result_user_action_tool_calls_blocked",
+                    "work_result_terminal_tool_calls_blocked",
                     Some(channel_name),
                     Some(provider_name),
                     Some(model),
@@ -9936,6 +10161,8 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            let final_response_is_user_visible =
+                is_user_visible_final_response_channel(channel_name);
             let mut final_response_replacement = forced_final_response_from_work_result.clone();
             if final_response_replacement.is_none() {
                 if let Some(blocker) = unverified_delegate_completion_blocker.as_ref() {
@@ -9964,7 +10191,7 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
-            if final_response_replacement.is_none() {
+            if final_response_replacement.is_none() && final_response_is_user_visible {
                 if let Some(result) = latest_delegate_work_result_for_final.as_ref() {
                     if should_replace_final_response_with_work_result(result, &display_text) {
                         runtime_trace::record_event(
@@ -9994,6 +10221,7 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             if final_response_replacement.is_none()
+                && final_response_is_user_visible
                 && latest_user_message_requests_no_internal_wrappers(history)
                 && response_contains_internal_wrapper_hint(&display_text)
             {
@@ -10045,6 +10273,60 @@ pub(crate) async fn run_tool_call_loop(
                 continue;
             }
 
+            if final_response_replacement.is_none() && final_response_is_user_visible {
+                if let Some(quality_issue) =
+                    visible_reply_quality_issue_requires_repair(history, &display_text)
+                {
+                    visible_reply_quality_repair_attempts += 1;
+                    runtime_trace::record_event(
+                        "final_response_visible_quality_repair",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some("assistant attempted to send a malformed or low-value visible reply"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "quality_issue": quality_issue,
+                            "repair_attempt": visible_reply_quality_repair_attempts,
+                            "max_repair_attempts": MAX_VISIBLE_REPLY_QUALITY_REPAIRS_PER_TURN,
+                            "text": scrub_credentials(&display_text),
+                        }),
+                    );
+
+                    if visible_reply_quality_repair_attempts
+                        > MAX_VISIBLE_REPLY_QUALITY_REPAIRS_PER_TURN
+                    {
+                        let blocker = if prefers_spanish_for_user_message(history, None, None) {
+                            "No pude generar una respuesta visible clara y legible para este turno. No voy a enviar texto deformado, placeholders ni trazas internas.".to_string()
+                        } else {
+                            "I could not produce a clear, readable visible reply for this turn. I will not send malformed text, placeholders, or internal traces.".to_string()
+                        };
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                            let _ = tx.send(blocker.clone()).await;
+                        }
+                        history.push(ChatMessage::assistant(blocker.clone()));
+                        tool_failures.push(format!(
+                            "visible reply: quality issue '{quality_issue}' persisted after {visible_reply_quality_repair_attempts} attempts"
+                        ));
+                        return Ok(AgentTurnOutcome {
+                            output: blocker,
+                            continuation: None,
+                            requests,
+                            tool_failures,
+                        });
+                    }
+
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    history.push(internal_repair_message(
+                        "Your final user-visible reply was malformed, obfuscated, placeholder-like, or too low-value. Rewrite it now as plain, readable, useful text for the user. Do not use combining marks, strikethrough, invisible characters, one-word placeholders, meta-confirmations about safety rules, wrappers, tool names, JSON, or internal traces. If there is verified work evidence, include the concrete result and evidence. If there is no concrete task result, say that plainly in one short normal sentence.",
+                    ));
+                    continue;
+                }
+            }
+
             if response_is_semantically_empty(&display_text)
                 && (recent_service_builder_context(history) || user_requested_scheduling(history))
             {
@@ -10092,6 +10374,7 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             if !service_delegation_satisfied
+                && latest_delegate_work_result_for_final.is_none()
                 && can_enforce_service_delegation_contract(tools_registry)
                 && latest_service_delegation_required(history)
             {
@@ -11078,6 +11361,32 @@ pub(crate) async fn run_tool_call_loop(
                     bound_procedure_failed = true;
                 }
             }
+            if !outcome.success && call.name == "delegate" {
+                if let Some(agent) = delegate_agent_name_from_args(&call.arguments) {
+                    if let Some(work_result) = terminal_work_result(&outcome.output) {
+                        side_effect_claims.record_successful_delegate_work_result(
+                            &agent,
+                            &work_result.status,
+                            &work_result.user_message,
+                            &work_result.evidence_summaries,
+                            work_result.evidence_count,
+                        );
+
+                        if work_result.is_done_without_evidence() {
+                            unverified_delegate_completion_blocker =
+                                Some(unverified_work_result_completion_message(history));
+                        } else {
+                            unverified_delegate_completion_blocker = None;
+                        }
+
+                        if work_result.requires_user_response()
+                            || work_result.next_action_type.as_deref() == Some("finish")
+                        {
+                            latest_delegate_work_result_for_final = Some(work_result);
+                        }
+                    }
+                }
+            }
             if outcome.success {
                 if call.name == "delegate" {
                     if let Some(agent) = delegate_agent_name_from_args(&call.arguments) {
@@ -11497,6 +11806,47 @@ pub(crate) async fn run_tool_call_loop(
                 requests,
                 tool_failures,
             });
+        }
+
+        if is_user_visible_final_response_channel(channel_name) {
+            if let Some(result) = latest_delegate_work_result_for_final
+                .as_ref()
+                .filter(|result| result.blocks_followup_tool_calls())
+            {
+                let terminal_reply = unverified_delegate_completion_blocker
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| result.user_message.clone());
+                runtime_trace::record_event(
+                    "work_result_terminal_reply_from_delegate",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(unverified_delegate_completion_blocker.is_none()),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "status": result.status.as_str(),
+                        "owner": result.owner.as_deref(),
+                        "next_action": result.next_action_type.as_deref(),
+                        "reply_excerpt": scrub_credentials(
+                            &truncate_with_ellipsis(&terminal_reply, 600)
+                        ),
+                    }),
+                );
+                if let Some(ref tx) = on_delta {
+                    let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    let _ = tx.send(terminal_reply.clone()).await;
+                }
+                history.push(ChatMessage::assistant(terminal_reply.clone()));
+                return Ok(AgentTurnOutcome {
+                    output: terminal_reply,
+                    continuation: None,
+                    requests,
+                    tool_failures,
+                });
+            }
         }
 
         // A model switch can be requested by a tool in the same batch as file
@@ -16284,6 +16634,92 @@ WORK_RESULT:
         ));
     }
 
+    #[test]
+    fn terminal_work_result_parses_wrapped_delegate_output_with_trailing_metadata() {
+        let output = r#"[Agent 'coder' (openai/gpt-5.4, agentic)]
+Created and verified the requested file.
+
+WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "coder",
+  "operation": "write",
+  "user_message": "Created and verified /zeroclaw-data/workspace/stage13_quality_probe.txt.",
+  "evidence": [
+    {
+      "type": "file",
+      "summary": "file_write and file_read verified stage13_quality_probe.txt.",
+      "ref": "/zeroclaw-data/workspace/stage13_quality_probe.txt"
+    }
+  ],
+  "next_action": {
+    "type": "finish",
+    "reason": "The requested file was created and verified."
+  }
+}
+
+[delegate-runtime metadata]"#;
+
+        let result = terminal_work_result(output).expect("wrapped WORK_RESULT should parse");
+
+        assert_eq!(result.status, "done");
+        assert_eq!(result.owner.as_deref(), Some("coder"));
+        assert_eq!(result.next_action_type.as_deref(), Some("finish"));
+        assert!(result.blocks_followup_tool_calls());
+    }
+
+    #[test]
+    fn visible_quality_detects_obfuscated_and_low_value_replies() {
+        let obfuscated = "P\u{0337}r\u{0337}o\u{0337}c\u{0337}e\u{0337}s\u{0337}o\u{0337} completo";
+
+        assert_eq!(
+            visible_reply_quality_issue(obfuscated),
+            Some("obfuscated_unicode")
+        );
+        assert_eq!(
+            visible_reply_quality_issue("Proceso completo"),
+            Some("low_value_placeholder")
+        );
+        assert_eq!(
+            visible_reply_quality_issue(
+                "Archivo creado y verificado con contenido exacto quality-ok-stage13."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn visible_quality_replacement_prefers_useful_work_result_message() {
+        let result = TerminalWorkResult {
+            status: "done".to_string(),
+            owner: Some("coder".to_string()),
+            user_message: "Archivo creado y verificado con contenido exacto quality-ok-stage13."
+                .to_string(),
+            evidence_count: 2,
+            evidence_summaries: vec![
+                "file_write created stage13_quality_probe.txt".to_string(),
+                "file_read confirmed quality-ok-stage13".to_string(),
+            ],
+            next_action_type: Some("finish".to_string()),
+            next_action_target: None,
+            continuity_job_slug: None,
+        };
+
+        assert!(should_replace_final_response_with_work_result(
+            &result,
+            "P\u{0337}r\u{0337}o\u{0337}c\u{0337}e\u{0337}s\u{0337}o\u{0337} completo"
+        ));
+        assert!(should_replace_final_response_with_work_result(
+            &result,
+            "Proceso completo"
+        ));
+        assert!(should_replace_final_response_with_work_result(
+            &result,
+            "Propuse el contrato para crear el archivo. No hice mutaciones todavía; espero confirmacion explicita."
+        ));
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_repairs_visible_wrapper_leak_without_work_result() {
         let provider = ScriptedProvider::from_text_responses(vec![
@@ -16336,6 +16772,234 @@ WORK_RESULT:
         assert!(!result.output.contains("STATUS"));
         assert!(!result.output.contains("http_request"));
         assert!(!result.output.contains("tool names"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_repairs_visible_quality_issue_without_work_result() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "P\u{0337}r\u{0337}o\u{0337}c\u{0337}e\u{0337}s\u{0337}o\u{0337} completo",
+            "No hay una tarea concreta para ejecutar en este turno.",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Reply with normal, readable, useful text and do not use obfuscated text.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should repair visible quality issues");
+
+        assert_eq!(
+            result.output,
+            "No hay una tarea concreta para ejecutar en este turno."
+        );
+        assert_eq!(visible_reply_quality_issue(&result.output), None);
+    }
+
+    #[tokio::test]
+    async fn visible_quality_gate_preserves_delegate_work_result_contract() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"Resultado interno preparado para Main.
+
+WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "coder",
+  "operation": "other",
+  "user_message": "Resultado interno preparado para Main.",
+  "evidence": [
+    {
+      "type": "other",
+      "summary": "Unit test evidence."
+    }
+  ],
+  "next_action": {
+    "type": "finish",
+    "reason": "The delegate result is complete."
+  }
+}"#,
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("Do not expose WORK_RESULT, wrappers, or tool names to the user."),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "delegate",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("delegate output should preserve internal WORK_RESULT contract");
+
+        assert!(result.output.contains("WORK_RESULT:"));
+        assert!(result
+            .output
+            .contains("\"schema_version\": \"subagent_work_result.v1\""));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_does_not_reopen_service_delegation_after_terminal_work_result() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"coder","prompt":"Create stage13_quality_probe.txt and verify it."}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"read_skill","arguments":{"name":"service_delegation_main"}}
+</tool_call>"#,
+        ]);
+        let read_skill_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![crate::tools::ToolResult {
+                success: false,
+                output: (r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "coder",
+  "operation": "create",
+  "user_message": "Archivo creado y verificado con contenido exacto quality-ok-stage13.",
+  "evidence": [
+    {
+      "type": "file",
+      "summary": "stage13_quality_probe.txt contiene quality-ok-stage13.",
+      "ref": "stage13_quality_probe.txt"
+    }
+  ],
+  "next_action": {
+    "type": "finish",
+    "reason": "The file was created and verified."
+  }
+}"#)
+                .to_string(),
+                error: Some("delegate wrapper reported a nonfatal failure".to_string()),
+            }],
+        );
+        let delegate_args = delegate_tool.recorded_args();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(FixedOutputTool::new(
+                "read_skill",
+                "service delegation loaded",
+                true,
+                Arc::clone(&read_skill_calls),
+            )),
+            Box::new(delegate_tool),
+        ];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Stage 13 service quality gate: creá un proceso reusable stage13-quality-probe y no propongas un tenant job si el subagente ya devolvió WORK_RESULT done/finish con evidencia actual.",
+            ),
+        ];
+        assert!(latest_service_delegation_required(&history));
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should use the terminal work result instead of reopening service flow");
+
+        assert_eq!(
+            result.output,
+            "Archivo creado y verificado con contenido exacto quality-ok-stage13."
+        );
+        assert_eq!(read_skill_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            delegate_args
+                .lock()
+                .expect("delegate args lock should be valid")
+                .len(),
+            1
+        );
+        assert!(!result.output.contains("tenant job"));
+        assert!(!result.output.contains("No files were created"));
     }
 
     #[tokio::test]
@@ -19801,6 +20465,13 @@ Tail"#;
     fn service_delegation_required_detects_recurring_website_summary_process() {
         assert!(service_delegation_required_from_message(
             "Quiero un proceso recurrente todos los viernes a las 10 ART que lea example.com y mande un resumen al grupo. No lo implementes todavía."
+        ));
+    }
+
+    #[test]
+    fn service_delegation_required_ignores_local_file_mutation_quality_prompt() {
+        assert!(!service_delegation_required_from_message(
+            "Stage 13 quality gate retest final: creá un archivo local stage13_quality_probe.txt con contenido exacto quality-ok-stage13. Si intentás responder solo 'Proceso completo', 'Listo' o texto raro, el gate debe entregar evidencia útil actual y sin wrappers."
         ));
     }
 
