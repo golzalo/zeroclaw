@@ -942,6 +942,36 @@ fn no_mutation_delegate_policy_for_agent(
     }
 }
 
+fn no_mutation_capability_block_for_tool(
+    guardrails: &NoMutationGuardrailsConfig,
+    tool_name: &str,
+) -> Option<String> {
+    guardrails
+        .capability_policies
+        .iter()
+        .find_map(|(capability, policy)| {
+            let normalized_capability = capability.trim();
+            if normalized_capability.is_empty()
+                || !policy
+                    .tools
+                    .iter()
+                    .any(|tool| tool_name.eq_ignore_ascii_case(tool.trim()))
+            {
+                return None;
+            }
+
+            let detail = policy
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("That capability is not allowed in this read-only/no-mutation turn.");
+            Some(format!(
+                "Turn no-mutation policy blocked capability `{normalized_capability}` for tool `{tool_name}`. {detail}"
+            ))
+        })
+}
+
 fn turn_policy_blocks_tool_call(
     policy: &TurnSideEffectPolicy,
     tool_name: &str,
@@ -949,6 +979,12 @@ fn turn_policy_blocks_tool_call(
 ) -> Option<String> {
     if !policy.no_mutation {
         return None;
+    }
+
+    if let Some(reason) =
+        no_mutation_capability_block_for_tool(&policy.no_mutation_guardrails, tool_name)
+    {
+        return Some(reason);
     }
 
     if policy
@@ -2256,6 +2292,49 @@ fn contains_any_keyword(message: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|keyword| message.contains(keyword))
 }
 
+fn provider_message_describes_local_file_mutation(message: &str) -> bool {
+    let explicitly_targets_remote_drive = contains_any_keyword(
+        message,
+        &["google drive", "drive", "onedrive", "sharepoint"],
+    );
+    if explicitly_targets_remote_drive {
+        return false;
+    }
+
+    let has_file_noun = contains_any_keyword(
+        message,
+        &[
+            "archivo", "archivos", "file", "files", ".txt", ".md", ".json", ".csv",
+        ],
+    );
+    let has_local_scope = contains_any_keyword(
+        message,
+        &[
+            "archivo local",
+            "archivos locales",
+            "local file",
+            "local files",
+            "workspace",
+            "/workspace/",
+            "/zeroclaw-data/workspace/",
+            "file_write",
+            "file write",
+            "file_edit",
+            "file edit",
+            "ruta",
+            "path",
+        ],
+    );
+    let has_mutation_action = contains_any_keyword(
+        message,
+        &[
+            "escrib", "write", "crea", "create", "guard", "save", "modific", "modify", "edit",
+        ],
+    );
+
+    has_file_noun && has_local_scope && has_mutation_action
+}
+
 fn provider_message_has_service_intent(message: &str) -> bool {
     contains_any_keyword(
         message,
@@ -2417,6 +2496,9 @@ fn service_delegation_required_from_message(message: &str) -> bool {
 fn provider_delegation_target_from_message(message: &str) -> Option<ProviderDelegateTarget> {
     let normalized = normalize_provider_keyword_text(message);
     if provider_message_has_service_intent(&normalized) {
+        return None;
+    }
+    if provider_message_describes_local_file_mutation(&normalized) {
         return None;
     }
 
@@ -10446,11 +10528,11 @@ pub(crate) async fn run_tool_call_loop(
                 &pending_required_delegate_contract_failure_agent,
                 &required_delegate_contract_failures,
             ) {
-            if let Some(normalized_prompt) =
-                maybe_normalize_required_delegate_contract_repair_prompt(
-                    history,
-                    &pending_agent,
-                    &tool_name,
+                if let Some(normalized_prompt) =
+                    maybe_normalize_required_delegate_contract_repair_prompt(
+                        history,
+                        &pending_agent,
+                        &tool_name,
                         &mut tool_args,
                     )
                 {
@@ -16573,6 +16655,7 @@ WORK_RESULT:
             no_mutation: true,
             no_mutation_guardrails: NoMutationGuardrailsConfig {
                 blocked_tools: vec!["custom_mutator".to_string()],
+                capability_policies: HashMap::new(),
                 allowed_http_write_url_substrings: vec!["/custom/oauth".to_string()],
                 ..NoMutationGuardrailsConfig::default()
             },
@@ -16597,6 +16680,33 @@ WORK_RESULT:
         assert!(
             turn_policy_blocks_tool_call(&policy, "http_request", &custom_oauth_link).is_none()
         );
+    }
+
+    #[test]
+    fn no_mutation_policy_blocks_configured_capability_even_without_legacy_tool_block() {
+        let mut capability_policies = HashMap::new();
+        capability_policies.insert(
+            "schedule".to_string(),
+            crate::config::NoMutationCapabilityPolicyConfig {
+                tools: vec!["cron_add".to_string()],
+                message: Some("No schedules in read-only turns.".to_string()),
+            },
+        );
+        let policy = TurnSideEffectPolicy {
+            no_mutation: true,
+            no_mutation_guardrails: NoMutationGuardrailsConfig {
+                blocked_tools: vec![],
+                capability_policies,
+                ..NoMutationGuardrailsConfig::default()
+            },
+        };
+        let args = serde_json::json!({});
+
+        let blocker = turn_policy_blocks_tool_call(&policy, "cron_add", &args)
+            .expect("capability policy should block cron_add");
+        assert!(blocker.contains("capability `schedule`"));
+        assert!(blocker.contains("No schedules"));
+        assert!(turn_policy_blocks_tool_call(&policy, "custom_mutator", &args).is_none());
     }
 
     #[test]
@@ -19399,6 +19509,24 @@ Tail"#;
         );
 
         assert_eq!(target, None);
+    }
+
+    #[test]
+    fn provider_delegation_target_skips_local_file_mutation_requests() {
+        let target = provider_delegation_target_from_message(
+            "NO_MUTATION/read-only. Intentá escribir un archivo local llamado stage10_should_not_exist.txt, pero file_write debe estar bloqueado.",
+        );
+
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn provider_delegation_target_keeps_explicit_drive_file_requests() {
+        let target = provider_delegation_target_from_message(
+            "Quiero crear un archivo en Google Drive con el resumen del dia.",
+        );
+
+        assert_eq!(target, Some(ProviderDelegateTarget::Drive));
     }
 
     #[test]

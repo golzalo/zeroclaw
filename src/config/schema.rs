@@ -620,6 +620,13 @@ pub struct NoMutationGuardrailsConfig {
     /// Root tool names that are considered mutating and must be blocked.
     #[serde(default = "default_no_mutation_blocked_tools")]
     pub blocked_tools: Vec<String>,
+    /// Named mutating capabilities and their tool members.
+    ///
+    /// This lets the runtime fail closed by operation scope (for example
+    /// `schedule` or `whatsapp_policy_mutation`) instead of only by raw tool
+    /// names. `blocked_tools` remains supported as a legacy/direct override.
+    #[serde(default = "default_no_mutation_capability_policies")]
+    pub capability_policies: HashMap<String, NoMutationCapabilityPolicyConfig>,
     /// HTTP methods treated as read-only by the `http_request` tool.
     #[serde(default = "default_no_mutation_read_only_http_methods")]
     pub read_only_http_methods: Vec<String>,
@@ -655,6 +662,7 @@ impl Default for NoMutationGuardrailsConfig {
             enabled: true,
             request_hints: default_no_mutation_request_hints(),
             blocked_tools: default_no_mutation_blocked_tools(),
+            capability_policies: default_no_mutation_capability_policies(),
             read_only_http_methods: default_no_mutation_read_only_http_methods(),
             allowed_http_write_url_substrings:
                 default_no_mutation_allowed_http_write_url_substrings(),
@@ -665,6 +673,16 @@ impl Default for NoMutationGuardrailsConfig {
             success_negation_hints: default_no_mutation_success_negation_hints(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct NoMutationCapabilityPolicyConfig {
+    /// Root tool names that belong to this mutating capability.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Optional safe explanation used in runtime traces when this capability is blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -697,6 +715,7 @@ impl NoMutationGuardrailsConfig {
             "runtime_guardrails.no_mutation.blocked_tools",
             &self.blocked_tools,
         )?;
+        self.validate_capability_policies()?;
         validate_non_empty_string_list(
             "runtime_guardrails.no_mutation.read_only_http_methods",
             &self.read_only_http_methods,
@@ -733,7 +752,9 @@ impl NoMutationGuardrailsConfig {
 
         let policy_prompt = self.delegate_policy_prompt.trim();
         if policy_prompt.is_empty() {
-            anyhow::bail!("runtime_guardrails.no_mutation.delegate_policy_prompt must not be empty");
+            anyhow::bail!(
+                "runtime_guardrails.no_mutation.delegate_policy_prompt must not be empty"
+            );
         }
         if !policy_prompt
             .to_ascii_lowercase()
@@ -742,6 +763,41 @@ impl NoMutationGuardrailsConfig {
             anyhow::bail!(
                 "runtime_guardrails.no_mutation.delegate_policy_prompt must include NO_MUTATION: true"
             );
+        }
+
+        Ok(())
+    }
+
+    fn validate_capability_policies(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for (capability, policy) in &self.capability_policies {
+            let normalized_capability = capability.trim();
+            if normalized_capability.is_empty() {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.capability_policies contains an empty capability name"
+                );
+            }
+            let capability_key = normalized_capability.to_ascii_lowercase();
+            if !seen.insert(capability_key) {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.capability_policies contains duplicate capability entry: {normalized_capability}"
+                );
+            }
+
+            validate_non_empty_string_list(
+                &format!(
+                    "runtime_guardrails.no_mutation.capability_policies.{normalized_capability}.tools"
+                ),
+                &policy.tools,
+            )?;
+
+            if let Some(message) = policy.message.as_deref() {
+                if message.trim().is_empty() {
+                    anyhow::bail!(
+                        "runtime_guardrails.no_mutation.capability_policies.{normalized_capability}.message must not be empty"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -803,6 +859,43 @@ fn default_no_mutation_request_hints() -> Vec<String> {
 
 fn default_no_mutation_blocked_tools() -> Vec<String> {
     string_vec(DEFAULT_NO_MUTATION_BLOCKED_TOOLS)
+}
+
+fn default_no_mutation_capability_policies() -> HashMap<String, NoMutationCapabilityPolicyConfig> {
+    [
+        (
+            "schedule",
+            &["cron_add", "cron_remove", "cron_update"][..],
+            "Scheduling, cron creation, cron updates, and cron removal are not allowed in read-only/no-mutation turns.",
+        ),
+        (
+            "file_mutation",
+            &["file_edit", "file_write"][..],
+            "File writes and edits are not allowed in read-only/no-mutation turns.",
+        ),
+        (
+            "whatsapp_policy_mutation",
+            &[
+                "whatsapp_configure_conversation_policy",
+                "whatsapp_create_topic_group",
+                "whatsapp_observe_group",
+                "whatsapp_start_direct_conversation",
+                "whatsapp_unobserve_group",
+            ][..],
+            "WhatsApp policy, group, and observation mutations are not allowed in read-only/no-mutation turns.",
+        ),
+    ]
+    .into_iter()
+    .map(|(capability, tools, message)| {
+        (
+            capability.to_string(),
+            NoMutationCapabilityPolicyConfig {
+                tools: tools.iter().map(|tool| (*tool).to_string()).collect(),
+                message: Some(message.to_string()),
+            },
+        )
+    })
+    .collect()
 }
 
 fn default_no_mutation_read_only_http_methods() -> Vec<String> {
@@ -9376,6 +9469,12 @@ mod tests {
         assert!(c
             .runtime_guardrails
             .no_mutation
+            .capability_policies
+            .get("schedule")
+            .is_some_and(|policy| policy.tools.iter().any(|tool| tool == "cron_add")));
+        assert!(c
+            .runtime_guardrails
+            .no_mutation
             .delegate_policy_prompt
             .contains("NO_MUTATION: true"));
     }
@@ -9383,12 +9482,32 @@ mod tests {
     #[test]
     async fn config_validate_rejects_invalid_no_mutation_guardrails() {
         let mut c = Config::default();
-        c.runtime_guardrails.no_mutation.blocked_tools.push(" ".to_string());
+        c.runtime_guardrails
+            .no_mutation
+            .blocked_tools
+            .push(" ".to_string());
 
         let error = c.validate().expect_err("blank blocked tool should fail");
         assert!(error
             .to_string()
             .contains("runtime_guardrails.no_mutation.blocked_tools"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_invalid_no_mutation_capability_policy() {
+        let mut c = Config::default();
+        c.runtime_guardrails.no_mutation.capability_policies.insert(
+            "schedule".to_string(),
+            NoMutationCapabilityPolicyConfig {
+                tools: vec![" ".to_string()],
+                message: Some("bad capability".to_string()),
+            },
+        );
+
+        let error = c.validate().expect_err("blank capability tool should fail");
+        assert!(error
+            .to_string()
+            .contains("runtime_guardrails.no_mutation.capability_policies.schedule.tools"));
     }
 
     #[test]

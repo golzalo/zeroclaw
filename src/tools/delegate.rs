@@ -2,7 +2,7 @@ use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::{build_delegate_resume_prompt, run_tool_call_loop};
 use crate::agent::subagent_history_store;
 use crate::agent::task_checkpoint_store::{self, ROOT_TASK_CHECKPOINT_AGENT};
-use crate::config::{DelegateAgentConfig, DelegateToolConfig};
+use crate::config::{runtime_guardrails_config, DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{
     self, with_provider_request_context, ChatMessage, ChatRequest, Provider, ProviderRequestContext,
@@ -34,6 +34,46 @@ fn looks_like_delegate_batch_continue_request(prompt: &str) -> bool {
 
 fn delegate_task_scope(scope_key: &str, agent_name: &str) -> String {
     format!("{scope_key}::delegate::{agent_name}")
+}
+
+fn normalize_no_mutation_text(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .replace(['\n', '\r', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn delegated_prompt_requests_no_mutation(prompt: &str) -> bool {
+    let guardrails = runtime_guardrails_config().no_mutation;
+    if !guardrails.enabled {
+        return false;
+    }
+
+    let normalized_prompt = normalize_no_mutation_text(prompt);
+    guardrails
+        .request_hints
+        .iter()
+        .map(|hint| normalize_no_mutation_text(hint))
+        .any(|hint| !hint.is_empty() && normalized_prompt.contains(&hint))
+}
+
+fn no_mutation_blocks_tool_for_delegate(tool_name: &str) -> bool {
+    let guardrails = runtime_guardrails_config().no_mutation;
+    if !guardrails.enabled {
+        return false;
+    }
+
+    guardrails.capability_policies.values().any(|policy| {
+        policy
+            .tools
+            .iter()
+            .any(|tool| tool_name.eq_ignore_ascii_case(tool.trim()))
+    }) || guardrails
+        .blocked_tools
+        .iter()
+        .any(|tool| tool_name.eq_ignore_ascii_case(tool.trim()))
 }
 
 fn contains_any(normalized: &str, terms: &[&str]) -> bool {
@@ -895,7 +935,7 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let sub_tools: Vec<Box<dyn Tool>> = {
+        let mut sub_tools: Vec<Box<dyn Tool>> = {
             let parent_tools = self.parent_tools.read();
             parent_tools
                 .iter()
@@ -916,17 +956,6 @@ impl DelegateTool {
                 })
                 .collect()
         };
-
-        if sub_tools.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
-                    agent_config.allowed_tools.join(", ")
-                )),
-            });
-        }
 
         let delegate_scope = continuation_scope
             .map(str::trim)
@@ -1039,6 +1068,31 @@ impl DelegateTool {
         };
 
         history.push(ChatMessage::user(effective_prompt.clone()));
+
+        if delegated_prompt_requests_no_mutation(&effective_prompt) {
+            let before = sub_tools.len();
+            sub_tools.retain(|tool| !no_mutation_blocks_tool_for_delegate(tool.name()));
+            let removed = before.saturating_sub(sub_tools.len());
+            if removed > 0 {
+                tracing::info!(
+                    agent = agent_name,
+                    removed,
+                    retained = sub_tools.len(),
+                    "Filtered mutating tools from no-mutation agentic delegate"
+                );
+            }
+        }
+
+        if sub_tools.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
+                    agent_config.allowed_tools.join(", ")
+                )),
+            });
+        }
 
         let quote = if let Some(remote_budget) = remote_budget {
             let (estimated_input_tokens, estimated_output_tokens) = estimate_delegate_tokens(
@@ -1822,6 +1876,17 @@ extra prose"#;
         let normalized = normalize_delegate_prompt("drive", prompt);
 
         assert_eq!(normalized, prompt);
+    }
+
+    #[test]
+    fn no_mutation_agentic_delegate_filter_blocks_mutating_tools() {
+        assert!(delegated_prompt_requests_no_mutation(
+            "NO_MUTATION/read-only: do not write files"
+        ));
+        assert!(no_mutation_blocks_tool_for_delegate("file_write"));
+        assert!(no_mutation_blocks_tool_for_delegate("cron_add"));
+        assert!(!no_mutation_blocks_tool_for_delegate("file_read"));
+        assert!(!no_mutation_blocks_tool_for_delegate("read_skill"));
     }
 
     #[test]

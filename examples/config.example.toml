@@ -28,6 +28,15 @@ allowed_http_write_url_substrings = ["/cloud/providers/", "/authorization-link"]
 # Delegate agents that receive the runtime no-mutation policy in their prompt.
 delegate_policy_agents = ["service_builder"]
 
+# Named mutating capabilities can group tools by operational scope.
+[runtime_guardrails.no_mutation.capability_policies.schedule]
+tools = ["cron_add", "cron_remove", "cron_update"]
+message = "Scheduling and cron changes are blocked in read-only/no-mutation turns."
+
+[runtime_guardrails.no_mutation.capability_policies.file_mutation]
+tools = ["file_edit", "file_write"]
+message = "File writes and edits are blocked in read-only/no-mutation turns."
+
 # Optional per-agent override. Set block_delegate = true to fail closed instead.
 [runtime_guardrails.no_mutation.delegate_agent_policies.service_builder]
 policy_prompt = "RUNTIME_NO_MUTATION_POLICY:\nNO_MUTATION: true\nThis service_builder turn is read-only. Return a proposal or blocker only, and do not claim implementation, scheduling, binding, or file writes without verified current-turn evidence."
