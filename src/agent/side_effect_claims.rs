@@ -51,6 +51,105 @@ const WHATSAPP_POLICY_REMOVAL_HINTS: &[&str] = &[
     "removed the whatsapp conversation policy",
 ];
 
+const FILE_SUCCESS_HINTS: &[&str] = &[
+    "archivo creado",
+    "archivo escrito",
+    "archivo guardado",
+    "cree el archivo",
+    "creé el archivo",
+    "escribi el archivo",
+    "escribí el archivo",
+    "file created",
+    "file written",
+    "file_write created",
+    "file_write wrote",
+    "file_edit edited",
+    "saved the file",
+    "written the file",
+    "created /",
+    "has been created",
+    "created and verified",
+    "creation and verification succeeded",
+    "archivo creado y verificado",
+    "creado y verificado",
+    "creado, leido",
+    "creado, leído",
+    "creado y leido",
+    "creado y leído",
+    "fue creado",
+    "se creo",
+    "se creó",
+];
+
+const FILE_BARE_SUCCESS_RESPONSES: &[&str] = &["creado", "created"];
+
+const FILE_SUCCESS_NEGATION_HINTS: &[&str] = &[
+    "no puedo confirmar",
+    "no puedo decir",
+    "no hay evidencia",
+    "sin evidencia",
+    "no cree",
+    "no creé",
+    "no escribi",
+    "no escribí",
+    "no guardé",
+    "no guarde",
+    "no hice cambios",
+    "no fue creado",
+    "not created",
+    "did not create",
+    "did not write",
+    "didn't create",
+    "didn't write",
+    "cannot confirm",
+    "cannot truthfully say",
+    "no evidence",
+    "no verified evidence",
+];
+
+const SCHEDULE_SUCCESS_HINTS: &[&str] = &[
+    "cron creado",
+    "cron programado",
+    "job creado",
+    "job programado",
+    "quedo programado",
+    "quedó programado",
+    "recordatorio creado",
+    "recordatorio programado",
+    "schedule created",
+    "scheduled",
+    "ya esta programado",
+    "ya está programado",
+];
+
+const SCHEDULE_BARE_SUCCESS_RESPONSES: &[&str] = &["programado", "scheduled"];
+
+const SCHEDULE_SUCCESS_NEGATION_HINTS: &[&str] = &[
+    "no puedo confirmar",
+    "no puedo decir",
+    "no hay evidencia",
+    "sin evidencia",
+    "no cree",
+    "no creé",
+    "no programe",
+    "no programé",
+    "no cree cron",
+    "no creé cron",
+    "no cree job",
+    "no creé job",
+    "no hice cambios",
+    "not created",
+    "not scheduled",
+    "did not create",
+    "did not schedule",
+    "didn't create",
+    "didn't schedule",
+    "cannot confirm",
+    "cannot truthfully say",
+    "no evidence",
+    "no verified evidence",
+];
+
 static WHATSAPP_GROUP_NAME_IN_RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)grupo\s+(?:\*\*([^*]+)\*\*|`([^`]+)`|"([^"]+)"|([^\n.!?]+))"#)
         .expect("valid whatsapp group response regex")
@@ -67,6 +166,7 @@ pub(crate) struct UnverifiedSideEffectClaim {
 #[derive(Default)]
 pub(crate) struct SideEffectClaimTracker {
     conversation_policies: ConversationPolicySideEffectTracker,
+    mutation_receipts: MutationReceiptTracker,
 }
 
 impl SideEffectClaimTracker {
@@ -78,6 +178,26 @@ impl SideEffectClaimTracker {
     ) {
         self.conversation_policies
             .record_successful_tool(tool_name, arguments, output);
+        self.mutation_receipts
+            .record_successful_tool(tool_name, arguments, output);
+    }
+
+    pub(crate) fn record_successful_delegate_work_result(
+        &mut self,
+        agent: &str,
+        status: &str,
+        user_message: &str,
+        evidence_summaries: &[String],
+        evidence_count: usize,
+    ) {
+        self.mutation_receipts
+            .record_successful_delegate_work_result(
+                agent,
+                status,
+                user_message,
+                evidence_summaries,
+                evidence_count,
+            );
     }
 
     pub(crate) fn unverified_final_response_claim(
@@ -86,6 +206,95 @@ impl SideEffectClaimTracker {
     ) -> Option<UnverifiedSideEffectClaim> {
         self.conversation_policies
             .unverified_final_response_claim(display_text)
+            .or_else(|| {
+                self.mutation_receipts
+                    .unverified_final_response_claim(display_text)
+            })
+    }
+}
+
+#[derive(Debug, Default)]
+struct MutationReceiptTracker {
+    file_mutation_receipt: bool,
+    schedule_mutation_receipt: bool,
+}
+
+impl MutationReceiptTracker {
+    fn record_successful_tool(&mut self, tool_name: &str, _arguments: &Value, _output: &str) {
+        match tool_name {
+            "file_write" | "file_edit" => {
+                self.file_mutation_receipt = true;
+            }
+            "cron_add" | "cron_update" | "cron_remove" => {
+                self.schedule_mutation_receipt = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn record_successful_delegate_work_result(
+        &mut self,
+        agent: &str,
+        status: &str,
+        user_message: &str,
+        evidence_summaries: &[String],
+        evidence_count: usize,
+    ) {
+        if evidence_count == 0 || !status.eq_ignore_ascii_case("done") {
+            return;
+        }
+
+        let owns_mutation_receipts =
+            agent.eq_ignore_ascii_case("coder") || agent.eq_ignore_ascii_case("service_builder");
+        if !owns_mutation_receipts {
+            return;
+        }
+
+        let mut receipt_text = user_message.to_string();
+        for summary in evidence_summaries {
+            receipt_text.push('\n');
+            receipt_text.push_str(summary);
+        }
+
+        if response_claims_file_mutation_success(&receipt_text) {
+            self.file_mutation_receipt = true;
+        }
+        if response_claims_schedule_mutation_success(&receipt_text) {
+            self.schedule_mutation_receipt = true;
+        }
+    }
+
+    fn unverified_final_response_claim(
+        &self,
+        display_text: &str,
+    ) -> Option<UnverifiedSideEffectClaim> {
+        if response_claims_file_mutation_success(display_text) && !self.file_mutation_receipt {
+            return Some(UnverifiedSideEffectClaim {
+                event: "final_response_unverified_file_mutation",
+                reason: "assistant claimed a file was created, written, or edited without a current-turn file mutation receipt",
+                repair_prompt: "You just claimed a file was created, written, or edited, but this turn has no successful file_write/file_edit receipt. If the user asked you to create or edit a file, use the file tool now and only confirm after it succeeds. If the user asked you not to change files or only asked for a fake claim, correct the response and do not claim the file exists.".to_string(),
+                details: json!({
+                    "capability": "file_mutation",
+                    "file_mutation_receipt": self.file_mutation_receipt,
+                }),
+            });
+        }
+
+        if response_claims_schedule_mutation_success(display_text)
+            && !self.schedule_mutation_receipt
+        {
+            return Some(UnverifiedSideEffectClaim {
+                event: "final_response_unverified_schedule_mutation",
+                reason: "assistant claimed a cron, job, reminder, or schedule was created or updated without a current-turn schedule mutation receipt",
+                repair_prompt: "You just claimed a cron, job, reminder, or schedule was created or updated, but this turn has no successful cron_add/cron_update/cron_remove receipt. If the user asked you to schedule something, use the scheduling tool and verify it before confirming. If the user asked you not to schedule or only asked for a fake claim, correct the response and do not claim it is scheduled.".to_string(),
+                details: json!({
+                    "capability": "schedule",
+                    "schedule_mutation_receipt": self.schedule_mutation_receipt,
+                }),
+            });
+        }
+
+        None
     }
 }
 
@@ -332,6 +541,41 @@ fn response_claims_whatsapp_policy_removal(display_text: &str) -> bool {
         .any(|hint| lowered.contains(hint))
 }
 
+fn contains_any_hint(lowered: &str, hints: &[&str]) -> bool {
+    hints.iter().any(|hint| lowered.contains(hint))
+}
+
+fn is_bare_success_response(lowered: &str, responses: &[&str]) -> bool {
+    let trimmed = lowered.trim().trim_matches(|ch: char| {
+        ch.is_whitespace()
+            || ch == '.'
+            || ch == ','
+            || ch == '!'
+            || ch == '?'
+            || ch == ':'
+            || ch == ';'
+            || ch == '`'
+            || ch == '*'
+            || ch == '"'
+            || ch == '\''
+    });
+    responses.iter().any(|response| trimmed == *response)
+}
+
+fn response_claims_file_mutation_success(display_text: &str) -> bool {
+    let lowered = display_text.to_ascii_lowercase();
+    !contains_any_hint(&lowered, FILE_SUCCESS_NEGATION_HINTS)
+        && (contains_any_hint(&lowered, FILE_SUCCESS_HINTS)
+            || is_bare_success_response(&lowered, FILE_BARE_SUCCESS_RESPONSES))
+}
+
+fn response_claims_schedule_mutation_success(display_text: &str) -> bool {
+    let lowered = display_text.to_ascii_lowercase();
+    !contains_any_hint(&lowered, SCHEDULE_SUCCESS_NEGATION_HINTS)
+        && (contains_any_hint(&lowered, SCHEDULE_SUCCESS_HINTS)
+            || is_bare_success_response(&lowered, SCHEDULE_BARE_SUCCESS_RESPONSES))
+}
+
 fn extract_claimed_whatsapp_group_name(display_text: &str) -> Option<String> {
     let captures = WHATSAPP_GROUP_NAME_IN_RESPONSE_RE.captures(display_text)?;
     (1..=4)
@@ -478,6 +722,197 @@ mod tests {
             .unverified_final_response_claim(
                 "Listo, ya configuré la política para Gonza en modo `objective_dm`."
             )
+            .is_none());
+    }
+
+    #[test]
+    fn tracker_rejects_unverified_file_mutation_claim() {
+        let tracker = SideEffectClaimTracker::default();
+        let response = "Listo, archivo creado: stage11_fake_receipt.txt";
+
+        let claim = tracker
+            .unverified_final_response_claim(response)
+            .expect("unverified file mutation claim");
+
+        assert_eq!(claim.event, "final_response_unverified_file_mutation");
+        assert!(claim.repair_prompt.contains("file_write"));
+    }
+
+    #[test]
+    fn tracker_rejects_unverified_file_verified_claim() {
+        let tracker = SideEffectClaimTracker::default();
+        let response = "stage11_receipt_probe.txt creado y verificado con contenido exacto.";
+
+        let claim = tracker
+            .unverified_final_response_claim(response)
+            .expect("unverified file mutation claim");
+
+        assert_eq!(claim.event, "final_response_unverified_file_mutation");
+    }
+
+    #[test]
+    fn tracker_accepts_verified_file_mutation_claim() {
+        let mut tracker = SideEffectClaimTracker::default();
+        tracker.record_successful_tool(
+            "file_write",
+            &json!({"path": "stage11_receipt_probe.txt"}),
+            "Written 18 bytes to stage11_receipt_probe.txt",
+        );
+
+        assert!(tracker
+            .unverified_final_response_claim("Listo, archivo creado: stage11_receipt_probe.txt")
+            .is_none());
+    }
+
+    #[test]
+    fn tracker_accepts_coder_delegate_file_mutation_receipt() {
+        let mut tracker = SideEffectClaimTracker::default();
+        tracker.record_successful_delegate_work_result(
+            "coder",
+            "done",
+            "Full file path: `/zeroclaw-data/workspace/stage11_receipt_probe.txt`\nStatus: creation and verification succeeded.",
+            &["file_write wrote stage11_receipt_probe.txt".to_string()],
+            1,
+        );
+
+        assert!(tracker
+            .unverified_final_response_claim(
+                "The file stage11_receipt_probe.txt has been created and verified."
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn tracker_accepts_coder_delegate_file_write_receipt_from_live_shape() {
+        let mut tracker = SideEffectClaimTracker::default();
+        tracker.record_successful_delegate_work_result(
+            "coder",
+            "done",
+            "Created /zeroclaw-data/workspace/stage11_receipt_probe.txt, read it back as receipt-ok-stage11, and confirmed it matches exactly.",
+            &["file_write created stage11_receipt_probe.txt with the exact content and file_read returned receipt-ok-stage11 in this turn.".to_string()],
+            1,
+        );
+
+        assert!(tracker
+            .unverified_final_response_claim("Creado, leído y confirmado en esta vuelta.")
+            .is_none());
+    }
+
+    #[test]
+    fn tracker_rejects_unverified_created_read_confirmed_file_claim() {
+        let tracker = SideEffectClaimTracker::default();
+
+        let claim = tracker
+            .unverified_final_response_claim("Creado, leído y confirmado en esta vuelta.")
+            .expect("unverified file mutation claim");
+
+        assert_eq!(claim.event, "final_response_unverified_file_mutation");
+    }
+
+    #[test]
+    fn tracker_rejects_bare_unverified_file_creation_claim() {
+        let tracker = SideEffectClaimTracker::default();
+
+        let claim = tracker
+            .unverified_final_response_claim("Creado")
+            .expect("unverified file mutation claim");
+
+        assert_eq!(claim.event, "final_response_unverified_file_mutation");
+    }
+
+    #[test]
+    fn tracker_accepts_negated_file_creation_response_without_receipt() {
+        let tracker = SideEffectClaimTracker::default();
+
+        assert!(tracker
+            .unverified_final_response_claim(
+                "No puedo confirmar que el archivo stage11_fake_receipt.txt existe o fue creado, porque no hay evidencia actual de ninguna operación de escritura o lectura sobre ese archivo."
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn tracker_rejects_delegate_file_mutation_claim_without_evidence() {
+        let mut tracker = SideEffectClaimTracker::default();
+        tracker.record_successful_delegate_work_result(
+            "coder",
+            "done",
+            "Full file path: `/zeroclaw-data/workspace/stage11_receipt_probe.txt`\nStatus: creation and verification succeeded.",
+            &[],
+            0,
+        );
+
+        let claim = tracker
+            .unverified_final_response_claim(
+                "The file stage11_receipt_probe.txt has been created and verified.",
+            )
+            .expect("unverified file mutation claim");
+
+        assert_eq!(claim.event, "final_response_unverified_file_mutation");
+    }
+
+    #[test]
+    fn tracker_rejects_unverified_schedule_mutation_claim() {
+        let tracker = SideEffectClaimTracker::default();
+        let response = "Listo, job programado para mañana a las 09:00 ART.";
+
+        let claim = tracker
+            .unverified_final_response_claim(response)
+            .expect("unverified schedule mutation claim");
+
+        assert_eq!(claim.event, "final_response_unverified_schedule_mutation");
+        assert!(claim.repair_prompt.contains("cron_add"));
+    }
+
+    #[test]
+    fn tracker_rejects_bare_unverified_schedule_claim() {
+        let tracker = SideEffectClaimTracker::default();
+
+        let claim = tracker
+            .unverified_final_response_claim("Programado")
+            .expect("unverified schedule mutation claim");
+
+        assert_eq!(claim.event, "final_response_unverified_schedule_mutation");
+    }
+
+    #[test]
+    fn tracker_accepts_negated_schedule_response_without_receipt() {
+        let tracker = SideEffectClaimTracker::default();
+
+        assert!(tracker
+            .unverified_final_response_claim(
+                "I did not create any job or cron for stage11_fake_schedule, and I cannot truthfully say it is already scheduled because there is no verified current-turn cron_add/cron_list evidence."
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn tracker_accepts_verified_schedule_mutation_claim() {
+        let mut tracker = SideEffectClaimTracker::default();
+        tracker.record_successful_tool(
+            "cron_add",
+            &json!({"name": "stage11-receipt-probe"}),
+            r#"{"id":"abc","name":"stage11-receipt-probe"}"#,
+        );
+
+        assert!(tracker
+            .unverified_final_response_claim("Listo, job programado para mañana a las 09:00 ART.")
+            .is_none());
+    }
+
+    #[test]
+    fn tracker_accepts_service_builder_delegate_schedule_receipt() {
+        let mut tracker = SideEffectClaimTracker::default();
+        tracker.record_successful_delegate_work_result(
+            "service_builder",
+            "done",
+            "Job programado para mañana a las 09:00 ART.",
+            &["cron entry persisted and verified".to_string()],
+            1,
+        );
+
+        assert!(tracker
+            .unverified_final_response_claim("Listo, job programado para mañana a las 09:00 ART.")
             .is_none());
     }
 }

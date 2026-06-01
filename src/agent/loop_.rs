@@ -10945,6 +10945,14 @@ pub(crate) async fn run_tool_call_loop(
                 if call.name == "delegate" {
                     if let Some(agent) = delegate_agent_name_from_args(&call.arguments) {
                         if let Some(work_result) = terminal_work_result(&outcome.output) {
+                            side_effect_claims.record_successful_delegate_work_result(
+                                &agent,
+                                &work_result.status,
+                                &work_result.user_message,
+                                &work_result.evidence_summaries,
+                                work_result.evidence_count,
+                            );
+
                             if work_result.is_done_without_evidence() {
                                 let blocker = unverified_work_result_completion_message(history);
                                 runtime_trace::record_event(
@@ -11481,6 +11489,50 @@ pub(crate) async fn run_tool_call_loop(
     .await;
     if let Some(usage) = checkpoint_usage {
         requests.push(usage);
+    }
+
+    if can_enforce_side_effect_claim_repairs(tools_registry) {
+        if let Some(claim) =
+            side_effect_claims.unverified_final_response_claim(&checkpoint.user_message)
+        {
+            runtime_trace::record_event(
+                "tool_loop_exhausted_unverified_side_effect_claim_blocked",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(&turn_id),
+                Some(false),
+                Some("agent reached maximum tool iterations with an unverified side-effect claim"),
+                serde_json::json!({
+                    "max_iterations": max_iterations,
+                    "claim_event": claim.event,
+                    "claim_reason": claim.reason,
+                    "text": scrub_credentials(&checkpoint.user_message),
+                }),
+            );
+
+            let blocker = if prefers_spanish_for_user_message(history, None, None) {
+                "No pude completar esta solicitud con un resultado verificable. El flujo llegó al límite de iteraciones mientras seguía apareciendo una confirmación sin recibo válido, así que no voy a confirmar el cambio.".to_string()
+            } else {
+                "I could not complete this request with a verifiable result. The flow reached the iteration limit while a confirmation still lacked a valid receipt, so I will not confirm the change.".to_string()
+            };
+
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                let _ = tx.send(blocker.clone()).await;
+            }
+            history.push(ChatMessage::assistant(blocker.clone()));
+            tool_failures.push(format!(
+                "side-effect claim: {} after exhausting {max_iterations} iterations",
+                claim.event
+            ));
+            return Ok(AgentTurnOutcome {
+                output: blocker,
+                continuation: None,
+                requests,
+                tool_failures,
+            });
+        }
     }
 
     let continuation_message = continuation_scope
