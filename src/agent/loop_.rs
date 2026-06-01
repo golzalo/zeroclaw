@@ -38,6 +38,7 @@ const REQUIRED_DELEGATE_CONTRACT_FAILURE_LIMIT: usize = 2;
 const REQUIRED_DELEGATE_CONTRACT_FAILURE_PHRASE: &str = "could not be safely validated";
 const MAX_PROVIDER_DELEGATION_CONTRACT_REPAIRS_PER_TURN: usize = 2;
 const MAX_SERVICE_DELEGATION_CONTRACT_REPAIRS_PER_TURN: usize = 2;
+const MAX_VISIBLE_REPLY_CONTRACT_REPAIRS_PER_TURN: usize = 2;
 const PROVIDER_DELEGATION_MAIN_SKILL: &str = "provider_delegation_main";
 const SERVICE_DELEGATION_MAIN_SKILL: &str = "service_delegation_main";
 
@@ -174,8 +175,26 @@ const FINAL_RESPONSE_INTERNAL_WRAPPER_HINTS: &[&str] = &[
     "http_request",
     "web_search_tool",
     "tool_call",
+    "tool name",
+    "tool names",
+    "herramientas internas",
     "subagent",
     "subagente",
+];
+
+const LOW_INFORMATION_FINAL_RESPONSE_HINTS: &[&str] = &[
+    "created",
+    "creado",
+    "done",
+    "hecho",
+    "listo",
+    "ok",
+    "okay",
+    "programado",
+    "ready",
+    "scheduled",
+    "verified",
+    "verificado",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2793,6 +2812,69 @@ fn response_contains_internal_wrapper_hint(display_text: &str) -> bool {
         .any(|hint| display_text.contains(hint) || lowered.contains(&hint.to_ascii_lowercase()))
 }
 
+fn stripped_visible_reply_token(display_text: &str) -> String {
+    display_text
+        .trim()
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || ch == '.'
+                || ch == ','
+                || ch == '!'
+                || ch == '?'
+                || ch == ':'
+                || ch == ';'
+                || ch == '`'
+                || ch == '*'
+                || ch == '"'
+                || ch == '\''
+        })
+        .to_ascii_lowercase()
+}
+
+fn response_is_low_information_final_response(display_text: &str) -> bool {
+    let token = stripped_visible_reply_token(display_text);
+    if token.is_empty() {
+        return true;
+    }
+
+    LOW_INFORMATION_FINAL_RESPONSE_HINTS
+        .iter()
+        .any(|hint| token == *hint)
+}
+
+fn latest_user_message_requests_no_internal_wrappers(history: &[ChatMessage]) -> bool {
+    let Some(message) = latest_user_message(history) else {
+        return false;
+    };
+    let lowered = normalize_provider_keyword_text(message);
+    let mentions_internal_surface = lowered.contains("wrapper")
+        || lowered.contains("wrappers")
+        || FINAL_RESPONSE_INTERNAL_WRAPPER_HINTS
+            .iter()
+            .any(|hint| lowered.contains(&hint.to_ascii_lowercase()));
+    if !mentions_internal_surface {
+        return false;
+    }
+
+    [
+        "do not expose",
+        "do not show",
+        "don't expose",
+        "don't show",
+        "hide",
+        "no debe exponer",
+        "no expongas",
+        "no mostrar",
+        "no muestres",
+        "sin wrapper",
+        "sin wrappers",
+        "without wrapper",
+        "without wrappers",
+    ]
+    .iter()
+    .any(|hint| lowered.contains(hint))
+}
+
 fn should_replace_final_response_with_work_result(
     result: &TerminalWorkResult,
     display_text: &str,
@@ -2801,6 +2883,8 @@ fn should_replace_final_response_with_work_result(
         return display_text.trim() != result.user_message.trim();
     }
     response_contains_internal_wrapper_hint(display_text)
+        || (response_is_low_information_final_response(display_text)
+            && !response_is_low_information_final_response(&result.user_message))
 }
 
 fn unverified_work_result_completion_message(history: &[ChatMessage]) -> String {
@@ -9240,6 +9324,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut service_delegation_satisfied = false;
     let mut service_delegation_contract_loaded = false;
     let mut service_delegation_contract_repair_attempts = 0usize;
+    let mut visible_reply_contract_repair_attempts = 0usize;
     let mut bound_procedure_terminal_reply: Option<BoundProcedureTerminalReply> = None;
     let mut side_effect_claims = SideEffectClaimTracker::default();
     let mut requests = Vec::new();
@@ -9906,6 +9991,58 @@ pub(crate) async fn run_tool_call_loop(
                         final_response_replacement = Some(display_text.clone());
                     }
                 }
+            }
+
+            if final_response_replacement.is_none()
+                && latest_user_message_requests_no_internal_wrappers(history)
+                && response_contains_internal_wrapper_hint(&display_text)
+            {
+                visible_reply_contract_repair_attempts += 1;
+                runtime_trace::record_event(
+                    "final_response_visible_wrapper_leak_blocked",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("assistant attempted to expose internal wrappers in the visible reply"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "contract_repair_attempt": visible_reply_contract_repair_attempts,
+                        "max_contract_repair_attempts": MAX_VISIBLE_REPLY_CONTRACT_REPAIRS_PER_TURN,
+                        "text": scrub_credentials(&display_text),
+                    }),
+                );
+
+                if visible_reply_contract_repair_attempts
+                    > MAX_VISIBLE_REPLY_CONTRACT_REPAIRS_PER_TURN
+                {
+                    let blocker = if prefers_spanish_for_user_message(history, None, None) {
+                        "No pude generar una respuesta visible segura sin detalles internos del runtime. No voy a exponer wrappers, herramientas ni trazas internas.".to_string()
+                    } else {
+                        "I could not produce a safe visible reply without internal runtime details. I will not expose wrappers, tools, or internal traces.".to_string()
+                    };
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        let _ = tx.send(blocker.clone()).await;
+                    }
+                    history.push(ChatMessage::assistant(blocker.clone()));
+                    tool_failures.push(format!(
+                        "visible reply: wrapper leak persisted after {visible_reply_contract_repair_attempts} attempts"
+                    ));
+                    return Ok(AgentTurnOutcome {
+                        output: blocker,
+                        continuation: None,
+                        requests,
+                        tool_failures,
+                    });
+                }
+
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(internal_repair_message(
+                    "Your final user-visible reply exposed internal runtime details. Rewrite it now as a normal user-facing answer. Do not include WORK_RESULT, PROVIDER_RESULT, STEP, STATUS, http_request, tool_call, tool names, API traces, JSON envelopes, or delegate wrapper labels. Preserve only the useful user-facing facts.",
+                ));
+                continue;
             }
 
             if response_is_semantically_empty(&display_text)
@@ -16120,6 +16257,85 @@ WORK_RESULT:
         assert_eq!(result.output, "Encontré 3 archivos: A, B y C.");
         assert!(!result.output.contains("PROVIDER_RESULT"));
         assert!(!result.output.contains("WORK_RESULT"));
+    }
+
+    #[test]
+    fn work_result_replacement_handles_low_information_final_reply() {
+        let result = TerminalWorkResult {
+            status: "done".to_string(),
+            owner: Some("coder".to_string()),
+            user_message: "Archivo creado y verificado con evidencia actual.".to_string(),
+            evidence_count: 1,
+            evidence_summaries: vec!["file_write and file_read succeeded".to_string()],
+            next_action_type: Some("finish".to_string()),
+            next_action_target: None,
+            continuity_job_slug: None,
+        };
+
+        assert!(should_replace_final_response_with_work_result(
+            &result, "Listo"
+        ));
+        assert!(should_replace_final_response_with_work_result(
+            &result, "Creado"
+        ));
+        assert!(!should_replace_final_response_with_work_result(
+            &result,
+            "Archivo creado y verificado con evidencia actual."
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_repairs_visible_wrapper_leak_without_work_result() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "La respuesta visible no expone wrappers, tool names ni etiquetas internas.",
+            "Respuesta limpia para el usuario.",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Respondé sin wrappers visibles y no expongas WORK_RESULT, STATUS ni http_request.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should repair visible wrapper leakage");
+
+        assert_eq!(result.output, "Respuesta limpia para el usuario.");
+        assert!(!result.output.contains("WORK_RESULT"));
+        assert!(!result.output.contains("STATUS"));
+        assert!(!result.output.contains("http_request"));
+        assert!(!result.output.contains("tool names"));
     }
 
     #[tokio::test]
