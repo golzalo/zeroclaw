@@ -1705,6 +1705,38 @@ fn take_pending_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) -> bo
         .remove(sender_key)
 }
 
+fn restore_persisted_sender_history_if_missing(
+    histories: &ConversationHistoryMap,
+    store: Option<&session_store::SessionStore>,
+    sender_key: &str,
+) -> usize {
+    let Some(store) = store else {
+        return 0;
+    };
+
+    {
+        let histories = histories.lock().unwrap_or_else(|e| e.into_inner());
+        if histories
+            .get(sender_key)
+            .is_some_and(|turns| !turns.is_empty())
+        {
+            return 0;
+        }
+    }
+
+    let persisted = store.load(sender_key);
+    if persisted.is_empty() {
+        return 0;
+    }
+
+    let restored = persisted.len();
+    histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), persisted);
+    restored
+}
+
 fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -> String {
     const SKILLS_HEADER: &str = "## Available Skills\n\n";
     const SKILLS_END: &str = "</available_skills>";
@@ -3986,6 +4018,19 @@ async fn process_channel_message(
         // `/new` should make the next user turn completely fresh even if
         // older cached turns reappear before this message starts.
         clear_sender_history(ctx.as_ref(), &history_key);
+    } else if whatsapp_conversation_policy.is_none() {
+        let restored = restore_persisted_sender_history_if_missing(
+            &ctx.conversation_histories,
+            ctx.session_store.as_deref(),
+            &history_key,
+        );
+        if restored > 0 {
+            tracing::info!(
+                key = %history_key,
+                restored_turns = restored,
+                "Restored persisted channel session for active sender key"
+            );
+        }
     }
 
     let whatsapp_journal_history = whatsapp_conversation_policy.as_ref().map(|policy| {
@@ -6725,6 +6770,34 @@ mod tests {
             channel_message_timeout_budget_secs(300, 10),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
+    }
+
+    #[test]
+    fn restore_persisted_sender_history_uses_active_unsanitized_key() {
+        let workspace = TempDir::new().unwrap();
+        let store = session_store::SessionStore::new(workspace.path()).unwrap();
+        let raw_key = "whatsapp:main::__whatsapp_official_group__::+5491140853388";
+        store
+            .append(raw_key, &ChatMessage::user("crear proceso"))
+            .unwrap();
+        store
+            .append(
+                raw_key,
+                &ChatMessage::assistant("Contrato propuesto. Responde YES."),
+            )
+            .unwrap();
+
+        let histories = Arc::new(Mutex::new(HashMap::new()));
+        let restored =
+            restore_persisted_sender_history_if_missing(&histories, Some(&store), raw_key);
+
+        assert_eq!(restored, 2);
+        let loaded = histories.lock().unwrap();
+        let turns = loaded
+            .get(raw_key)
+            .expect("history should be restored under the active raw key");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].content, "crear proceso");
     }
 
     fn test_whatsapp_policy() -> ObservedGroupConfig {

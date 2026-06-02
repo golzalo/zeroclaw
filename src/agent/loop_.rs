@@ -2144,6 +2144,103 @@ fn latest_user_confirmed_pending_service_contract(history: &[ChatMessage]) -> bo
     latest_confirmed_pending_service_builder_contract(history).is_some()
 }
 
+fn message_requests_or_reports_authorization_for_service(content: &str) -> bool {
+    let normalized = normalize_provider_keyword_text(content);
+    let mentions_authorization = contains_any_keyword(
+        &normalized,
+        &[
+            "oauth",
+            "authorization",
+            "authorization-link",
+            "auth_required",
+            "authorize",
+            "autoriza",
+            "autorices",
+            "autorizacion",
+            "autorización",
+            "permiso",
+            "permisos",
+            "conectar google",
+            "conectar drive",
+        ],
+    );
+    if !mentions_authorization {
+        return false;
+    }
+
+    contains_any_keyword(
+        &normalized,
+        &[
+            "servicio",
+            "service",
+            "service_builder",
+            "proceso",
+            "procedimiento",
+            "job",
+            "implementacion",
+            "implementación",
+            "continuar",
+            "continuemos",
+            "runtime",
+            "drive",
+            "sheets",
+            "spreadsheet",
+        ],
+    )
+}
+
+fn latest_service_authorization_followup_original_request(
+    history: &[ChatMessage],
+) -> Option<String> {
+    let (latest_user_index, latest_user) =
+        history.iter().enumerate().rev().find(|(_, message)| {
+            message.role == "user" && !is_runtime_user_message(&message.content)
+        })?;
+
+    if !looks_like_service_contract_confirmation(&latest_user.content) {
+        return None;
+    }
+
+    if latest_confirmed_pending_service_builder_contract(history).is_some() {
+        return None;
+    }
+
+    let (service_user_index, service_user) = history
+        .iter()
+        .enumerate()
+        .take(latest_user_index)
+        .rev()
+        .find(|(_, message)| {
+            message.role == "user" && service_delegation_required_from_message(&message.content)
+        })?;
+
+    if history
+        .iter()
+        .skip(service_user_index + 1)
+        .any(is_service_builder_done_message)
+    {
+        return None;
+    }
+
+    if history.iter().skip(service_user_index + 1).any(|message| {
+        is_service_builder_blocked_message(message)
+            && !message_requests_or_reports_authorization_for_service(&message.content)
+    }) {
+        return None;
+    }
+
+    let auth_requested = history
+        .iter()
+        .take(latest_user_index)
+        .skip(service_user_index + 1)
+        .any(|message| {
+            (message.role == "assistant" || message.role == "tool")
+                && message_requests_or_reports_authorization_for_service(&message.content)
+        });
+
+    auth_requested.then(|| service_user.content.trim().to_string())
+}
+
 fn build_confirmed_service_builder_delegate_prompt(
     history: &[ChatMessage],
     original_prompt: &str,
@@ -2164,11 +2261,20 @@ fn build_confirmed_service_builder_delegate_prompt(
         "Implement now and continue until STEP: done with STATUS: verified or scheduled, or return STATUS: blocked with concrete evidence."
     );
     let _ = writeln!(prompt);
+    let _ = writeln!(prompt, "OPERATION: create");
     let _ = writeln!(prompt, "USER_CONFIRMED_PROCESSING_CONTRACT: true");
     if let Some(slug) = pending_contract.proposed_slug.as_deref() {
         let _ = writeln!(prompt, "NEW_JOB: true");
         let _ = writeln!(prompt, "PROPOSED_SLUG: {slug}");
     }
+    let _ = writeln!(
+        prompt,
+        "For WhatsApp group-bound procedures, build and verify an on-demand tenant procedure first; Main owns the later whatsapp_configure_conversation_policy binding after a verified service_builder handoff."
+    );
+    let _ = writeln!(
+        prompt,
+        "Do not require state/whatsapp/observed_groups/index.json before creating an on-demand procedure unless the confirmed contract explicitly requires polling an observed journal."
+    );
     let _ = writeln!(
         prompt,
         "Use EXISTING_JOB only if tenant_service_builder.py status confirms that exact slug already exists on disk."
@@ -2647,6 +2753,9 @@ fn latest_service_delegation_required(history: &[ChatMessage]) -> bool {
     if latest_user_confirmed_pending_service_contract(history) {
         return true;
     }
+    if latest_service_authorization_followup_original_request(history).is_some() {
+        return true;
+    }
     latest_human_user_message(history).is_some_and(service_delegation_required_from_message)
 }
 
@@ -2665,6 +2774,20 @@ fn delegate_agent_name_from_args(arguments: &serde_json::Value) -> Option<String
         .map(str::trim)
         .filter(|agent| !agent.is_empty())
         .map(ToString::to_string)
+}
+
+fn delegate_prompt_from_args(arguments: &serde_json::Value) -> Option<&str> {
+    arguments
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+}
+
+fn is_required_delegate_contract_repair_prompt(prompt: &str) -> bool {
+    prompt
+        .trim_start()
+        .starts_with("CONTRACT REPAIR FOR MAIN/SUBAGENT HANDOFF:")
 }
 
 fn required_delegate_contract_failure_agent(
@@ -3054,6 +3177,13 @@ fn visible_reply_quality_issue_requires_repair(
 ) -> Option<&'static str> {
     let issue = visible_reply_quality_issue(display_text)?;
     match issue {
+        "semantically_empty"
+            if recent_service_builder_context(history)
+                || user_requested_scheduling(history)
+                || latest_service_delegation_required(history) =>
+        {
+            None
+        }
         "semantically_empty" | "obfuscated_unicode" => Some(issue),
         _ if latest_user_message_requests_visible_quality(history)
             || latest_user_message_requests_no_internal_wrappers(history) =>
@@ -3165,6 +3295,213 @@ fn service_builder_handoff_allows_procedure_policy_bind(
     slug_matches && has_verified_done
 }
 
+fn latest_service_request_message(history: &[ChatMessage]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == "user"
+                && !is_runtime_user_message(&message.content)
+                && service_delegation_required_from_message(&message.content)
+        })
+        .map(|message| message.content.as_str())
+}
+
+fn extract_named_whatsapp_group(message: &str) -> Option<String> {
+    let lowered = message.to_lowercase();
+    let marker = ["grupo ", "group "]
+        .iter()
+        .find_map(|marker| lowered.find(marker).map(|idx| (idx, *marker)))?;
+    let raw_tail = message.get(marker.0 + marker.1.len()..)?;
+    let tail = raw_tail
+        .trim_start()
+        .trim_start_matches(['"', '\'', '`', '“', '”', ':']);
+    let lowered_tail = tail.to_lowercase();
+    let stop_at = [
+        " imagenes",
+        " imágenes",
+        " image",
+        " images",
+        " foto",
+        " fotos",
+        " recibo",
+        " recibos",
+        " archivo",
+        " archivos",
+        " que ",
+        " donde ",
+        " necesito ",
+        " para ",
+        ".",
+        ",",
+        ";",
+        "\n",
+        "\r",
+    ]
+    .iter()
+    .filter_map(|marker| lowered_tail.find(marker))
+    .min()
+    .unwrap_or(tail.len());
+    let candidate = tail
+        .get(..stop_at)
+        .unwrap_or(tail)
+        .trim()
+        .trim_matches(['"', '\'', '`', '“', '”', ':']);
+
+    if candidate.is_empty()
+        || candidate.len() > 120
+        || !candidate.chars().any(|ch| ch.is_alphanumeric())
+    {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
+}
+
+fn latest_named_whatsapp_group_from_service_request(history: &[ChatMessage]) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user" && !is_runtime_user_message(&message.content))
+        .filter_map(|message| extract_named_whatsapp_group(&message.content))
+        .next()
+}
+
+fn service_builder_policy_bind_sidecar_recovery_call(
+    call: &ParsedToolCall,
+    handoff: &(TerminalWorkResult, String),
+) -> bool {
+    if call.name != "delegate" {
+        return false;
+    }
+    if !delegate_agent_name_from_args(&call.arguments)
+        .is_some_and(|agent| agent.eq_ignore_ascii_case("service_builder"))
+    {
+        return false;
+    }
+
+    let Some(prompt) = delegate_prompt_from_args(&call.arguments) else {
+        return false;
+    };
+    let Some(job_slug) = handoff
+        .0
+        .continuity_job_slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+    else {
+        return false;
+    };
+
+    let normalized = normalize_provider_keyword_text(prompt);
+    let asks_for_sidecars = normalized.contains("tenant_service_procedure")
+        || normalized.contains("sidecar")
+        || normalized.contains("procedure_input_schema_path")
+        || normalized.contains("procedure_sop_path");
+    let inspect_recovery = normalized.contains("operation: inspect")
+        || normalized.contains("return the canonical")
+        || normalized.contains("exact file paths");
+
+    asks_for_sidecars
+        && inspect_recovery
+        && normalized.contains(&job_slug.to_ascii_lowercase())
+}
+
+fn synthesize_verified_service_builder_policy_bind_call(
+    history: &[ChatMessage],
+    handoff: &(TerminalWorkResult, String),
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+) -> Option<ParsedToolCall> {
+    let channel_base = channel_name
+        .split_once(':')
+        .map(|(base, _)| base)
+        .unwrap_or(channel_name);
+    if channel_base != "whatsapp" {
+        return None;
+    }
+
+    let job_slug = handoff
+        .0
+        .continuity_job_slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())?;
+    let group_name = latest_named_whatsapp_group_from_service_request(history)?;
+    let service_request = latest_service_request_message(history)
+        .or_else(|| latest_human_user_message(history))
+        .unwrap_or(&handoff.0.user_message)
+        .trim();
+    let goal = truncate_with_ellipsis(service_request, 280);
+    let procedure_summary = truncate_with_ellipsis(&handoff.0.user_message, 400);
+
+    let mut args = serde_json::json!({
+        "target_kind": "group",
+        "mode": "mention_reply",
+        "skill_name": "whatsapp_group_active",
+        "group_name": group_name,
+        "reply_to_all": false,
+        "goal": goal,
+        "procedure_job_slug": job_slug,
+        "procedure_summary": procedure_summary,
+        "policy_tools": ["whatsapp_run_policy_procedure"],
+    });
+
+    if let Some(reply_target) = channel_reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(object) = args.as_object_mut() {
+            object.insert(
+                "delivery_chat_jid".to_string(),
+                serde_json::Value::String(reply_target.to_string()),
+            );
+        }
+    }
+
+    Some(ParsedToolCall {
+        name: "whatsapp_configure_conversation_policy".to_string(),
+        arguments: args,
+        tool_call_id: Some(synthetic_tool_call_id(
+            "service_builder_verified_policy_bind",
+        )),
+    })
+}
+
+fn maybe_replace_service_builder_policy_bind_sidecar_recovery_calls(
+    tool_calls: &mut Vec<ParsedToolCall>,
+    latest_handoff: Option<&(TerminalWorkResult, String)>,
+    history: &[ChatMessage],
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    configure_tool_available: bool,
+) -> bool {
+    if !configure_tool_available || tool_calls.is_empty() {
+        return false;
+    }
+    let Some(handoff) = latest_handoff else {
+        return false;
+    };
+    if !tool_calls
+        .iter()
+        .any(|call| service_builder_policy_bind_sidecar_recovery_call(call, handoff))
+    {
+        return false;
+    }
+    let Some(replacement) = synthesize_verified_service_builder_policy_bind_call(
+        history,
+        handoff,
+        channel_name,
+        channel_reply_target,
+    ) else {
+        return false;
+    };
+
+    tool_calls.clear();
+    tool_calls.push(replacement);
+    true
+}
+
 fn unverified_procedure_policy_bind_reason(
     tool_name: &str,
     args: &serde_json::Value,
@@ -3251,12 +3588,12 @@ fn build_required_delegate_contract_repair_prompt(
     if agent.eq_ignore_ascii_case("service_builder") {
         let _ = writeln!(
             prompt,
-            "For service_builder: preserve proposal-only/no-mutation constraints. If the user asked only for a proposal, return a proposal/confirmation result; do not create files, jobs, cron, schedules, or bindings."
+            "For service_builder: preserve constraints from the original user request. If the original request explicitly limited the task to a proposal, return a proposal/confirmation result."
         );
     } else if provider_delegation_target_from_agent_name(agent).is_some() {
         let _ = writeln!(
             prompt,
-            "For provider work: preserve read-only/no-mutation constraints. If authorization is missing and the user allowed it, generate the user action through the provider workflow and return it in user_message."
+            "For provider work: preserve constraints from the original user request. If authorization is missing and the user allowed it, generate the user action through the provider workflow and return it in user_message."
         );
     }
 
@@ -3274,6 +3611,7 @@ fn synthesize_required_delegate_contract_repair_tool_call(
     agent: &str,
     service_contract_loaded: bool,
     provider_contract_loaded: bool,
+    original_delegate_prompt: Option<&str>,
 ) -> ParsedToolCall {
     if agent.eq_ignore_ascii_case("service_builder") && !service_contract_loaded {
         return synthetic_read_skill_call(
@@ -3291,7 +3629,7 @@ fn synthesize_required_delegate_contract_repair_tool_call(
 
     synthetic_delegate_call(
         agent,
-        build_required_delegate_contract_repair_prompt(history, agent, None),
+        build_required_delegate_contract_repair_prompt(history, agent, original_delegate_prompt),
         "required_contract_repair_delegate",
     )
 }
@@ -3301,6 +3639,7 @@ fn maybe_normalize_required_delegate_contract_repair_prompt(
     pending_agent: &str,
     tool_name: &str,
     tool_args: &mut serde_json::Value,
+    original_delegate_prompt: Option<&str>,
 ) -> Option<String> {
     if tool_name != "delegate" {
         return None;
@@ -3317,8 +3656,14 @@ fn maybe_normalize_required_delegate_contract_repair_prompt(
     }
 
     let original_prompt = args.get("prompt").and_then(serde_json::Value::as_str);
-    let normalized =
-        build_required_delegate_contract_repair_prompt(history, pending_agent, original_prompt);
+    if original_prompt.is_some_and(is_required_delegate_contract_repair_prompt) {
+        return None;
+    }
+    let normalized = build_required_delegate_contract_repair_prompt(
+        history,
+        pending_agent,
+        original_delegate_prompt.or(original_prompt),
+    );
     args.insert(
         "prompt".to_string(),
         serde_json::Value::String(normalized.clone()),
@@ -3429,6 +3774,34 @@ fn build_service_builder_delegation_prompt(history: &[ChatMessage]) -> String {
         .unwrap_or_default()
         .trim();
     if let Some(prompt) = build_confirmed_service_builder_delegate_prompt(history, latest_user) {
+        return prompt;
+    }
+
+    if let Some(original_request) = latest_service_authorization_followup_original_request(history)
+    {
+        let mut prompt = String::new();
+        let _ = writeln!(
+            prompt,
+            "The latest human message indicates the user completed the provider authorization requested during an unresolved service/procedure/job flow."
+        );
+        let _ = writeln!(
+            prompt,
+            "Continue the service_builder flow from the original service request. Do not treat the latest confirmation word by itself as the service request."
+        );
+        let _ = writeln!(
+            prompt,
+            "If no processing contract has been confirmed yet, return the access/processing contract or a concrete blocker. Do not claim implementation, scheduling, or policy binding unless service_builder verifies it in this turn."
+        );
+        let _ = writeln!(
+            prompt,
+            "RECOVERY_EVIDENCE: The user replied that the requested provider authorization step is complete."
+        );
+        let _ = writeln!(prompt);
+        let _ = writeln!(prompt, "ORIGINAL_SERVICE_REQUEST:");
+        let _ = writeln!(prompt, "{original_request}");
+        let _ = writeln!(prompt);
+        let _ = writeln!(prompt, "LATEST_USER_MESSAGE:");
+        let _ = writeln!(prompt, "{latest_user}");
         return prompt;
     }
 
@@ -9552,6 +9925,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut repeated_tool_failures: HashMap<(String, String, String), usize> = HashMap::new();
     let mut required_delegate_contract_failures: HashMap<String, usize> = HashMap::new();
     let mut pending_required_delegate_contract_failure_agent: Option<String> = None;
+    let mut required_delegate_contract_original_prompts: HashMap<String, String> = HashMap::new();
     let mut required_delegate_contract_repair_user_message: Option<String> = None;
     let mut latest_delegate_work_result_for_final: Option<TerminalWorkResult> = None;
     let mut unverified_delegate_completion_blocker: Option<String> = None;
@@ -9957,6 +10331,9 @@ pub(crate) async fn run_tool_call_loop(
                     &pending_agent,
                     service_delegation_contract_loaded,
                     provider_delegation_contract_loaded,
+                    required_delegate_contract_original_prompts
+                        .get(&pending_agent)
+                        .map(String::as_str),
                 );
                 runtime_trace::record_event(
                     "required_delegate_contract_direct_reply_blocked",
@@ -10072,6 +10449,38 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if !tool_calls.is_empty() {
+            let configure_tool_available = tools_registry
+                .iter()
+                .any(|tool| tool.name() == "whatsapp_configure_conversation_policy");
+            if maybe_replace_service_builder_policy_bind_sidecar_recovery_calls(
+                &mut tool_calls,
+                latest_service_builder_policy_bind_handoff.as_ref(),
+                history,
+                channel_name,
+                channel_reply_target,
+                configure_tool_available,
+            ) {
+                runtime_trace::record_event(
+                    "service_builder_policy_bind_sidecar_recovery_replaced",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "replacement_tool": "whatsapp_configure_conversation_policy",
+                        "arguments": scrub_credentials(&tool_calls[0].arguments.to_string()),
+                    }),
+                );
+                display_text.clear();
+                assistant_history_content =
+                    build_synthesized_tool_call_history_content(use_native_tools, &tool_calls);
+            }
+        }
+
+        if !tool_calls.is_empty() {
             if let Some(pending_agent) = active_required_delegate_contract_failure_agent(
                 &pending_required_delegate_contract_failure_agent,
                 &required_delegate_contract_failures,
@@ -10084,6 +10493,9 @@ pub(crate) async fn run_tool_call_loop(
                         &pending_agent,
                         service_delegation_contract_loaded,
                         provider_delegation_contract_loaded,
+                        required_delegate_contract_original_prompts
+                            .get(&pending_agent)
+                            .map(String::as_str),
                     );
                     runtime_trace::record_event(
                         "required_delegate_contract_repair_tool_call_synthesized",
@@ -10954,6 +11366,9 @@ pub(crate) async fn run_tool_call_loop(
                         &pending_agent,
                         &tool_name,
                         &mut tool_args,
+                        required_delegate_contract_original_prompts
+                            .get(&pending_agent)
+                            .map(String::as_str),
                     )
                 {
                     runtime_trace::record_event(
@@ -11467,6 +11882,7 @@ pub(crate) async fn run_tool_call_loop(
                             }
                         }
                         required_delegate_contract_failures.remove(&agent);
+                        required_delegate_contract_original_prompts.remove(&agent);
                         if pending_required_delegate_contract_failure_agent
                             .as_deref()
                             .is_some_and(|pending| pending.eq_ignore_ascii_case(&agent))
@@ -11524,6 +11940,13 @@ pub(crate) async fn run_tool_call_loop(
                     .entry(agent.clone())
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
+                if let Some(prompt) = delegate_prompt_from_args(&call.arguments) {
+                    if !is_required_delegate_contract_repair_prompt(prompt) {
+                        required_delegate_contract_original_prompts
+                            .entry(agent.clone())
+                            .or_insert_with(|| prompt.to_string());
+                    }
+                }
                 pending_required_delegate_contract_failure_agent = Some(agent.clone());
                 runtime_trace::record_event(
                     "required_delegate_contract_failure_observed",
@@ -16431,6 +16854,65 @@ WORK_RESULT:
         .to_string()
     }
 
+    #[test]
+    fn extracts_named_whatsapp_group_from_service_request() {
+        let group = extract_named_whatsapp_group(
+            "Voy a estar recibiendo en grupo S86 - XXXX imágenes de recibos de la obra.",
+        );
+
+        assert_eq!(group.as_deref(), Some("S86 - XXXX"));
+    }
+
+    #[test]
+    fn replaces_service_builder_sidecar_inspect_recovery_with_configure_call() {
+        let raw_handoff = service_builder_verified_bind_handoff();
+        let handoff = (
+            terminal_work_result(&raw_handoff).expect("handoff WORK_RESULT should parse"),
+            raw_handoff,
+        );
+        let mut tool_calls = vec![ParsedToolCall {
+            name: "delegate".to_string(),
+            arguments: serde_json::json!({
+                "agent": "service_builder",
+                "prompt": "OPERATION: inspect\nEXISTING_JOB: invoice-router\nReturn the canonical TENANT_SERVICE_PROCEDURE_SIDECAR_PATHS_JSON for the job invoice-router. I need the exact file paths for procedure_input_schema_path and procedure_sop_path."
+            }),
+            tool_call_id: Some("call_inspect_recovery".to_string()),
+        }];
+        let history = vec![
+            ChatMessage::user(
+                "Voy a estar recibiendo en grupo S86 - XXXX imágenes de recibos de la obra que necesito que vayan a un Drive.",
+            ),
+            ChatMessage::tool(format!(
+                "[Agent 'service_builder' (mock)]\n{}",
+                handoff.1
+            )),
+        ];
+
+        let replaced = maybe_replace_service_builder_policy_bind_sidecar_recovery_calls(
+            &mut tool_calls,
+            Some(&handoff),
+            &history,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            true,
+        );
+
+        assert!(replaced);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "whatsapp_configure_conversation_policy");
+        assert_eq!(tool_calls[0].arguments["group_name"], "S86 - XXXX");
+        assert_eq!(
+            tool_calls[0].arguments["delivery_chat_jid"],
+            "__whatsapp_official_group__"
+        );
+        assert_eq!(tool_calls[0].arguments["procedure_job_slug"], "invoice-router");
+        assert_eq!(tool_calls[0].arguments["reply_to_all"], false);
+        assert_eq!(
+            tool_calls[0].arguments["policy_tools"],
+            serde_json::json!(["whatsapp_run_policy_procedure"])
+        );
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_blocks_done_work_result_without_evidence_success_claim() {
         let provider = ScriptedProvider::from_text_responses(vec![
@@ -17995,6 +18477,12 @@ WORK_RESULT:
         assert!(second_prompt.contains("CONTRACT REPAIR"));
         assert!(second_prompt.contains("WORK_RESULT"));
         assert!(second_prompt.contains("final user-visible reply only"));
+        assert!(
+            second_prompt.contains("El usuario pidio que el subagente NO devuelva WORK_RESULT.")
+        );
+        assert!(
+            !second_prompt.contains("ORIGINAL_DELEGATE_PROMPT:\nSigo sin devolver WORK_RESULT.")
+        );
     }
 
     #[tokio::test]
@@ -20287,8 +20775,11 @@ Tail"#;
         .unwrap();
 
         assert!(normalized.contains("USER_CONFIRMED_PROCESSING_CONTRACT: true"));
+        assert!(normalized.contains("OPERATION: create"));
         assert!(normalized.contains("NEW_JOB: true"));
         assert!(normalized.contains("PROPOSED_SLUG: whatsapp-group-drive-amigazo-uploader"));
+        assert!(normalized.contains("on-demand tenant procedure"));
+        assert!(normalized.contains("whatsapp_configure_conversation_policy"));
         assert!(normalized.contains("Do not ask for confirmation again."));
         assert_eq!(args["prompt"], serde_json::Value::String(normalized));
     }
@@ -20494,6 +20985,113 @@ Tail"#;
         ];
 
         assert!(latest_service_delegation_required(&history));
+    }
+
+    #[test]
+    fn latest_service_delegation_required_detects_post_auth_service_followup() {
+        let history = vec![
+            ChatMessage::user(
+                "Necesito un proceso para recibir imagenes de recibos por WhatsApp, subirlas a Drive y registrar datos en un spreadsheet.",
+            ),
+            ChatMessage::tool(
+                "[Agent 'service_builder' (mock)]\nSTATUS: blocked\nBLOCKER: Google Drive authorization is required before probing the target folder.",
+            ),
+            ChatMessage::assistant(
+                "Para conectar Google Drive/Sheets en el runtime, abre este enlace. Despues de autorizar, avisame para continuar con la implementacion del servicio.",
+            ),
+            ChatMessage::user("Listo"),
+        ];
+
+        assert!(latest_service_delegation_required(&history));
+    }
+
+    #[test]
+    fn synthetic_service_delegation_after_auth_preserves_original_request() {
+        let history = vec![
+            ChatMessage::user(
+                "Necesito un proceso para recibir imagenes de recibos por WhatsApp, subirlas a Drive y registrar datos en un spreadsheet.",
+            ),
+            ChatMessage::assistant(
+                "Para conectar Google Drive/Sheets en el runtime, abre este enlace. Despues de autorizar, avisame para continuar con la implementacion del servicio.",
+            ),
+            ChatMessage::user("Listo"),
+        ];
+
+        let call = synthesize_service_delegation_contract_tool_call(&history, true, 1);
+
+        assert_eq!(call.name, "delegate");
+        assert_eq!(call.arguments["agent"], "service_builder");
+        let prompt = call.arguments["prompt"].as_str().unwrap();
+        assert!(prompt.contains("RECOVERY_EVIDENCE"));
+        assert!(prompt.contains("ORIGINAL_SERVICE_REQUEST"));
+        assert!(prompt.contains("recibir imagenes de recibos"));
+        assert!(prompt.contains("LATEST_USER_MESSAGE:\nListo"));
+    }
+
+    #[test]
+    fn visible_quality_defers_empty_service_followup_to_service_repair() {
+        let history = vec![
+            ChatMessage::user(
+                "Necesito un proceso para recibir imagenes de recibos por WhatsApp, subirlas a Drive y registrar datos en un spreadsheet.",
+            ),
+            ChatMessage::assistant(
+                "Para conectar Google Drive/Sheets en el runtime, abre este enlace. Despues de autorizar, avisame para continuar con la implementacion del servicio.",
+            ),
+            ChatMessage::user("Listo"),
+        ];
+
+        assert_eq!(visible_reply_quality_issue(""), Some("semantically_empty"));
+        assert_eq!(
+            visible_reply_quality_issue_requires_repair(&history, ""),
+            None
+        );
+    }
+
+    #[test]
+    fn required_delegate_contract_repair_prompt_preserves_original_prompt_without_no_mutation_noise(
+    ) {
+        let history = vec![
+            ChatMessage::user("Quiero crear un proceso para recibos."),
+            ChatMessage::assistant("Contrato propuesto."),
+            ChatMessage::user("YES"),
+        ];
+        let original_prompt = "The user has already confirmed the pending service_builder processing contract.\nUSER_CONFIRMED_PROCESSING_CONTRACT: true\nNEW_JOB: true\nPROPOSED_SLUG: recibos-obra-gastos";
+
+        let prompt = build_required_delegate_contract_repair_prompt(
+            &history,
+            "service_builder",
+            Some(original_prompt),
+        );
+
+        assert!(prompt.contains("LATEST_USER_MESSAGE:\nYES"));
+        assert!(prompt.contains(original_prompt));
+        assert!(!prompt.contains("ORIGINAL_DELEGATE_PROMPT:\nYES"));
+        assert!(!prompt.to_ascii_lowercase().contains("do not create"));
+        assert!(!prompt.to_ascii_lowercase().contains("read-only"));
+        assert!(!prompt.to_ascii_lowercase().contains("no_mutation"));
+    }
+
+    #[test]
+    fn required_delegate_contract_repair_prompt_is_not_wrapped_twice() {
+        let history = vec![ChatMessage::user("YES")];
+        let repair_prompt = build_required_delegate_contract_repair_prompt(
+            &history,
+            "service_builder",
+            Some("Original service prompt"),
+        );
+        let mut args = serde_json::json!({
+            "agent": "service_builder",
+            "prompt": repair_prompt,
+        });
+
+        assert!(maybe_normalize_required_delegate_contract_repair_prompt(
+            &history,
+            "service_builder",
+            "delegate",
+            &mut args,
+            Some("Original service prompt"),
+        )
+        .is_none());
     }
 
     #[test]
