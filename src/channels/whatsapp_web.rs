@@ -5406,8 +5406,9 @@ impl Channel for WhatsAppWebChannel {
                                     allow_direct_messages,
                                     allow_group_messages,
                                 );
-                                let rejection_reason =
-                                    decision.rejection_reason.unwrap_or("accepted");
+                                let base_rejection_reason = decision.rejection_reason;
+                                let base_rejection_reason_label =
+                                    base_rejection_reason.unwrap_or("accepted");
                                 let configured_group = official_group_jid.lock().clone();
                                 let observation_service = Self::observation_service();
                                 let conversation_policy = match decision.chat_kind {
@@ -5480,13 +5481,28 @@ impl Channel for WhatsAppWebChannel {
                                             && policy.mode == ConversationMode::ObjectiveDm
                                             && policy.status == ConversationPolicyStatus::Active
                                     });
-                                let accepted = decision.accepted
-                                    || Self::allows_conversation_policy_override(
+                                let accepted_by_conversation_policy =
+                                    !decision.accepted
+                                        && Self::allows_conversation_policy_override(
                                         &decision,
-                                        rejection_reason,
+                                        base_rejection_reason_label,
                                         group_is_managed,
                                         conversation_policy.as_ref(),
                                     );
+                                let accepted =
+                                    decision.accepted || accepted_by_conversation_policy;
+                                let acceptance_reason = if decision.accepted {
+                                    "base_policy"
+                                } else if accepted_by_conversation_policy {
+                                    "conversation_policy_override"
+                                } else {
+                                    "rejected"
+                                };
+                                let effective_rejection_reason = if accepted {
+                                    None
+                                } else {
+                                    base_rejection_reason
+                                };
 
                                 tracing::trace!(
                                     raw_sender_jid = %sender_jid,
@@ -5511,7 +5527,9 @@ impl Channel for WhatsAppWebChannel {
                                     group_is_suppressed,
                                     group_is_support,
                                     accepted,
-                                    rejection_reason,
+                                    acceptance_reason,
+                                    base_rejection_reason = ?base_rejection_reason,
+                                    rejection_reason = ?effective_rejection_reason,
                                     "WhatsApp Web inbound chat policy evaluation"
                                 );
 
@@ -5542,7 +5560,7 @@ impl Channel for WhatsAppWebChannel {
 
                                 if !accepted {
                                     tracing::warn!(
-                                        reason = rejection_reason,
+                                        reason = effective_rejection_reason.unwrap_or("unknown"),
                                         chat_kind = ?decision.chat_kind,
                                         sender_candidates_count = sender_candidates.len(),
                                         chat_candidates_count = chat_candidates.len(),

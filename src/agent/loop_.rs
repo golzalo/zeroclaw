@@ -2353,6 +2353,36 @@ fn response_is_semantically_empty(display_text: &str) -> bool {
     meaningful_chars.chars().count() <= 1
 }
 
+fn response_is_repeated_short_noise(display_text: &str) -> bool {
+    let stripped = strip_combining_and_format_marks(display_text);
+    let normalized = normalize_provider_keyword_text(&stripped);
+    let tokens = normalized
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    if (2..=4).contains(&tokens.len()) {
+        let first = tokens[0];
+        if first.chars().count() <= 2 && tokens.iter().all(|token| *token == first) {
+            return true;
+        }
+    }
+
+    let meaningful_chars = normalized
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .collect::<Vec<_>>();
+    if (2..=4).contains(&meaningful_chars.len()) {
+        let first = meaningful_chars[0];
+        if meaningful_chars.iter().all(|ch| *ch == first) {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn clear_assistant_history_content_if_semantically_empty(history_content: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(history_content) else {
         return history_content.to_string();
@@ -3107,6 +3137,9 @@ fn visible_reply_quality_issue(display_text: &str) -> Option<&'static str> {
     if response_is_semantically_empty(display_text) {
         return Some("semantically_empty");
     }
+    if response_is_repeated_short_noise(display_text) {
+        return Some("short_repeated_noise");
+    }
     if response_contains_obfuscated_unicode(display_text) {
         return Some("obfuscated_unicode");
     }
@@ -3184,7 +3217,7 @@ fn visible_reply_quality_issue_requires_repair(
         {
             None
         }
-        "semantically_empty" | "obfuscated_unicode" => Some(issue),
+        "semantically_empty" | "short_repeated_noise" | "obfuscated_unicode" => Some(issue),
         _ if latest_user_message_requests_visible_quality(history)
             || latest_user_message_requests_no_internal_wrappers(history) =>
         {
@@ -3500,6 +3533,88 @@ fn maybe_replace_service_builder_policy_bind_sidecar_recovery_calls(
     tool_calls.clear();
     tool_calls.push(replacement);
     true
+}
+
+fn response_claims_pending_service_policy_ready(display_text: &str) -> bool {
+    let normalized = normalize_provider_keyword_text(display_text);
+    if normalized.trim().is_empty() {
+        return false;
+    }
+
+    let negation_hints = [
+        "no esta configur",
+        "no esta vinculado",
+        "no esta listo",
+        "no quedo configur",
+        "no quedo vinculado",
+        "no pude",
+        "sin vincular",
+        "sin configurar",
+        "not configured",
+        "not bound",
+        "not linked",
+        "not ready",
+    ];
+    if negation_hints.iter().any(|hint| normalized.contains(hint)) {
+        return false;
+    }
+
+    let service_context_hints = [
+        "servicio",
+        "service",
+        "proceso",
+        "procedure",
+        "procedimiento",
+        "job",
+        "whatsapp",
+        "grupo",
+        "policy",
+        "politica",
+        "cron",
+    ];
+    let success_hints = [
+        "listo",
+        "ready",
+        "implementado",
+        "implemente",
+        "implemented",
+        "configurado",
+        "configure",
+        "configured",
+        "vinculado",
+        "bound",
+        "linked",
+        "programado",
+        "scheduled",
+        "activo",
+        "active",
+        "running",
+    ];
+
+    service_context_hints
+        .iter()
+        .any(|hint| normalized.contains(hint))
+        && success_hints.iter().any(|hint| normalized.contains(hint))
+}
+
+fn maybe_synthesize_service_builder_policy_bind_for_final_response(
+    display_text: &str,
+    latest_handoff: Option<&(TerminalWorkResult, String)>,
+    history: &[ChatMessage],
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    configure_tool_available: bool,
+) -> Option<ParsedToolCall> {
+    if !configure_tool_available || !response_claims_pending_service_policy_ready(display_text) {
+        return None;
+    }
+    let handoff = latest_handoff?;
+    synthesize_verified_service_builder_policy_bind_call(
+        history,
+        handoff,
+        channel_name,
+        channel_reply_target,
+    )
 }
 
 fn unverified_procedure_policy_bind_reason(
@@ -10480,6 +10595,44 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
+        if tool_calls.is_empty() {
+            let configure_tool_available = tools_registry
+                .iter()
+                .any(|tool| tool.name() == "whatsapp_configure_conversation_policy");
+            if let Some(synthesized_call) =
+                maybe_synthesize_service_builder_policy_bind_for_final_response(
+                    &display_text,
+                    latest_service_builder_policy_bind_handoff.as_ref(),
+                    history,
+                    channel_name,
+                    channel_reply_target,
+                    configure_tool_available,
+                )
+            {
+                runtime_trace::record_event(
+                    "service_builder_policy_bind_final_response_synthesized",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "replacement_tool": "whatsapp_configure_conversation_policy",
+                        "blocked_response_excerpt": scrub_credentials(
+                            &truncate_with_ellipsis(&display_text, 600)
+                        ),
+                        "arguments": scrub_credentials(&synthesized_call.arguments.to_string()),
+                    }),
+                );
+                tool_calls.push(synthesized_call);
+                display_text.clear();
+                assistant_history_content =
+                    build_synthesized_tool_call_history_content(use_native_tools, &tool_calls);
+            }
+        }
+
         if !tool_calls.is_empty() {
             if let Some(pending_agent) = active_required_delegate_contract_failure_agent(
                 &pending_required_delegate_contract_failure_agent,
@@ -11900,6 +12053,11 @@ pub(crate) async fn run_tool_call_loop(
                     && service_delegation_target_from_delegate_args(&call.arguments)
                 {
                     service_delegation_satisfied = true;
+                }
+                if call.name == "whatsapp_configure_conversation_policy"
+                    && procedure_policy_bind_args_present(&call.arguments)
+                {
+                    latest_service_builder_policy_bind_handoff = None;
                 }
                 if call.name == "cron_add" || call.name == "cron_update" {
                     scheduled_delivery_created = true;
@@ -16914,6 +17072,82 @@ WORK_RESULT:
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_synthesizes_policy_bind_before_premature_ready_reply() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delegate","arguments":{"agent":"service_builder","prompt":"Create the receipt process for the WhatsApp group."}}
+</tool_call>"#,
+            "Listo, el servicio quedó implementado y programado para el grupo S86 - XXXX.",
+            "Listo, ya dejé configurado el grupo S86 - XXXX con el procedimiento.",
+        ]);
+        let delegate_tool = ScriptedTool::new(
+            "delegate",
+            vec![successful_tool_result(service_builder_verified_bind_handoff())],
+        );
+        let configure_tool = ScriptedTool::new(
+            "whatsapp_configure_conversation_policy",
+            vec![successful_tool_result(
+                "configured kind=group name=S86 - XXXX procedure_job_slug=invoice-router",
+            )],
+        );
+        let configure_args = configure_tool.recorded_args();
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(delegate_tool), Box::new(configure_tool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(
+                "Voy a estar recibiendo en grupo S86 - XXXX imágenes de recibos de la obra que necesito que vayan a un Drive.",
+            ),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &[],
+            None,
+            crate::config::SkillsPromptInjectionMode::Full,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp:main",
+            Some("__whatsapp_official_group__"),
+            &crate::config::MultimodalConfig::default(),
+            &crate::config::ReliabilityConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should synthesize policy binding before final success");
+
+        assert!(result.output.contains("dejé configurado"));
+        let recorded = configure_args
+            .lock()
+            .expect("configure args lock should be valid");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["group_name"], "S86 - XXXX");
+        assert_eq!(recorded[0]["procedure_job_slug"], "invoice-router");
+        assert_eq!(recorded[0]["delivery_chat_jid"], "__whatsapp_official_group__");
+        assert_eq!(
+            recorded[0]["policy_tools"],
+            serde_json::json!(["whatsapp_run_policy_procedure"])
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_blocks_done_work_result_without_evidence_success_claim() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -20856,6 +21090,25 @@ Tail"#;
         assert!(response_is_semantically_empty(" . "));
         assert!(!response_is_semantically_empty("OK"));
         assert!(!response_is_semantically_empty("Listo, quedó verificado."));
+    }
+
+    #[test]
+    fn visible_quality_detects_repeated_short_noise() {
+        let history = vec![ChatMessage::user("ya está observado el grupo?")];
+
+        assert_eq!(
+            visible_reply_quality_issue("J J"),
+            Some("short_repeated_noise")
+        );
+        assert_eq!(
+            visible_reply_quality_issue_requires_repair(&history, "J J"),
+            Some("short_repeated_noise")
+        );
+        assert_eq!(
+            visible_reply_quality_issue_requires_repair(&history, "JJ"),
+            Some("short_repeated_noise")
+        );
+        assert_eq!(visible_reply_quality_issue("Listo, quedó verificado."), None);
     }
 
     #[test]

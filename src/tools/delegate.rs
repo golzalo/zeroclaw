@@ -331,6 +331,108 @@ fn json_string_field<'a>(
         .filter(|value| !value.is_empty())
 }
 
+fn json_bool_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<bool> {
+    object.get(key).and_then(serde_json::Value::as_bool)
+}
+
+fn json_array_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a Vec<serde_json::Value>> {
+    object.get(key).and_then(serde_json::Value::as_array)
+}
+
+fn validate_service_builder_acceptance_evidence(
+    object: &serde_json::Map<String, serde_json::Value>,
+    status: Option<&str>,
+    owner: Option<&str>,
+    operation: Option<&str>,
+    issues: &mut Vec<String>,
+) {
+    if owner != Some("service_builder") || !matches!(status, Some("done" | "handoff")) {
+        return;
+    }
+
+    let Some(acceptance) = object
+        .get("acceptance_evidence")
+        .and_then(serde_json::Value::as_object)
+    else {
+        issues.push("service_builder_requires_acceptance_evidence".to_string());
+        return;
+    };
+
+    let acceptance_status = json_string_field(acceptance, "status");
+    match acceptance_status {
+        Some(
+            "verified"
+            | "scheduled"
+            | "unscheduled"
+            | "installed_but_unverified"
+            | "blocked"
+            | "not_applicable",
+        ) => {}
+        Some(value) => issues.push(format!("unknown_acceptance_status:{value}")),
+        None => issues.push("missing_acceptance_status".to_string()),
+    }
+
+    let gaps_empty = json_array_field(acceptance, "gaps").is_some_and(Vec::is_empty);
+    match operation {
+        Some("create" | "edit") => {
+            if acceptance_status != Some("verified") {
+                issues.push(
+                    "service_builder_create_edit_acceptance_must_be_verified".to_string(),
+                );
+            }
+            let policy_binding_required =
+                json_bool_field(acceptance, "policy_binding_required");
+            if policy_binding_required.is_none() {
+                issues.push(
+                    "service_builder_acceptance_policy_binding_required_must_be_boolean"
+                        .to_string(),
+                );
+            }
+            for key in [
+                "job_run_verified",
+                "latest_status_readable",
+                "action_path_verified",
+            ] {
+                if json_bool_field(acceptance, key) != Some(true) {
+                    issues.push(format!("service_builder_acceptance_{key}_must_be_true"));
+                }
+            }
+            if policy_binding_required == Some(true)
+                && json_bool_field(acceptance, "source_binding_verified") != Some(true)
+            {
+                issues.push(
+                    "service_builder_acceptance_source_binding_verified_must_be_true_when_policy_binding_required"
+                        .to_string(),
+                );
+            }
+            if !gaps_empty {
+                issues.push("service_builder_verified_acceptance_gaps_must_be_empty".to_string());
+            }
+        }
+        Some("schedule") => {
+            if !matches!(
+                acceptance_status,
+                Some("scheduled" | "unscheduled" | "verified")
+            ) {
+                issues.push(
+                    "service_builder_schedule_acceptance_must_be_scheduled_unscheduled_or_verified"
+                        .to_string(),
+                );
+            }
+            if json_bool_field(acceptance, "schedule_readback_verified") != Some(true) {
+                issues.push(
+                    "service_builder_acceptance_schedule_readback_verified_must_be_true"
+                        .to_string(),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn validate_subagent_work_result_contract(output: &str) -> SubagentWorkResultContractStatus {
     let value = match extract_terminal_work_result_value(output) {
         Ok(Some(value)) => value,
@@ -371,6 +473,8 @@ fn validate_subagent_work_result_contract(output: &str) -> SubagentWorkResultCon
             issues.push(format!("missing_{key}"));
         }
     }
+    let owner = json_string_field(object, "owner");
+    let operation = json_string_field(object, "operation");
     if let Some(user_message) = json_string_field(object, "user_message") {
         if looks_like_contract_placeholder(user_message) {
             issues.push("user_message_must_be_concrete".to_string());
@@ -424,6 +528,8 @@ fn validate_subagent_work_result_contract(output: &str) -> SubagentWorkResultCon
     if status == Some("handoff") && next_action_type == Some("finish") {
         issues.push("handoff_must_not_finish".to_string());
     }
+
+    validate_service_builder_acceptance_evidence(object, status, owner, operation, &mut issues);
 
     if issues.is_empty() {
         SubagentWorkResultContractStatus::Valid
@@ -1772,6 +1878,176 @@ WORK_RESULT:
     }
 
     #[test]
+    fn subagent_work_result_contract_rejects_service_builder_done_without_acceptance() {
+        let output = r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "service_builder",
+  "operation": "create",
+  "user_message": "Servicio creado.",
+  "evidence": [
+    {
+      "type": "job_status",
+      "summary": "Job manifest exists.",
+      "ref": "receipts-job"
+    }
+  ],
+  "next_action": {
+    "type": "finish",
+    "reason": "Done."
+  }
+}"#;
+
+        let status = validate_subagent_work_result_contract(output);
+
+        assert!(matches!(
+            status,
+            SubagentWorkResultContractStatus::Invalid(issues)
+                if issues.contains(&"service_builder_requires_acceptance_evidence".to_string())
+        ));
+    }
+
+    #[test]
+    fn subagent_work_result_contract_rejects_unverified_service_builder_acceptance() {
+        let output = r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "service_builder",
+  "operation": "create",
+  "user_message": "Servicio creado.",
+  "evidence": [
+    {
+      "type": "job_status",
+      "summary": "latest.json returned ok with detectedFilesCount=0.",
+      "ref": "receipts-job:latest"
+    }
+  ],
+  "next_action": {
+    "type": "finish",
+    "reason": "Done."
+  },
+  "acceptance_evidence": {
+    "status": "installed_but_unverified",
+    "job_run_verified": true,
+    "latest_status_readable": true,
+    "action_path_verified": false,
+    "input_detected_count": 0,
+    "policy_binding_required": false,
+    "gaps": [
+      "No representative input was processed."
+    ]
+  }
+}"#;
+
+        let status = validate_subagent_work_result_contract(output);
+
+        assert!(matches!(
+            status,
+            SubagentWorkResultContractStatus::Invalid(issues)
+                if issues.contains(
+                    &"service_builder_create_edit_acceptance_must_be_verified".to_string()
+                )
+                    && issues.contains(
+                        &"service_builder_acceptance_action_path_verified_must_be_true"
+                            .to_string()
+                    )
+        ));
+    }
+
+    #[test]
+    fn subagent_work_result_contract_accepts_service_builder_verified_acceptance() {
+        let output = r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "handoff",
+  "owner": "service_builder",
+  "operation": "create",
+  "user_message": "Procedure verified; Main can bind policy.",
+  "evidence": [
+    {
+      "type": "job_status",
+      "summary": "minimum_valid_call processed one fixture and wrote one row.",
+      "ref": "receipts-job:verify"
+    }
+  ],
+  "next_action": {
+    "type": "bind_policy",
+    "target": "whatsapp_configure_conversation_policy",
+    "reason": "Main owns policy binding."
+  },
+  "acceptance_evidence": {
+    "status": "verified",
+    "job_run_verified": true,
+    "latest_status_readable": true,
+    "action_path_verified": true,
+    "fixture_or_real_input_used": true,
+    "source_binding_verified": true,
+    "input_detected_count": 1,
+    "destination_write_verified": true,
+    "rows_written_count": 1,
+    "uploaded_count": 1,
+    "policy_binding_required": true,
+    "gaps": []
+  }
+}"#;
+
+        assert_eq!(
+            validate_subagent_work_result_contract(output),
+            SubagentWorkResultContractStatus::Valid
+        );
+    }
+
+    #[test]
+    fn subagent_work_result_contract_rejects_policy_required_without_source_binding() {
+        let output = r#"WORK_RESULT:
+{
+  "schema_version": "subagent_work_result.v1",
+  "status": "done",
+  "owner": "service_builder",
+  "operation": "create",
+  "user_message": "Servicio verificado.",
+  "evidence": [
+    {
+      "type": "job_status",
+      "summary": "minimum_valid_call processed one fixture.",
+      "ref": "receipts-job:verify"
+    }
+  ],
+  "next_action": {
+    "type": "finish",
+    "reason": "Done."
+  },
+  "acceptance_evidence": {
+    "status": "verified",
+    "job_run_verified": true,
+    "latest_status_readable": true,
+    "action_path_verified": true,
+    "fixture_or_real_input_used": true,
+    "source_binding_verified": false,
+    "input_detected_count": 1,
+    "destination_write_verified": true,
+    "rows_written_count": 1,
+    "uploaded_count": 1,
+    "policy_binding_required": true,
+    "gaps": []
+  }
+}"#;
+
+        let status = validate_subagent_work_result_contract(output);
+
+        assert!(matches!(
+            status,
+            SubagentWorkResultContractStatus::Invalid(issues)
+                if issues.contains(
+                    &"service_builder_acceptance_source_binding_verified_must_be_true_when_policy_binding_required"
+                        .to_string()
+                )
+        ));
+    }
+
+    #[test]
     fn subagent_work_result_contract_rejects_non_terminal_json_trailer() {
         let output = r#"WORK_RESULT:
 {"schema_version":"subagent_work_result.v1","status":"blocked","owner":"service_builder","operation":"create","user_message":"Bloqueado.","evidence":[],"next_action":{"type":"finish","reason":"blocked"}}
@@ -2119,6 +2395,15 @@ WORK_RESULT:
   ],
   "next_action": {
     "type": "finish"
+  },
+  "acceptance_evidence": {
+    "status": "verified",
+    "job_run_verified": true,
+    "latest_status_readable": true,
+    "action_path_verified": true,
+    "fixture_or_real_input_used": true,
+    "policy_binding_required": false,
+    "gaps": []
   }
 }"#
                         .to_string(),
