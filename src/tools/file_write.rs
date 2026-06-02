@@ -145,6 +145,17 @@ impl Tool for FileWriteTool {
             });
         }
 
+        if self.security.is_agent_state_path(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    self.security
+                        .agent_state_violation_message(&resolved_target),
+                ),
+            });
+        }
+
         // If the target already exists and is a symlink, refuse to follow it
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
             if meta.file_type().is_symlink() {

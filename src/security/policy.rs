@@ -1224,6 +1224,32 @@ impl SecurityPolicy {
             || file_name.starts_with(".active_workspace.toml.tmp-")
     }
 
+    /// Returns true when `resolved` is an agent-managed state path that must
+    /// only be written through native tools (e.g. `whatsapp_configure_conversation_policy`).
+    /// This covers `state/whatsapp/observed_groups/` — the observation index and
+    /// per-group journals — which the LLM must never construct by hand because the
+    /// Rust deserialization schema is strict and a hand-written file will silently
+    /// produce an empty config, breaking group observation.
+    pub fn is_agent_state_path(&self, resolved: &Path) -> bool {
+        // Canonical workspace root for reliable prefix matching.
+        let workspace_root = self
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone());
+
+        let observed_groups_dir = workspace_root.join("state/whatsapp/observed_groups");
+        resolved.starts_with(&observed_groups_dir)
+    }
+
+    pub fn agent_state_violation_message(&self, resolved: &Path) -> String {
+        format!(
+            "Refusing to write agent-managed state file: {}. \
+             This path is owned exclusively by native tools (e.g. whatsapp_configure_conversation_policy). \
+             Use the appropriate native tool instead of file_write.",
+            resolved.display()
+        )
+    }
+
     pub fn runtime_config_violation_message(&self, resolved: &Path) -> String {
         format!(
             "Refusing to modify ZeroClaw runtime config/state file: {}. Use dedicated config tools or edit it manually outside the agent loop.",

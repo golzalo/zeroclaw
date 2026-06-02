@@ -1322,6 +1322,10 @@ pub struct MultimodalConfig {
     /// before the main agent/model sees the turn.
     #[serde(default)]
     pub processor: MultimodalProcessorConfig,
+    /// Optional document/text analysis processor for /internal/text-analysis and
+    /// /internal/document-analysis gateway endpoints.
+    #[serde(default)]
+    pub document_processor: DocumentProcessorConfig,
 }
 
 /// Dedicated visual understanding stage (`[multimodal.processor]`).
@@ -1377,6 +1381,7 @@ impl Default for MultimodalConfig {
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
             processor: MultimodalProcessorConfig::default(),
+            document_processor: DocumentProcessorConfig::default(),
         }
     }
 }
@@ -1411,6 +1416,81 @@ impl Default for MultimodalProcessorConfig {
             mode: default_multimodal_processor_mode(),
             include_image_paths: true,
             prompt_file: default_multimodal_processor_prompt_file(),
+        }
+    }
+}
+
+/// Document and text analysis processor configuration (`[multimodal.document_processor]`).
+///
+/// Uses the main agent provider + model (defaults to `openrouter` / `@preset/main`)
+/// for extracting structured data from text, DOCX, CSV, TXT, and text-layer PDFs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DocumentProcessorConfig {
+    /// Enable the /internal/text-analysis and /internal/document-analysis endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Provider for document/text analysis — defaults to the main agent provider.
+    #[serde(default = "default_document_processor_provider")]
+    pub provider: String,
+    /// Model for document/text analysis — defaults to the main agent model.
+    #[serde(default = "default_document_processor_model")]
+    pub model: String,
+    /// Temperature for extraction.
+    #[serde(
+        default = "default_document_processor_temperature",
+        deserialize_with = "deserialize_temperature"
+    )]
+    pub temperature: f64,
+    /// Maximum document file size in bytes; returns DOCUMENT_TOO_LARGE above this.
+    #[serde(default = "default_max_document_bytes")]
+    pub max_document_bytes: usize,
+    /// Maximum extracted text length in chars; returns EXTRACTED_TEXT_TOO_LARGE above this.
+    #[serde(default = "default_max_extracted_chars")]
+    pub max_extracted_chars: usize,
+    /// Timeout in seconds for the model call; returns ANALYSIS_TIMEOUT if exceeded.
+    #[serde(default = "default_analysis_timeout_secs")]
+    pub analysis_timeout_secs: u64,
+    /// When true, scanned PDFs (no text layer) are forwarded to the visual path.
+    /// When false (default), they return SCANNED_PDF_REQUIRES_OCR_OR_DOCUMENT_VISION.
+    #[serde(default)]
+    pub supports_document_vision: bool,
+}
+
+fn default_document_processor_provider() -> String {
+    "openrouter".into()
+}
+
+fn default_document_processor_model() -> String {
+    "@preset/main".into()
+}
+
+fn default_document_processor_temperature() -> f64 {
+    0.0
+}
+
+fn default_max_document_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+fn default_max_extracted_chars() -> usize {
+    200_000
+}
+
+fn default_analysis_timeout_secs() -> u64 {
+    120
+}
+
+impl Default for DocumentProcessorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_document_processor_provider(),
+            model: default_document_processor_model(),
+            temperature: default_document_processor_temperature(),
+            max_document_bytes: default_max_document_bytes(),
+            max_extracted_chars: default_max_extracted_chars(),
+            analysis_timeout_secs: default_analysis_timeout_secs(),
+            supports_document_vision: false,
         }
     }
 }

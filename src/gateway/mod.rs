@@ -755,6 +755,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/internal/visual-analysis", post(handle_internal_visual_analysis))
+        .route("/internal/text-analysis", post(handle_internal_text_analysis))
+        .route("/internal/document-analysis", post(handle_internal_document_analysis))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
@@ -1459,19 +1461,45 @@ pub struct WebhookBody {
 #[derive(serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VisualAnalysisBody {
-    #[serde(default, alias = "request_text")]
-    pub request_text: String,
+    #[serde(default)]
+    pub instruction: String,
+    #[serde(default, alias = "output_schema")]
+    pub output_schema: Option<serde_json::Value>,
     #[serde(default, alias = "image_refs")]
     pub image_refs: Vec<String>,
     #[serde(default)]
     pub source: Option<serde_json::Value>,
 }
 
-/// POST /internal/visual-analysis — internal runtime visual processor endpoint.
-///
-/// Tenant services can call this only through the runner gateway token. The
-/// actual model call stays inside ZeroClaw's dedicated multimodal processor so
-/// model routing, fallback, and remote budget accounting remain centralized.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TextAnalysisBody {
+    #[serde(default)]
+    pub instruction: String,
+    #[serde(default, alias = "output_schema")]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub source: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentAnalysisBody {
+    #[serde(default)]
+    pub instruction: String,
+    #[serde(default, alias = "output_schema")]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(default, alias = "document_ref")]
+    pub document_ref: String,
+    #[serde(default)]
+    pub source: Option<serde_json::Value>,
+}
+
+/// POST /internal/visual-analysis — schema-driven visual analysis endpoint.
+/// Requires all three inputs: `instruction` (non-empty prompt), `output_schema` (JSON Schema),
+/// and `image_refs` (at least one image path or URL). Returns 400 if any is missing or invalid.
 async fn handle_internal_visual_analysis(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1480,10 +1508,7 @@ async fn handle_internal_visual_analysis(
     if !is_internal_visual_analysis_authorized(&state, &headers) {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "Unauthorized internal visual analysis request"
-            })),
+            Json(serde_json::json!({ "ok": false, "error_code": "UNAUTHORIZED", "message": "Unauthorized internal analysis request" })),
         )
             .into_response();
     }
@@ -1493,68 +1518,277 @@ async fn handle_internal_visual_analysis(
         Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("Invalid JSON body: {error}")
-                })),
+                Json(serde_json::json!({ "ok": false, "error_code": "INVALID_REQUEST", "message": format!("Invalid JSON body: {error}") })),
             )
                 .into_response();
         }
     };
 
-    let image_refs = body
+    let image_refs: Vec<String> = body
         .image_refs
         .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
     if image_refs.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "image_refs must contain at least one image reference"
-            })),
+            Json(serde_json::json!({ "ok": false, "error_code": "MISSING_CONTENT", "message": "image_refs must contain at least one reference" })),
         )
             .into_response();
     }
 
+    if body.instruction.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error_code": "MISSING_INSTRUCTION", "message": "instruction is required" })),
+        )
+            .into_response();
+    }
+
+    let output_schema = match body.output_schema {
+        Some(s) if !s.is_null() => s,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error_code": "MISSING_OUTPUT_SCHEMA", "message": "output_schema is required" })),
+            )
+                .into_response();
+        }
+    };
+
     let config = state.config.lock().clone();
-    match crate::multimodal::analyze_image_refs_to_visual_analysis(
-        &body.request_text,
+    tracing::debug!(
+        image_count = image_refs.len(),
+        instruction_len = body.instruction.len(),
+        "gateway: /internal/visual-analysis"
+    );
+
+    match crate::multimodal::run_visual_analysis(
         &image_refs,
+        &body.instruction,
+        &output_schema,
+        &config.multimodal,
+        &config.reliability,
+        Some(config.workspace_dir.as_path()),
+        false,
+    )
+    .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "ok": true,
+            "processor": result.processor,
+            "structured_data": result.structured_data,
+            "raw_output": result.raw_output,
+            "source": body.source,
+        }))
+        .into_response(),
+        Err(err) => {
+            tracing::warn!(error_code = err.error_code(), error = %err, "gateway: /internal/visual-analysis failed");
+            let status = StatusCode::from_u16(err.http_status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error_code": err.error_code(),
+                    "message": err.to_string(),
+                    "details": err.details(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /internal/text-analysis — analyse raw text (messages, API responses, etc.).
+/// Requires all three inputs: `instruction` (non-empty prompt), `output_schema` (JSON Schema),
+/// and `text` (non-empty string). Returns 400 if any is missing or invalid.
+async fn handle_internal_text_analysis(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<TextAnalysisBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if !is_internal_visual_analysis_authorized(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "ok": false, "error_code": "UNAUTHORIZED", "message": "Unauthorized internal analysis request" })),
+        )
+            .into_response();
+    }
+
+    let Json(body) = match body {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error_code": "INVALID_REQUEST", "message": format!("Invalid JSON body: {error}") })),
+            )
+                .into_response();
+        }
+    };
+
+    if body.instruction.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error_code": "MISSING_INSTRUCTION", "message": "instruction is required" })),
+        )
+            .into_response();
+    }
+
+    if body.text.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error_code": "MISSING_CONTENT", "message": "text is required" })),
+        )
+            .into_response();
+    }
+
+    let output_schema = match body.output_schema {
+        Some(s) if !s.is_null() => s,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error_code": "MISSING_OUTPUT_SCHEMA", "message": "output_schema is required" })),
+            )
+                .into_response();
+        }
+    };
+
+    let config = state.config.lock().clone();
+    tracing::debug!(
+        text_len = body.text.len(),
+        instruction_len = body.instruction.len(),
+        "gateway: /internal/text-analysis"
+    );
+
+    match crate::multimodal::run_text_analysis(
+        &body.text,
+        &body.instruction,
+        &output_schema,
+        &config.multimodal,
+        &config.reliability,
+    )
+    .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "ok": true,
+            "processor": result.processor,
+            "structured_data": result.structured_data,
+            "raw_output": result.raw_output,
+            "source": body.source,
+        }))
+        .into_response(),
+        Err(err) => {
+            tracing::warn!(error_code = err.error_code(), error = %err, "gateway: /internal/text-analysis failed");
+            let status = StatusCode::from_u16(err.http_status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error_code": err.error_code(),
+                    "message": err.to_string(),
+                    "details": err.details(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /internal/document-analysis — analyse one document (local path or URL).
+/// Requires all three inputs: `instruction` (non-empty prompt), `output_schema` (JSON Schema),
+/// and `document_ref` (non-empty path or URL). The gateway detects MIME server-side and
+/// forwards all three to the specific text or visual sub-service. Returns 400 if any is missing.
+async fn handle_internal_document_analysis(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<DocumentAnalysisBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if !is_internal_visual_analysis_authorized(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "ok": false, "error_code": "UNAUTHORIZED", "message": "Unauthorized internal analysis request" })),
+        )
+            .into_response();
+    }
+
+    let Json(body) = match body {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error_code": "INVALID_REQUEST", "message": format!("Invalid JSON body: {error}") })),
+            )
+                .into_response();
+        }
+    };
+
+    if body.instruction.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error_code": "MISSING_INSTRUCTION", "message": "instruction is required" })),
+        )
+            .into_response();
+    }
+
+    if body.document_ref.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error_code": "MISSING_CONTENT", "message": "document_ref is required" })),
+        )
+            .into_response();
+    }
+
+    let output_schema = match body.output_schema {
+        Some(s) if !s.is_null() => s,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error_code": "MISSING_OUTPUT_SCHEMA", "message": "output_schema is required" })),
+            )
+                .into_response();
+        }
+    };
+
+    let config = state.config.lock().clone();
+    tracing::debug!(
+        document_ref = %body.document_ref,
+        instruction_len = body.instruction.len(),
+        "gateway: /internal/document-analysis"
+    );
+
+    match crate::multimodal::analyze_document_ref_to_analysis(
+        &body.document_ref,
+        &body.instruction,
+        &output_schema,
         &config.multimodal,
         &config.reliability,
         Some(config.workspace_dir.as_path()),
     )
     .await
     {
-        Ok(analysis) => {
-            let parsed = serde_json::from_str::<serde_json::Value>(&analysis)
-                .unwrap_or_else(|_| serde_json::json!({ "raw": analysis }));
-            Json(serde_json::json!({
-                "ok": true,
-                "schema_version": "visual_analysis.v1",
-                "analysis": parsed,
-                "processor": {
-                    "provider": config.multimodal.processor.provider,
-                    "model": config.multimodal.processor.model,
-                    "mode": config.multimodal.processor.mode,
-                    "budget_component": "multimodal_processor"
-                },
-                "source": body.source,
-            }))
-            .into_response()
+        Ok(result) => Json(serde_json::json!({
+            "ok": true,
+            "processor": result.processor,
+            "structured_data": result.structured_data,
+            "raw_output": result.raw_output,
+            "source": body.source,
+        }))
+        .into_response(),
+        Err(err) => {
+            tracing::warn!(error_code = err.error_code(), error = %err, "gateway: /internal/document-analysis failed");
+            let status = StatusCode::from_u16(err.http_status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error_code": err.error_code(),
+                    "message": err.to_string(),
+                    "details": err.details(),
+                })),
+            )
+                .into_response()
         }
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": error.to_string(),
-                "schema_version": "visual_analysis.v1"
-            })),
-        )
-            .into_response(),
     }
 }
 

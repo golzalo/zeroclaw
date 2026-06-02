@@ -1830,6 +1830,15 @@ fn maybe_normalize_confirmed_service_builder_delegate_prompt(
 fn recent_service_builder_context(history: &[ChatMessage]) -> bool {
     history.iter().rev().take(12).any(|message| {
         let lowered = message.content.to_ascii_lowercase();
+        // For tool messages (read_skill results, delegate results), only match on
+        // workflow-specific markers — not "service_builder" which appears in skill
+        // documentation and causes false positives for scheduling flows.
+        if message.role == "tool" {
+            return lowered.contains("tenant-app/server/jobs")
+                || lowered.contains("step: done")
+                || lowered.contains("status: awaiting_confirmation")
+                || lowered.contains("user_confirmed_processing_contract");
+        }
         lowered.contains("service_builder")
             || lowered.contains("tenant-app/server/jobs")
             || lowered.contains("step: done")
@@ -3306,10 +3315,18 @@ fn workspace_dir_for_artifact_checks() -> PathBuf {
 
 fn missing_artifact_references(display_text: &str) -> Vec<(String, PathBuf)> {
     let workspace_dir = workspace_dir_for_artifact_checks();
+    // Paths under state/whatsapp/ are agent-managed state written exclusively by
+    // native tools (e.g. whatsapp_configure_conversation_policy). Excluding them
+    // prevents the artifact-existence guardrail from prompting the LLM to recreate
+    // these files with file_write using a hallucinated schema.
+    let observed_groups_dir = workspace_dir.join("state/whatsapp/observed_groups");
     extract_artifact_references(display_text)
         .into_iter()
         .filter_map(|reference| {
             let resolved = resolve_artifact_reference(&reference, &workspace_dir);
+            if resolved.starts_with(&observed_groups_dir) {
+                return None;
+            }
             if resolved.exists() {
                 None
             } else {
@@ -8368,9 +8385,12 @@ pub(crate) async fn run_tool_call_loop(
                 );
 
                 history.push(ChatMessage::assistant(response_text.clone()));
-                history.push(internal_repair_message(
-                    "Your last response was empty or a single character in a service/job flow. Do not send placeholder letters. Inspect the latest service_builder result, continue or re-delegate if needed, and reply only with a meaningful status, a concrete blocker, or the verified STEP: done summary.",
-                ));
+                let repair_msg = if recent_service_builder_context(history) {
+                    "Your last response was empty or a single character in a service/job flow. Do not send placeholder letters. Inspect the latest service_builder result, continue or re-delegate if needed, and reply only with a meaningful status, a concrete blocker, or the verified STEP: done summary."
+                } else {
+                    "Your last response was empty or a single character. Do not send placeholder letters. Produce a complete, direct response to the user's request now."
+                };
+                history.push(internal_repair_message(repair_msg));
                 continue;
             }
 

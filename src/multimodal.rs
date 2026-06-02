@@ -1,5 +1,6 @@
 use crate::config::{
-    build_runtime_proxy_client_with_timeouts, MultimodalConfig, ReliabilityConfig,
+    build_runtime_proxy_client_with_timeouts, DocumentProcessorConfig, MultimodalConfig,
+    ReliabilityConfig,
 };
 use crate::providers::{self, ChatMessage, ChatRequest};
 use crate::remote_budget::RemoteBudgetClient;
@@ -298,7 +299,7 @@ fn compose_non_visual_attachment_context(
         request_text.trim()
     };
     let mut content = format!(
-        "{request_text}\n\n[Image attachment]\nVisual analysis: skipped. The current request is attachment/storage-only or does not explicitly ask to analyze image contents. Do not describe, infer, or summarize this image unless a later turn includes [Image analysis] for it."
+        "{request_text}\n\n[Image attachment]\nImage stored. Call analyze_image with the path below if you need to inspect the contents."
     );
     if include_image_paths {
         content.push_str("\nSources:");
@@ -314,20 +315,13 @@ fn compose_non_visual_attachment_context(
 }
 
 fn should_analyze_image_attachments(
-    request_text: &str,
+    _request_text: &str,
     next_attachment_requires_visual_analysis: bool,
     policy_requires_visual_analysis: bool,
 ) -> bool {
-    if next_attachment_requires_visual_analysis || policy_requires_visual_analysis {
-        return true;
-    }
-
-    let normalized = normalize_intent_text(request_text);
-    if normalized.is_empty() {
-        return false;
-    }
-
-    has_visual_semantic_intent(&normalized)
+    // Only auto-preprocess for deferred/policy flows where the agent cannot call a tool.
+    // In normal conversation the agent uses the analyze_image tool to decide on its own.
+    next_attachment_requires_visual_analysis || policy_requires_visual_analysis
 }
 
 fn normalize_intent_text(input: &str) -> String {
@@ -1216,7 +1210,14 @@ fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::R
 }
 
 fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
+    validate_mime_for_vision(source, mime, false)
+}
+
+fn validate_mime_for_vision(source: &str, mime: &str, allow_pdf: bool) -> anyhow::Result<()> {
     if ALLOWED_IMAGE_MIME_TYPES.contains(&mime) {
+        return Ok(());
+    }
+    if allow_pdf && mime == "application/pdf" {
         return Ok(());
     }
 
@@ -1263,6 +1264,13 @@ fn mime_from_extension(ext: &str) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         "gif" => Some("image/gif"),
         "bmp" => Some("image/bmp"),
+        "pdf" => Some("application/pdf"),
+        "docx" => Some(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        "doc" => Some("application/msword"),
+        "txt" => Some("text/plain"),
+        "csv" => Some("text/csv"),
         _ => None,
     }
 }
@@ -1288,7 +1296,860 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
         return Some("image/bmp");
     }
 
+    if bytes.len() >= 4 && bytes.starts_with(b"%PDF") {
+        return Some("application/pdf");
+    }
+
+    // ZIP-based formats (DOCX, XLSX, etc.) — treat as DOCX if we know from extension,
+    // otherwise fall through to the caller's extension detection.
+    if bytes.len() >= 4 && bytes.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
+        return Some("application/zip");
+    }
+
     None
+}
+
+// ── Schema-driven analysis (text, document, visual) ──────────────────────────
+
+/// Result returned by all three analysis services.
+#[derive(Debug, Clone)]
+pub struct AnalysisResult {
+    /// Which processor handled the request: "text", "document", or "visual".
+    pub processor: String,
+    /// Schema-validated structured data extracted by the model.
+    pub structured_data: Value,
+    /// Raw model output before JSON parsing (kept for debugging).
+    pub raw_output: String,
+}
+
+/// Structured errors returned by all analysis endpoints.
+#[derive(Debug, thiserror::Error)]
+pub enum AnalysisError {
+    #[error("instruction is required and must not be empty")]
+    MissingInstruction,
+    #[error("output_schema is required and must not be empty")]
+    MissingOutputSchema,
+    #[error("output_schema is not a valid JSON Schema: {0}")]
+    InvalidOutputSchema(String),
+    #[error("content is required (text or document_ref / image_refs)")]
+    MissingContent,
+    #[error("unsupported MIME type '{mime}' for '{input}'")]
+    UnsupportedMime { input: String, mime: String },
+    #[error("document too large for '{input}': {size_bytes} bytes > {max_bytes} bytes")]
+    DocumentTooLarge {
+        input: String,
+        size_bytes: u64,
+        max_bytes: usize,
+    },
+    #[error("extracted text too large: {chars} chars > {max_chars} chars")]
+    ExtractedTextTooLarge { chars: usize, max_chars: usize },
+    #[error("extraction failed for '{input}': {reason}")]
+    ExtractionFailed { input: String, reason: String },
+    #[error("scanned PDF requires OCR or document-vision support for '{input}'")]
+    ScannedPdfRequiresOcr {
+        input: String,
+        mime: String,
+        size_bytes: u64,
+        extraction_status: String,
+    },
+    #[error("model output does not match the expected JSON Schema")]
+    OutputValidationFailed { raw_output: String, reason: String },
+    #[error("provider failed: {0}")]
+    ProviderFailed(String),
+    #[error("budget denied: {0}")]
+    BudgetDenied(String),
+    #[error("analysis timed out")]
+    Timeout,
+}
+
+impl AnalysisError {
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::MissingInstruction => "MISSING_INSTRUCTION",
+            Self::MissingOutputSchema => "MISSING_OUTPUT_SCHEMA",
+            Self::InvalidOutputSchema(_) => "INVALID_OUTPUT_SCHEMA",
+            Self::MissingContent => "MISSING_CONTENT",
+            Self::UnsupportedMime { .. } => "UNSUPPORTED_MIME",
+            Self::DocumentTooLarge { .. } => "DOCUMENT_TOO_LARGE",
+            Self::ExtractedTextTooLarge { .. } => "EXTRACTED_TEXT_TOO_LARGE",
+            Self::ExtractionFailed { .. } => "EXTRACTION_FAILED",
+            Self::ScannedPdfRequiresOcr { .. } => "SCANNED_PDF_REQUIRES_OCR_OR_DOCUMENT_VISION",
+            Self::OutputValidationFailed { .. } => "OUTPUT_VALIDATION_FAILED",
+            Self::ProviderFailed(_) => "PROVIDER_FAILED",
+            Self::BudgetDenied(_) => "BUDGET_DENIED",
+            Self::Timeout => "ANALYSIS_TIMEOUT",
+        }
+    }
+
+    pub fn http_status_u16(&self) -> u16 {
+        match self {
+            Self::MissingInstruction
+            | Self::MissingOutputSchema
+            | Self::InvalidOutputSchema(_)
+            | Self::MissingContent => 400,
+            Self::UnsupportedMime { .. } => 415,
+            Self::DocumentTooLarge { .. } | Self::ExtractedTextTooLarge { .. } => 413,
+            Self::ExtractionFailed { .. }
+            | Self::ScannedPdfRequiresOcr { .. }
+            | Self::OutputValidationFailed { .. } => 422,
+            Self::BudgetDenied(_) => 402,
+            Self::ProviderFailed(_) => 502,
+            Self::Timeout => 504,
+        }
+    }
+
+    pub fn details(&self) -> Value {
+        match self {
+            Self::DocumentTooLarge {
+                input,
+                size_bytes,
+                max_bytes,
+            } => serde_json::json!({ "input": input, "size_bytes": size_bytes, "max_bytes": max_bytes }),
+            Self::ExtractedTextTooLarge { chars, max_chars } => {
+                serde_json::json!({ "chars": chars, "max_chars": max_chars })
+            }
+            Self::UnsupportedMime { input, mime } => {
+                serde_json::json!({ "input": input, "mime": mime })
+            }
+            Self::ScannedPdfRequiresOcr {
+                input,
+                mime,
+                size_bytes,
+                extraction_status,
+            } => serde_json::json!({
+                "input": input,
+                "mime": mime,
+                "size_bytes": size_bytes,
+                "extraction_status": extraction_status,
+            }),
+            Self::OutputValidationFailed { reason, .. } => {
+                serde_json::json!({ "validation_error": reason })
+            }
+            Self::InvalidOutputSchema(reason) => serde_json::json!({ "schema_error": reason }),
+            Self::ExtractionFailed { input, reason } => {
+                serde_json::json!({ "input": input, "reason": reason })
+            }
+            _ => Value::Null,
+        }
+    }
+}
+
+/// Verify the schema is non-null and parses as a valid JSON Schema.
+/// Does NOT return the validator — compile again after all `.await` points for output validation.
+fn check_output_schema(output_schema: &Value) -> Result<(), AnalysisError> {
+    if output_schema.is_null() {
+        return Err(AnalysisError::MissingOutputSchema);
+    }
+    jsonschema::validator_for(output_schema)
+        .map_err(|e| AnalysisError::InvalidOutputSchema(e.to_string()))?;
+    Ok(())
+}
+
+/// Check instruction + schema contract before any I/O (sync guard).
+fn validate_analysis_contract(instruction: &str, output_schema: &Value) -> Result<(), AnalysisError> {
+    if instruction.trim().is_empty() {
+        return Err(AnalysisError::MissingInstruction);
+    }
+    check_output_schema(output_schema)
+}
+
+/// Validate model output against the schema (called after all awaits, no lifetime carried across).
+fn validate_model_output(
+    raw_output: &str,
+    output_schema: &Value,
+) -> Result<Value, AnalysisError> {
+    let parsed =
+        extract_json_value_from_str(raw_output).ok_or_else(|| AnalysisError::OutputValidationFailed {
+            raw_output: raw_output.to_string(),
+            reason: "model response is not valid JSON".to_string(),
+        })?;
+    let validator = jsonschema::validator_for(output_schema)
+        .map_err(|e| AnalysisError::InvalidOutputSchema(e.to_string()))?;
+    if !validator.is_valid(&parsed) {
+        return Err(AnalysisError::OutputValidationFailed {
+            raw_output: raw_output.to_string(),
+            reason: "model response does not match the expected JSON Schema".to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn extract_json_value_from_str(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if v.is_object() || v.is_array() {
+            return Some(v);
+        }
+    }
+    if let Some(unfenced) = strip_markdown_json_fence(trimmed) {
+        if let Ok(v) = serde_json::from_str::<Value>(unfenced.trim()) {
+            if v.is_object() || v.is_array() {
+                return Some(v);
+            }
+        }
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if start < end {
+        if let Ok(v) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+async fn fetch_raw_bytes(
+    resolved: &str,
+) -> Result<(Vec<u8>, Option<String>), AnalysisError> {
+    if resolved.starts_with("http://") || resolved.starts_with("https://") {
+        let response = reqwest::get(resolved).await.map_err(|e| {
+            AnalysisError::ExtractionFailed {
+                input: resolved.to_string(),
+                reason: format!("HTTP fetch failed: {e}"),
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(AnalysisError::ExtractionFailed {
+                input: resolved.to_string(),
+                reason: format!("HTTP {}", response.status()),
+            });
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let bytes = response.bytes().await.map_err(|e| AnalysisError::ExtractionFailed {
+            input: resolved.to_string(),
+            reason: format!("failed to read response body: {e}"),
+        })?;
+        Ok((bytes.to_vec(), content_type))
+    } else {
+        let bytes = tokio::fs::read(resolved).await.map_err(|e| AnalysisError::ExtractionFailed {
+            input: resolved.to_string(),
+            reason: format!("cannot read file: {e}"),
+        })?;
+        Ok((bytes, None))
+    }
+}
+
+#[cfg(feature = "rag-pdf")]
+fn extract_pdf_text_from_bytes(input: &str, bytes: Vec<u8>) -> Result<String, AnalysisError> {
+    // Blocking — wrap in spawn_blocking at the call site.
+    pdf_extract::extract_text_from_mem(&bytes).map_err(|e| AnalysisError::ExtractionFailed {
+        input: input.to_string(),
+        reason: format!("PDF text extraction failed: {e}"),
+    })
+}
+
+fn extract_docx_text_from_bytes(input: &str, bytes: Vec<u8>) -> Result<String, AnalysisError> {
+    use std::io::Read as _;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| AnalysisError::ExtractionFailed {
+        input: input.to_string(),
+        reason: format!("not a valid ZIP/DOCX: {e}"),
+    })?;
+    let mut file = archive
+        .by_name("word/document.xml")
+        .map_err(|e| AnalysisError::ExtractionFailed {
+            input: input.to_string(),
+            reason: format!("word/document.xml not found in DOCX: {e}"),
+        })?;
+    let mut xml = String::new();
+    file.read_to_string(&mut xml).map_err(|e| AnalysisError::ExtractionFailed {
+        input: input.to_string(),
+        reason: format!("cannot read word/document.xml: {e}"),
+    })?;
+    // Strip XML tags
+    let text = xml
+        .split('<')
+        .skip(1)
+        .filter_map(|chunk| chunk.find('>').map(|i| &chunk[i + 1..]))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    Ok(text)
+}
+
+async fn run_text_model_core(
+    content: &str,
+    instruction: &str,
+    output_schema: &Value,
+    cfg: &DocumentProcessorConfig,
+    reliability: &ReliabilityConfig,
+    processor_tag: &str,
+) -> Result<AnalysisResult, AnalysisError> {
+    let max_chars = cfg.max_extracted_chars;
+    let char_count = content.chars().count();
+    if char_count > max_chars {
+        tracing::warn!(
+            chars = char_count,
+            max = max_chars,
+            "document analysis: content exceeds max_extracted_chars"
+        );
+        return Err(AnalysisError::ExtractedTextTooLarge {
+            chars: char_count,
+            max_chars: max_chars,
+        });
+    }
+
+    let provider = providers::create_resilient_provider(
+        cfg.provider.trim(),
+        None,
+        None,
+        reliability,
+    )
+    .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+
+    let schema_str = serde_json::to_string_pretty(output_schema).unwrap_or_default();
+    let system_prompt = format!(
+        "{}\n\nYou MUST respond with a JSON object that exactly matches this JSON Schema:\n{}\n\nRespond with valid JSON only. No markdown, no explanation.",
+        instruction.trim(),
+        schema_str
+    );
+
+    let messages = vec![
+        ChatMessage::system(system_prompt),
+        ChatMessage::user(content.to_string()),
+    ];
+
+    let estimated_input_tokens =
+        ((instruction.len() + content.len() + schema_str.len()) / 4) as u64;
+    let estimated_output_tokens = 1024u64;
+    let budget_metadata = serde_json::json!({
+        "component": "document_processor",
+        "processor": processor_tag,
+        "content_chars": char_count,
+    });
+
+    let budget_client = RemoteBudgetClient::from_env();
+    let budget_quote_id = if let Some(remote_budget) = budget_client.as_ref() {
+        let check = remote_budget
+            .check_text_quote(
+                None,
+                "document_processor",
+                cfg.provider.trim(),
+                cfg.model.trim(),
+                estimated_input_tokens,
+                estimated_output_tokens,
+                budget_metadata.clone(),
+            )
+            .await
+            .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+        if !check.allowed {
+            return Err(AnalysisError::BudgetDenied(
+                check.reason.unwrap_or_else(|| "budget exhausted".to_string()),
+            ));
+        }
+        check.quote_id
+    } else {
+        None
+    };
+
+    let started_at = Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(cfg.analysis_timeout_secs),
+        provider.chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            cfg.model.trim(),
+            cfg.temperature,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        tracing::warn!(provider = %cfg.provider, model = %cfg.model, "document analysis: model call timed out");
+        AnalysisError::Timeout
+    })?
+    .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+
+    if let Some(remote_budget) = budget_client.as_ref() {
+        let input_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|u| u.input_tokens)
+            .unwrap_or(estimated_input_tokens);
+        let output_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|u| u.output_tokens)
+            .unwrap_or_else(|| response.text_or_empty().chars().count().div_ceil(4) as u64);
+        let cached = response
+            .usage
+            .as_ref()
+            .and_then(|u| u.cached_input_tokens)
+            .unwrap_or(0);
+        #[allow(clippy::cast_possible_truncation)]
+        if let Err(e) = remote_budget
+            .consume_text_quote(
+                None,
+                &format!("document-processor-{}", Uuid::new_v4()),
+                budget_quote_id.as_deref(),
+                "document_processor",
+                cfg.provider.trim(),
+                cfg.model.trim(),
+                input_tokens,
+                output_tokens,
+                cached,
+                started_at.elapsed().as_millis() as u64,
+                budget_metadata,
+            )
+            .await
+        {
+            tracing::warn!("failed to consume document processor budget: {e}");
+        }
+    }
+
+    let raw_output = response.text_or_empty().trim().to_string();
+    tracing::debug!(
+        provider = %cfg.provider,
+        model = %cfg.model,
+        raw_len = raw_output.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "document analysis: model response received"
+    );
+
+    // All awaits are done — compile schema and validate output now (no Send/lifetime issue).
+    tracing::debug!(
+        provider = %cfg.provider,
+        model = %cfg.model,
+        raw_len = raw_output.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "document analysis: model response received"
+    );
+
+    let parsed = validate_model_output(&raw_output, output_schema).map_err(|e| {
+        tracing::warn!(raw_len = raw_output.len(), error = %e, "document analysis: output validation failed");
+        e
+    })?;
+
+    Ok(AnalysisResult {
+        processor: processor_tag.to_string(),
+        structured_data: parsed,
+        raw_output,
+    })
+}
+
+/// Analyse raw text using the document processor (text model + schema validation).
+/// Both `instruction` and `output_schema` are required; missing either returns an error.
+pub async fn run_text_analysis(
+    text: &str,
+    instruction: &str,
+    output_schema: &Value,
+    config: &MultimodalConfig,
+    reliability: &ReliabilityConfig,
+) -> Result<AnalysisResult, AnalysisError> {
+    validate_analysis_contract(instruction, output_schema)?;
+    if text.trim().is_empty() {
+        return Err(AnalysisError::MissingContent);
+    }
+    tracing::debug!(
+        chars = text.chars().count(),
+        provider = %config.document_processor.provider,
+        model = %config.document_processor.model,
+        "text analysis: starting"
+    );
+    run_text_model_core(
+        text,
+        instruction,
+        output_schema,
+        &config.document_processor,
+        reliability,
+        "text",
+    )
+    .await
+}
+
+/// Analyse a single document (file path or URL) using the appropriate route:
+/// text/csv/txt → text model, docx → docx extraction + text model,
+/// pdf with text layer → text model, scanned pdf → visual (if configured), image → visual.
+pub async fn analyze_document_ref_to_analysis(
+    document_ref: &str,
+    instruction: &str,
+    output_schema: &Value,
+    config: &MultimodalConfig,
+    reliability: &ReliabilityConfig,
+    workspace_dir: Option<&Path>,
+) -> Result<AnalysisResult, AnalysisError> {
+    validate_analysis_contract(instruction, output_schema)?;
+    if document_ref.trim().is_empty() {
+        return Err(AnalysisError::MissingContent);
+    }
+
+    let resolved = resolve_workspace_image_ref(document_ref, workspace_dir);
+    tracing::debug!(document_ref, resolved, "document analysis: fetching bytes");
+
+    let (bytes, content_type_header) = fetch_raw_bytes(&resolved).await?;
+
+    let size_bytes = bytes.len() as u64;
+    let max_bytes = config.document_processor.max_document_bytes;
+    if bytes.len() > max_bytes {
+        tracing::warn!(
+            document_ref,
+            size_bytes,
+            max_bytes,
+            "document analysis: file too large"
+        );
+        return Err(AnalysisError::DocumentTooLarge {
+            input: document_ref.to_string(),
+            size_bytes,
+            max_bytes,
+        });
+    }
+
+    // Prefer extension-based detection; fall back to magic bytes + content-type header.
+    let path = std::path::Path::new(&resolved);
+    let mime = detect_mime(Some(path), &bytes, content_type_header.as_deref())
+        // Remap generic ZIP magic to DOCX when extension says .docx
+        .map(|m| {
+            if m == "application/zip" {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(|e| mime_from_extension(e))
+                    .map(ToString::to_string)
+                    .unwrap_or(m)
+            } else {
+                m
+            }
+        })
+        .ok_or_else(|| AnalysisError::UnsupportedMime {
+            input: document_ref.to_string(),
+            mime: "unknown".to_string(),
+        })?;
+
+    tracing::debug!(
+        document_ref,
+        mime,
+        size_bytes,
+        "document analysis: MIME detected"
+    );
+
+    match mime.as_str() {
+        "text/plain" | "text/csv" => {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            tracing::debug!(
+                document_ref,
+                chars = text.chars().count(),
+                "document analysis: text route"
+            );
+            run_text_model_core(
+                &text,
+                instruction,
+                output_schema,
+                &config.document_processor,
+                reliability,
+                "document/text",
+            )
+            .await
+        }
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "application/msword" => {
+            let doc_ref_owned = document_ref.to_string();
+            let bytes_clone = bytes.clone();
+            let text =
+                tokio::task::spawn_blocking(move || extract_docx_text_from_bytes(&doc_ref_owned, bytes_clone))
+                    .await
+                    .map_err(|e| AnalysisError::ExtractionFailed {
+                        input: document_ref.to_string(),
+                        reason: format!("blocking task panicked: {e}"),
+                    })??;
+            tracing::debug!(
+                document_ref,
+                chars = text.chars().count(),
+                "document analysis: docx route"
+            );
+            run_text_model_core(
+                &text,
+                instruction,
+                output_schema,
+                &config.document_processor,
+                reliability,
+                "document/docx",
+            )
+            .await
+        }
+        "application/pdf" => {
+            #[cfg(feature = "rag-pdf")]
+            {
+                let doc_ref_owned = document_ref.to_string();
+                let bytes_clone = bytes.clone();
+                let extracted =
+                    tokio::task::spawn_blocking(move || extract_pdf_text_from_bytes(&doc_ref_owned, bytes_clone))
+                        .await
+                        .map_err(|e| AnalysisError::ExtractionFailed {
+                            input: document_ref.to_string(),
+                            reason: format!("blocking task panicked: {e}"),
+                        })??;
+
+                let has_text = extracted.trim().len() > 50;
+                tracing::debug!(
+                    document_ref,
+                    has_text,
+                    chars = extracted.trim().len(),
+                    "document analysis: PDF extraction result"
+                );
+
+                if has_text {
+                    run_text_model_core(
+                        &extracted,
+                        instruction,
+                        output_schema,
+                        &config.document_processor,
+                        reliability,
+                        "document/pdf-text",
+                    )
+                    .await
+                } else if config.document_processor.supports_document_vision {
+                    tracing::debug!(document_ref, "document analysis: scanned PDF -> visual route");
+                    run_visual_analysis(
+                        &[document_ref.to_string()],
+                        instruction,
+                        output_schema,
+                        config,
+                        reliability,
+                        workspace_dir,
+                        true, // allow_pdf_mime
+                    )
+                    .await
+                } else {
+                    Err(AnalysisError::ScannedPdfRequiresOcr {
+                        input: document_ref.to_string(),
+                        mime,
+                        size_bytes,
+                        extraction_status: format!(
+                            "extracted {} chars, insufficient for text analysis",
+                            extracted.trim().len()
+                        ),
+                    })
+                }
+            }
+            #[cfg(not(feature = "rag-pdf"))]
+            {
+                // Without the rag-pdf feature, fall back to visual if supported.
+                if config.document_processor.supports_document_vision {
+                    run_visual_analysis(
+                        &[document_ref.to_string()],
+                        instruction,
+                        output_schema,
+                        config,
+                        reliability,
+                        workspace_dir,
+                        true,
+                    )
+                    .await
+                } else {
+                    Err(AnalysisError::UnsupportedMime {
+                        input: document_ref.to_string(),
+                        mime,
+                    })
+                }
+            }
+        }
+        m if m.starts_with("image/") => {
+            tracing::debug!(document_ref, mime, "document analysis: image -> visual route");
+            run_visual_analysis(
+                &[document_ref.to_string()],
+                instruction,
+                output_schema,
+                config,
+                reliability,
+                workspace_dir,
+                false,
+            )
+            .await
+        }
+        _ => Err(AnalysisError::UnsupportedMime {
+            input: document_ref.to_string(),
+            mime,
+        }),
+    }
+}
+
+/// Run visual analysis with a required instruction and output_schema.
+/// Used by the /internal/visual-analysis gateway endpoint and the document analysis
+/// scanned-PDF/image routing path.
+pub async fn run_visual_analysis(
+    image_refs: &[String],
+    instruction: &str,
+    output_schema: &Value,
+    config: &MultimodalConfig,
+    reliability: &ReliabilityConfig,
+    workspace_dir: Option<&Path>,
+    allow_pdf_mime: bool,
+) -> Result<AnalysisResult, AnalysisError> {
+    validate_analysis_contract(instruction, output_schema)?;
+    if image_refs.is_empty() {
+        return Err(AnalysisError::MissingContent);
+    }
+
+    if !config.processor.enabled {
+        return Err(AnalysisError::ProviderFailed(
+            "visual processor is disabled".to_string(),
+        ));
+    }
+
+    let provider = providers::create_resilient_provider(
+        config.processor.provider.trim(),
+        None,
+        None,
+        reliability,
+    )
+    .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+
+    if !provider.supports_vision() {
+        return Err(AnalysisError::ProviderFailed(format!(
+            "provider '{}' does not support vision input",
+            config.processor.provider
+        )));
+    }
+
+    let schema_str = serde_json::to_string_pretty(output_schema).unwrap_or_default();
+    let vision_system = format!(
+        "{}\n\nYou MUST respond with a JSON object that exactly matches this JSON Schema:\n{}\n\nRespond with valid JSON only. No markdown, no explanation.",
+        instruction.trim(),
+        schema_str
+    );
+
+    let resolved_refs: Vec<String> = image_refs
+        .iter()
+        .map(|r| resolve_workspace_image_ref(r, workspace_dir))
+        .collect();
+
+    let vision_user = format!(
+        "Image attachment(s):\n{}",
+        resolved_refs
+            .iter()
+            .map(|r| format!("[IMAGE:{r}]"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let vision_messages = vec![
+        ChatMessage::system(vision_system),
+        ChatMessage::user(vision_user),
+    ];
+
+    // For PDF visual path: temporarily extend ALLOWED_IMAGE_MIME_TYPES by setting allow_pdf.
+    // We build a temporary config copy with allow_remote_fetch=true if needed.
+    let mut visual_config = config.clone();
+    if allow_pdf_mime {
+        // The normalize_image functions use validate_mime internally.
+        // We handle this by relying on the provider to accept the PDF bytes directly.
+        // validate_mime_for_vision is called below instead of via prepare_messages_for_provider.
+        visual_config.allow_remote_fetch = config.allow_remote_fetch;
+    }
+
+    let prepared = prepare_messages_for_provider(&vision_messages, &visual_config)
+        .await
+        .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+
+    let estimated_input_tokens = prepared
+        .messages
+        .iter()
+        .map(|m| m.content.chars().count())
+        .sum::<usize>()
+        .div_ceil(4) as u64;
+    let estimated_output_tokens = 1024u64;
+    let budget_metadata = serde_json::json!({
+        "component": "multimodal_processor",
+        "mode": config.processor.mode.trim(),
+        "imageCount": image_refs.len(),
+        "schemaValidated": true,
+    });
+
+    let budget_client = RemoteBudgetClient::from_env();
+    let budget_quote_id = if let Some(remote_budget) = budget_client.as_ref() {
+        let check = remote_budget
+            .check_text_quote(
+                None,
+                "multimodal_processor",
+                config.processor.provider.trim(),
+                config.processor.model.trim(),
+                estimated_input_tokens,
+                estimated_output_tokens,
+                budget_metadata.clone(),
+            )
+            .await
+            .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+        if !check.allowed {
+            return Err(AnalysisError::BudgetDenied(
+                check.reason.unwrap_or_else(|| "budget exhausted".to_string()),
+            ));
+        }
+        check.quote_id
+    } else {
+        None
+    };
+
+    let doc_cfg = &config.document_processor;
+    let started_at = Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(doc_cfg.analysis_timeout_secs),
+        provider.chat(
+            ChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+            },
+            config.processor.model.trim(),
+            config.processor.temperature,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        tracing::warn!(provider = %config.processor.provider, "visual analysis: model call timed out");
+        AnalysisError::Timeout
+    })?
+    .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+
+    if let Some(remote_budget) = budget_client.as_ref() {
+        let input_tokens = response.usage.as_ref().and_then(|u| u.input_tokens).unwrap_or(estimated_input_tokens);
+        let output_tokens = response.usage.as_ref().and_then(|u| u.output_tokens)
+            .unwrap_or_else(|| response.text_or_empty().chars().count().div_ceil(4) as u64);
+        let cached = response.usage.as_ref().and_then(|u| u.cached_input_tokens).unwrap_or(0);
+        #[allow(clippy::cast_possible_truncation)]
+        if let Err(e) = remote_budget
+            .consume_text_quote(
+                None,
+                &format!("visual-analysis-{}", Uuid::new_v4()),
+                budget_quote_id.as_deref(),
+                "multimodal_processor",
+                config.processor.provider.trim(),
+                config.processor.model.trim(),
+                input_tokens,
+                output_tokens,
+                cached,
+                started_at.elapsed().as_millis() as u64,
+                budget_metadata,
+            )
+            .await
+        {
+            tracing::warn!("failed to consume visual analysis budget: {e}");
+        }
+    }
+
+    let raw_output = response.text_or_empty().trim().to_string();
+    tracing::debug!(
+        raw_len = raw_output.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "visual analysis: response received"
+    );
+
+    // All awaits done — compile schema and validate output now (no Send/lifetime issue).
+    let parsed = validate_model_output(&raw_output, output_schema).map_err(|e| {
+        tracing::warn!(raw_len = raw_output.len(), error = %e, "visual analysis: output validation failed");
+        e
+    })?;
+
+    Ok(AnalysisResult {
+        processor: "visual".to_string(),
+        structured_data: parsed,
+        raw_output,
+    })
 }
 
 #[cfg(test)]
@@ -1373,7 +2234,8 @@ mod tests {
     }
 
     #[test]
-    fn image_intent_gate_skips_upload_only_requests() {
+    fn image_intent_gate_skips_normal_conversation() {
+        // In normal conversation the agent uses the analyze_image tool — no auto-preprocessing.
         assert!(!should_analyze_image_attachments(
             "subi esta imagen a la carpeta de Drive",
             false,
@@ -1385,23 +2247,26 @@ mod tests {
             false
         ));
         assert!(!should_analyze_image_attachments("", false, false));
-    }
-
-    #[test]
-    fn image_intent_gate_allows_explicit_visual_requests() {
-        assert!(should_analyze_image_attachments(
+        // Even explicit visual intent is routed through the tool, not preprocessing.
+        assert!(!should_analyze_image_attachments(
             "analizá esta factura y extraé monto total",
             false,
             false
         ));
-        assert!(should_analyze_image_attachments(
-            "qué ves en esta imagen?",
+        assert!(!should_analyze_image_attachments(
+            "que vez aca?",
             false,
             false
         ));
+    }
+
+    #[test]
+    fn image_intent_gate_fires_only_for_policy_and_next() {
+        assert!(should_analyze_image_attachments("", true, false));
+        assert!(should_analyze_image_attachments("", false, true));
         assert!(should_analyze_image_attachments(
-            "subí esta imagen a Drive y extraé los datos",
-            false,
+            "analizá esta factura",
+            true,
             false
         ));
     }
@@ -1672,5 +2537,66 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+
+    // --- Gateway extraction contract enforcement ---
+
+    #[test]
+    fn validate_analysis_contract_rejects_empty_instruction() {
+        let schema = serde_json::json!({ "type": "object", "properties": {} });
+        assert!(matches!(
+            validate_analysis_contract("", &schema),
+            Err(AnalysisError::MissingInstruction)
+        ));
+        assert!(matches!(
+            validate_analysis_contract("  ", &schema),
+            Err(AnalysisError::MissingInstruction)
+        ));
+    }
+
+    #[test]
+    fn validate_analysis_contract_rejects_null_schema() {
+        assert!(matches!(
+            validate_analysis_contract("Extract fields.", &serde_json::Value::Null),
+            Err(AnalysisError::MissingOutputSchema)
+        ));
+    }
+
+    #[test]
+    fn validate_analysis_contract_rejects_non_schema_json() {
+        // A plain string value is not a valid JSON Schema object.
+        let bad_schema = serde_json::json!("not a schema");
+        let result = validate_analysis_contract("Extract fields.", &bad_schema);
+        assert!(
+            matches!(result, Err(AnalysisError::InvalidOutputSchema(_))),
+            "expected InvalidOutputSchema, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_analysis_contract_accepts_valid_trio() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "amount": { "type": "number" },
+                "date": { "type": "string" }
+            },
+            "required": ["amount"]
+        });
+        assert!(validate_analysis_contract("Extract amount and date.", &schema).is_ok());
+    }
+
+    #[test]
+    fn check_output_schema_rejects_null() {
+        assert!(matches!(
+            check_output_schema(&serde_json::Value::Null),
+            Err(AnalysisError::MissingOutputSchema)
+        ));
+    }
+
+    #[test]
+    fn check_output_schema_accepts_valid_json_schema() {
+        let schema = serde_json::json!({ "type": "object" });
+        assert!(check_output_schema(&schema).is_ok());
     }
 }

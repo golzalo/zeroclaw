@@ -191,6 +191,10 @@ probe-rs = { version = "0.31", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
+# DOCX extraction (word/*.xml via ZIP) and JSON Schema validation for document analysis
+zip = { version = "2" }
+jsonschema = { version = "0.26" }
+
 # WASM plugin runtime (extism)
 extism = { version = "1.9", optional = true }
 
@@ -216,7 +220,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["observability-prometheus", "channel-nostr", "skill-creation"]
+default = ["observability-prometheus", "channel-nostr", "skill-creation", "rag-pdf"]
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
