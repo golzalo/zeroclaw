@@ -7,12 +7,16 @@ use crate::remote_budget::RemoteBudgetClient;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use serde_json::{json, Map, Value};
-use std::path::Path;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 use uuid::Uuid;
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 const VISUAL_ANALYSIS_SCHEMA_VERSION: &str = "visual_analysis.v1";
+const PDF_RENDER_TARGET_WIDTH: i32 = 1600;
+const PDF_RENDER_MAXIMUM_HEIGHT: i32 = 2200;
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -958,7 +962,16 @@ pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
 ) -> anyhow::Result<PreparedMessages> {
-    let (max_images, max_image_size_mb) = config.effective_limits();
+    prepare_messages_for_provider_with_image_limit(messages, config, None).await
+}
+
+async fn prepare_messages_for_provider_with_image_limit(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    max_images_override: Option<usize>,
+) -> anyhow::Result<PreparedMessages> {
+    let (configured_max_images, max_image_size_mb) = config.effective_limits();
+    let max_images = max_images_override.unwrap_or(configured_max_images).max(1);
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
     let found_images = count_image_markers(messages);
@@ -1210,14 +1223,7 @@ fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::R
 }
 
 fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
-    validate_mime_for_vision(source, mime, false)
-}
-
-fn validate_mime_for_vision(source: &str, mime: &str, allow_pdf: bool) -> anyhow::Result<()> {
     if ALLOWED_IMAGE_MIME_TYPES.contains(&mime) {
-        return Ok(());
-    }
-    if allow_pdf && mime == "application/pdf" {
         return Ok(());
     }
 
@@ -1265,9 +1271,7 @@ fn mime_from_extension(ext: &str) -> Option<&'static str> {
         "gif" => Some("image/gif"),
         "bmp" => Some("image/bmp"),
         "pdf" => Some("application/pdf"),
-        "docx" => Some(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
         "doc" => Some("application/msword"),
         "txt" => Some("text/plain"),
         "csv" => Some("text/csv"),
@@ -1404,7 +1408,9 @@ impl AnalysisError {
                 input,
                 size_bytes,
                 max_bytes,
-            } => serde_json::json!({ "input": input, "size_bytes": size_bytes, "max_bytes": max_bytes }),
+            } => {
+                serde_json::json!({ "input": input, "size_bytes": size_bytes, "max_bytes": max_bytes })
+            }
             Self::ExtractedTextTooLarge { chars, max_chars } => {
                 serde_json::json!({ "chars": chars, "max_chars": max_chars })
             }
@@ -1446,7 +1452,10 @@ fn check_output_schema(output_schema: &Value) -> Result<(), AnalysisError> {
 }
 
 /// Check instruction + schema contract before any I/O (sync guard).
-fn validate_analysis_contract(instruction: &str, output_schema: &Value) -> Result<(), AnalysisError> {
+fn validate_analysis_contract(
+    instruction: &str,
+    output_schema: &Value,
+) -> Result<(), AnalysisError> {
     if instruction.trim().is_empty() {
         return Err(AnalysisError::MissingInstruction);
     }
@@ -1454,15 +1463,13 @@ fn validate_analysis_contract(instruction: &str, output_schema: &Value) -> Resul
 }
 
 /// Validate model output against the schema (called after all awaits, no lifetime carried across).
-fn validate_model_output(
-    raw_output: &str,
-    output_schema: &Value,
-) -> Result<Value, AnalysisError> {
-    let parsed =
-        extract_json_value_from_str(raw_output).ok_or_else(|| AnalysisError::OutputValidationFailed {
+fn validate_model_output(raw_output: &str, output_schema: &Value) -> Result<Value, AnalysisError> {
+    let parsed = extract_json_value_from_str(raw_output).ok_or_else(|| {
+        AnalysisError::OutputValidationFailed {
             raw_output: raw_output.to_string(),
             reason: "model response is not valid JSON".to_string(),
-        })?;
+        }
+    })?;
     let validator = jsonschema::validator_for(output_schema)
         .map_err(|e| AnalysisError::InvalidOutputSchema(e.to_string()))?;
     if !validator.is_valid(&parsed) {
@@ -1501,16 +1508,15 @@ fn extract_json_value_from_str(raw: &str) -> Option<Value> {
     None
 }
 
-async fn fetch_raw_bytes(
-    resolved: &str,
-) -> Result<(Vec<u8>, Option<String>), AnalysisError> {
+async fn fetch_raw_bytes(resolved: &str) -> Result<(Vec<u8>, Option<String>), AnalysisError> {
     if resolved.starts_with("http://") || resolved.starts_with("https://") {
-        let response = reqwest::get(resolved).await.map_err(|e| {
-            AnalysisError::ExtractionFailed {
-                input: resolved.to_string(),
-                reason: format!("HTTP fetch failed: {e}"),
-            }
-        })?;
+        let response =
+            reqwest::get(resolved)
+                .await
+                .map_err(|e| AnalysisError::ExtractionFailed {
+                    input: resolved.to_string(),
+                    reason: format!("HTTP fetch failed: {e}"),
+                })?;
         if !response.status().is_success() {
             return Err(AnalysisError::ExtractionFailed {
                 input: resolved.to_string(),
@@ -1522,16 +1528,22 @@ async fn fetch_raw_bytes(
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
-        let bytes = response.bytes().await.map_err(|e| AnalysisError::ExtractionFailed {
-            input: resolved.to_string(),
-            reason: format!("failed to read response body: {e}"),
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| AnalysisError::ExtractionFailed {
+                input: resolved.to_string(),
+                reason: format!("failed to read response body: {e}"),
+            })?;
         Ok((bytes.to_vec(), content_type))
     } else {
-        let bytes = tokio::fs::read(resolved).await.map_err(|e| AnalysisError::ExtractionFailed {
-            input: resolved.to_string(),
-            reason: format!("cannot read file: {e}"),
-        })?;
+        let bytes =
+            tokio::fs::read(resolved)
+                .await
+                .map_err(|e| AnalysisError::ExtractionFailed {
+                    input: resolved.to_string(),
+                    reason: format!("cannot read file: {e}"),
+                })?;
         Ok((bytes, None))
     }
 }
@@ -1545,24 +1557,135 @@ fn extract_pdf_text_from_bytes(input: &str, bytes: Vec<u8>) -> Result<String, An
     })
 }
 
+fn effective_pdf_render_page_count(page_count: usize, max_pages: i32) -> usize {
+    if max_pages < 0 {
+        page_count
+    } else {
+        usize::try_from(max_pages).unwrap_or(0).min(page_count)
+    }
+}
+
+fn pdfium_for_rendering(
+    input: &str,
+) -> Result<&'static pdfium_render::prelude::Pdfium, AnalysisError> {
+    use pdfium_render::prelude::Pdfium;
+
+    static PDFIUM: OnceLock<Result<Pdfium, String>> = OnceLock::new();
+
+    PDFIUM
+        .get_or_init(|| {
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."));
+
+            Pdfium::bind_to_system_library()
+                .or_else(|_| {
+                    Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&exe_dir))
+                })
+                .or_else(|_| {
+                    Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+                        "/usr/local/lib",
+                    ))
+                })
+                .map(Pdfium::new)
+                .map_err(|e| format!("PDFium library binding failed: {e}"))
+        })
+        .as_ref()
+        .map_err(|reason| AnalysisError::ExtractionFailed {
+            input: input.to_string(),
+            reason: reason.clone(),
+        })
+}
+
+fn render_pdf_pages_to_png_data_uris(
+    input: &str,
+    bytes: Vec<u8>,
+    max_pages: i32,
+) -> Result<Vec<String>, AnalysisError> {
+    use pdfium_render::prelude::{PdfPageRenderRotation, PdfRenderConfig};
+
+    let pdfium = pdfium_for_rendering(input)?;
+    let document = pdfium.load_pdf_from_byte_vec(bytes, None).map_err(|e| {
+        AnalysisError::ExtractionFailed {
+            input: input.to_string(),
+            reason: format!("PDFium failed to load PDF: {e}"),
+        }
+    })?;
+
+    let page_count = usize::try_from(document.pages().len()).unwrap_or(usize::MAX);
+    let render_count = effective_pdf_render_page_count(page_count, max_pages);
+    if render_count == 0 {
+        return Err(AnalysisError::ExtractionFailed {
+            input: input.to_string(),
+            reason: format!(
+                "PDF has {page_count} page(s), pdf_render_max_pages={max_pages} leaves no pages to render"
+            ),
+        });
+    }
+
+    let render_config = PdfRenderConfig::new()
+        .set_target_width(PDF_RENDER_TARGET_WIDTH)
+        .set_maximum_height(PDF_RENDER_MAXIMUM_HEIGHT)
+        .rotate_if_landscape(PdfPageRenderRotation::Degrees90, true);
+
+    let mut rendered_refs = Vec::with_capacity(render_count);
+    for (index, page) in document.pages().iter().take(render_count).enumerate() {
+        let image = page
+            .render_with_config(&render_config)
+            .map_err(|e| AnalysisError::ExtractionFailed {
+                input: input.to_string(),
+                reason: format!("PDFium failed to render page {}: {e}", index + 1),
+            })?
+            .as_image()
+            .map_err(|e| AnalysisError::ExtractionFailed {
+                input: input.to_string(),
+                reason: format!(
+                    "PDFium failed to convert rendered page {} to image: {e}",
+                    index + 1
+                ),
+            })?;
+
+        let mut cursor = Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| AnalysisError::ExtractionFailed {
+                input: input.to_string(),
+                reason: format!(
+                    "failed to encode rendered PDF page {} as PNG: {e}",
+                    index + 1
+                ),
+            })?;
+        rendered_refs.push(format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(cursor.into_inner())
+        ));
+    }
+
+    Ok(rendered_refs)
+}
+
 fn extract_docx_text_from_bytes(input: &str, bytes: Vec<u8>) -> Result<String, AnalysisError> {
     use std::io::Read as _;
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| AnalysisError::ExtractionFailed {
-        input: input.to_string(),
-        reason: format!("not a valid ZIP/DOCX: {e}"),
-    })?;
-    let mut file = archive
-        .by_name("word/document.xml")
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|e| AnalysisError::ExtractionFailed {
+            input: input.to_string(),
+            reason: format!("not a valid ZIP/DOCX: {e}"),
+        })?;
+    let mut file =
+        archive
+            .by_name("word/document.xml")
+            .map_err(|e| AnalysisError::ExtractionFailed {
+                input: input.to_string(),
+                reason: format!("word/document.xml not found in DOCX: {e}"),
+            })?;
+    let mut xml = String::new();
+    file.read_to_string(&mut xml)
         .map_err(|e| AnalysisError::ExtractionFailed {
             input: input.to_string(),
-            reason: format!("word/document.xml not found in DOCX: {e}"),
+            reason: format!("cannot read word/document.xml: {e}"),
         })?;
-    let mut xml = String::new();
-    file.read_to_string(&mut xml).map_err(|e| AnalysisError::ExtractionFailed {
-        input: input.to_string(),
-        reason: format!("cannot read word/document.xml: {e}"),
-    })?;
     // Strip XML tags
     let text = xml
         .split('<')
@@ -1592,17 +1715,13 @@ async fn run_text_model_core(
         );
         return Err(AnalysisError::ExtractedTextTooLarge {
             chars: char_count,
-            max_chars: max_chars,
+            max_chars,
         });
     }
 
-    let provider = providers::create_resilient_provider(
-        cfg.provider.trim(),
-        None,
-        None,
-        reliability,
-    )
-    .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+    let provider =
+        providers::create_resilient_provider(cfg.provider.trim(), None, None, reliability)
+            .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
 
     let schema_str = serde_json::to_string_pretty(output_schema).unwrap_or_default();
     let system_prompt = format!(
@@ -1641,7 +1760,9 @@ async fn run_text_model_core(
             .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
         if !check.allowed {
             return Err(AnalysisError::BudgetDenied(
-                check.reason.unwrap_or_else(|| "budget exhausted".to_string()),
+                check
+                    .reason
+                    .unwrap_or_else(|| "budget exhausted".to_string()),
             ));
         }
         check.quote_id
@@ -1851,13 +1972,14 @@ pub async fn analyze_document_ref_to_analysis(
         | "application/msword" => {
             let doc_ref_owned = document_ref.to_string();
             let bytes_clone = bytes.clone();
-            let text =
-                tokio::task::spawn_blocking(move || extract_docx_text_from_bytes(&doc_ref_owned, bytes_clone))
-                    .await
-                    .map_err(|e| AnalysisError::ExtractionFailed {
-                        input: document_ref.to_string(),
-                        reason: format!("blocking task panicked: {e}"),
-                    })??;
+            let text = tokio::task::spawn_blocking(move || {
+                extract_docx_text_from_bytes(&doc_ref_owned, bytes_clone)
+            })
+            .await
+            .map_err(|e| AnalysisError::ExtractionFailed {
+                input: document_ref.to_string(),
+                reason: format!("blocking task panicked: {e}"),
+            })??;
             tracing::debug!(
                 document_ref,
                 chars = text.chars().count(),
@@ -1878,13 +2000,14 @@ pub async fn analyze_document_ref_to_analysis(
             {
                 let doc_ref_owned = document_ref.to_string();
                 let bytes_clone = bytes.clone();
-                let extracted =
-                    tokio::task::spawn_blocking(move || extract_pdf_text_from_bytes(&doc_ref_owned, bytes_clone))
-                        .await
-                        .map_err(|e| AnalysisError::ExtractionFailed {
-                            input: document_ref.to_string(),
-                            reason: format!("blocking task panicked: {e}"),
-                        })??;
+                let extracted = tokio::task::spawn_blocking(move || {
+                    extract_pdf_text_from_bytes(&doc_ref_owned, bytes_clone)
+                })
+                .await
+                .map_err(|e| AnalysisError::ExtractionFailed {
+                    input: document_ref.to_string(),
+                    reason: format!("blocking task panicked: {e}"),
+                })??;
 
                 let has_text = extracted.trim().len() > 50;
                 tracing::debug!(
@@ -1905,15 +2028,35 @@ pub async fn analyze_document_ref_to_analysis(
                     )
                     .await
                 } else if config.document_processor.supports_document_vision {
-                    tracing::debug!(document_ref, "document analysis: scanned PDF -> visual route");
+                    tracing::debug!(
+                        document_ref,
+                        pdf_render_max_pages = config.document_processor.pdf_render_max_pages,
+                        "document analysis: scanned PDF -> PDFium render route"
+                    );
+                    let doc_ref_owned = document_ref.to_string();
+                    let bytes_clone = bytes.clone();
+                    let max_pages = config.document_processor.pdf_render_max_pages;
+                    let rendered_refs = tokio::task::spawn_blocking(move || {
+                        render_pdf_pages_to_png_data_uris(&doc_ref_owned, bytes_clone, max_pages)
+                    })
+                    .await
+                    .map_err(|e| AnalysisError::ExtractionFailed {
+                        input: document_ref.to_string(),
+                        reason: format!("blocking task panicked: {e}"),
+                    })??;
+                    tracing::debug!(
+                        document_ref,
+                        rendered_pages = rendered_refs.len(),
+                        "document analysis: rendered scanned PDF pages"
+                    );
                     run_visual_analysis(
-                        &[document_ref.to_string()],
+                        &rendered_refs,
                         instruction,
                         output_schema,
                         config,
                         reliability,
                         workspace_dir,
-                        true, // allow_pdf_mime
+                        Some(rendered_refs.len()),
                     )
                     .await
                 } else {
@@ -1930,16 +2073,37 @@ pub async fn analyze_document_ref_to_analysis(
             }
             #[cfg(not(feature = "rag-pdf"))]
             {
-                // Without the rag-pdf feature, fall back to visual if supported.
+                // Without the rag-pdf feature, render PDF pages for document vision if supported.
                 if config.document_processor.supports_document_vision {
+                    tracing::debug!(
+                        document_ref,
+                        pdf_render_max_pages = config.document_processor.pdf_render_max_pages,
+                        "document analysis: PDF -> PDFium render route"
+                    );
+                    let doc_ref_owned = document_ref.to_string();
+                    let bytes_clone = bytes.clone();
+                    let max_pages = config.document_processor.pdf_render_max_pages;
+                    let rendered_refs = tokio::task::spawn_blocking(move || {
+                        render_pdf_pages_to_png_data_uris(&doc_ref_owned, bytes_clone, max_pages)
+                    })
+                    .await
+                    .map_err(|e| AnalysisError::ExtractionFailed {
+                        input: document_ref.to_string(),
+                        reason: format!("blocking task panicked: {e}"),
+                    })??;
+                    tracing::debug!(
+                        document_ref,
+                        rendered_pages = rendered_refs.len(),
+                        "document analysis: rendered PDF pages"
+                    );
                     run_visual_analysis(
-                        &[document_ref.to_string()],
+                        &rendered_refs,
                         instruction,
                         output_schema,
                         config,
                         reliability,
                         workspace_dir,
-                        true,
+                        Some(rendered_refs.len()),
                     )
                     .await
                 } else {
@@ -1951,7 +2115,11 @@ pub async fn analyze_document_ref_to_analysis(
             }
         }
         m if m.starts_with("image/") => {
-            tracing::debug!(document_ref, mime, "document analysis: image -> visual route");
+            tracing::debug!(
+                document_ref,
+                mime,
+                "document analysis: image -> visual route"
+            );
             run_visual_analysis(
                 &[document_ref.to_string()],
                 instruction,
@@ -1959,7 +2127,7 @@ pub async fn analyze_document_ref_to_analysis(
                 config,
                 reliability,
                 workspace_dir,
-                false,
+                None,
             )
             .await
         }
@@ -1980,7 +2148,7 @@ pub async fn run_visual_analysis(
     config: &MultimodalConfig,
     reliability: &ReliabilityConfig,
     workspace_dir: Option<&Path>,
-    allow_pdf_mime: bool,
+    max_images_override: Option<usize>,
 ) -> Result<AnalysisResult, AnalysisError> {
     validate_analysis_contract(instruction, output_schema)?;
     if image_refs.is_empty() {
@@ -2034,19 +2202,13 @@ pub async fn run_visual_analysis(
         ChatMessage::user(vision_user),
     ];
 
-    // For PDF visual path: temporarily extend ALLOWED_IMAGE_MIME_TYPES by setting allow_pdf.
-    // We build a temporary config copy with allow_remote_fetch=true if needed.
-    let mut visual_config = config.clone();
-    if allow_pdf_mime {
-        // The normalize_image functions use validate_mime internally.
-        // We handle this by relying on the provider to accept the PDF bytes directly.
-        // validate_mime_for_vision is called below instead of via prepare_messages_for_provider.
-        visual_config.allow_remote_fetch = config.allow_remote_fetch;
-    }
-
-    let prepared = prepare_messages_for_provider(&vision_messages, &visual_config)
-        .await
-        .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
+    let prepared = prepare_messages_for_provider_with_image_limit(
+        &vision_messages,
+        config,
+        max_images_override,
+    )
+    .await
+    .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
 
     let estimated_input_tokens = prepared
         .messages
@@ -2078,7 +2240,9 @@ pub async fn run_visual_analysis(
             .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
         if !check.allowed {
             return Err(AnalysisError::BudgetDenied(
-                check.reason.unwrap_or_else(|| "budget exhausted".to_string()),
+                check
+                    .reason
+                    .unwrap_or_else(|| "budget exhausted".to_string()),
             ));
         }
         check.quote_id
@@ -2107,10 +2271,21 @@ pub async fn run_visual_analysis(
     .map_err(|e| AnalysisError::ProviderFailed(e.to_string()))?;
 
     if let Some(remote_budget) = budget_client.as_ref() {
-        let input_tokens = response.usage.as_ref().and_then(|u| u.input_tokens).unwrap_or(estimated_input_tokens);
-        let output_tokens = response.usage.as_ref().and_then(|u| u.output_tokens)
+        let input_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|u| u.input_tokens)
+            .unwrap_or(estimated_input_tokens);
+        let output_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|u| u.output_tokens)
             .unwrap_or_else(|| response.text_or_empty().chars().count().div_ceil(4) as u64);
-        let cached = response.usage.as_ref().and_then(|u| u.cached_input_tokens).unwrap_or(0);
+        let cached = response
+            .usage
+            .as_ref()
+            .and_then(|u| u.cached_input_tokens)
+            .unwrap_or(0);
         #[allow(clippy::cast_possible_truncation)]
         if let Err(e) = remote_budget
             .consume_text_quote(
@@ -2175,6 +2350,13 @@ mod tests {
 
         assert_eq!(cleaned, "hello [IMAGE:] world");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn effective_pdf_render_page_count_honors_limit_and_all_pages() {
+        assert_eq!(effective_pdf_render_page_count(12, 10), 10);
+        assert_eq!(effective_pdf_render_page_count(3, 10), 3);
+        assert_eq!(effective_pdf_render_page_count(12, -1), 12);
     }
 
     #[test]
@@ -2454,6 +2636,7 @@ mod tests {
             max_image_size_mb: 5,
             allow_remote_fetch: false,
             processor: Default::default(),
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
@@ -2497,6 +2680,7 @@ mod tests {
             max_image_size_mb: 1,
             allow_remote_fetch: false,
             processor: Default::default(),
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)

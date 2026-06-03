@@ -190,6 +190,8 @@ probe-rs = { version = "0.31", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
+# Render scanned/image-only PDFs to page images for document vision fallback.
+pdfium-render = "0.9"
 
 # DOCX extraction (word/*.xml via ZIP) and JSON Schema validation for document analysis
 zip = { version = "2" }

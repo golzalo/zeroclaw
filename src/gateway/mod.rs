@@ -1571,7 +1571,7 @@ async fn handle_internal_visual_analysis(
         &config.multimodal,
         &config.reliability,
         Some(config.workspace_dir.as_path()),
-        false,
+        None,
     )
     .await
     {
@@ -1585,7 +1585,8 @@ async fn handle_internal_visual_analysis(
         .into_response(),
         Err(err) => {
             tracing::warn!(error_code = err.error_code(), error = %err, "gateway: /internal/visual-analysis failed");
-            let status = StatusCode::from_u16(err.http_status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status = StatusCode::from_u16(err.http_status_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (
                 status,
                 Json(serde_json::json!({
@@ -1680,7 +1681,8 @@ async fn handle_internal_text_analysis(
         .into_response(),
         Err(err) => {
             tracing::warn!(error_code = err.error_code(), error = %err, "gateway: /internal/text-analysis failed");
-            let status = StatusCode::from_u16(err.http_status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status = StatusCode::from_u16(err.http_status_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (
                 status,
                 Json(serde_json::json!({
@@ -1777,7 +1779,8 @@ async fn handle_internal_document_analysis(
         .into_response(),
         Err(err) => {
             tracing::warn!(error_code = err.error_code(), error = %err, "gateway: /internal/document-analysis failed");
-            let status = StatusCode::from_u16(err.http_status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status = StatusCode::from_u16(err.http_status_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (
                 status,
                 Json(serde_json::json!({

@@ -1454,6 +1454,9 @@ pub struct DocumentProcessorConfig {
     /// When false (default), they return SCANNED_PDF_REQUIRES_OCR_OR_DOCUMENT_VISION.
     #[serde(default)]
     pub supports_document_vision: bool,
+    /// Maximum scanned PDF pages to render for document vision. `-1` renders all pages.
+    #[serde(default = "default_pdf_render_max_pages")]
+    pub pdf_render_max_pages: i32,
 }
 
 fn default_document_processor_provider() -> String {
@@ -1480,6 +1483,10 @@ fn default_analysis_timeout_secs() -> u64 {
     120
 }
 
+fn default_pdf_render_max_pages() -> i32 {
+    10
+}
+
 impl Default for DocumentProcessorConfig {
     fn default() -> Self {
         Self {
@@ -1491,6 +1498,7 @@ impl Default for DocumentProcessorConfig {
             max_extracted_chars: default_max_extracted_chars(),
             analysis_timeout_secs: default_analysis_timeout_secs(),
             supports_document_vision: false,
+            pdf_render_max_pages: default_pdf_render_max_pages(),
         }
     }
 }
@@ -7672,6 +7680,13 @@ impl Config {
             if self.multimodal.processor.prompt_file.trim().is_empty() {
                 anyhow::bail!("multimodal.processor.prompt_file must not be empty when enabled");
             }
+        }
+        if self.multimodal.document_processor.pdf_render_max_pages < -1
+            || self.multimodal.document_processor.pdf_render_max_pages == 0
+        {
+            anyhow::bail!(
+                "multimodal.document_processor.pdf_render_max_pages must be -1 or greater than 0"
+            );
         }
 
         // Embedding routes

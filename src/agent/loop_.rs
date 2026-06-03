@@ -13779,6 +13779,7 @@ outcomes:
             max_image_size_mb: 1,
             allow_remote_fetch: false,
             processor: Default::default(),
+            ..Default::default()
         };
 
         let err = run_tool_call_loop(

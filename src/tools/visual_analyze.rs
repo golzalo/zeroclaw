@@ -139,6 +139,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            ..Default::default()
         };
         let reliability = ReliabilityConfig::default();
         VisualAnalyzeTool::new(security, multimodal, reliability, std::env::temp_dir())
@@ -182,7 +183,12 @@ mod tests {
             },
             ..Default::default()
         };
-        VisualAnalyzeTool::new(security, multimodal, ReliabilityConfig::default(), std::env::temp_dir())
+        VisualAnalyzeTool::new(
+            security,
+            multimodal,
+            ReliabilityConfig::default(),
+            std::env::temp_dir(),
+        )
     }
 
     #[tokio::test]
