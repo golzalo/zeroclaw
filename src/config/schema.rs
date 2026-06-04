@@ -53,9 +53,111 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
     "transcription.*",
 ];
 
+const DEFAULT_NO_MUTATION_REQUEST_HINTS: &[&str] = &[
+    "do not bind",
+    "do not create",
+    "do not edit",
+    "do not implement",
+    "do not mutate",
+    "do not schedule",
+    "do not write",
+    "no bind",
+    "no crear",
+    "no crees",
+    "no cron",
+    "no edites",
+    "no files",
+    "no implement",
+    "no implementes",
+    "no job",
+    "no mutation",
+    "no programes",
+    "no schedule",
+    "no escribas",
+    "no_mutation",
+    "read only",
+    "read-only",
+    "solo propuesta",
+    "solo read-only",
+    "sin crear",
+    "sin implementar",
+    "sin modificar",
+    "sin programar",
+];
+
+const DEFAULT_NO_MUTATION_BLOCKED_TOOLS: &[&str] = &[
+    "cron_add",
+    "cron_remove",
+    "cron_update",
+    "file_edit",
+    "file_write",
+    "whatsapp_configure_conversation_policy",
+    "whatsapp_create_topic_group",
+    "whatsapp_observe_group",
+    "whatsapp_start_direct_conversation",
+    "whatsapp_unobserve_group",
+];
+
+const DEFAULT_NO_MUTATION_READ_ONLY_HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
+const DEFAULT_NO_MUTATION_ALLOWED_HTTP_WRITE_URL_SUBSTRINGS: &[&str] =
+    &["/cloud/providers/", "/authorization-link"];
+const DEFAULT_NO_MUTATION_DELEGATE_POLICY_AGENTS: &[&str] = &["service_builder"];
+
+const DEFAULT_NO_MUTATION_POLICY_PROMPT: &str = "RUNTIME_NO_MUTATION_POLICY:\nNO_MUTATION: true\nThe latest user message forbids implementation, scheduling, binding, file writes, job creation, cron creation, and other side effects. Treat this as a read-only proposal/blocker turn. Return a terminal WORK_RESULT user_message that does not claim anything was created, scheduled, active, configured, or linked unless the latest verified evidence already proves it.";
+
+const DEFAULT_NO_MUTATION_SUCCESS_CLAIM_HINTS: &[&str] = &[
+    "active",
+    "activo",
+    "completado",
+    "configurado",
+    "creado",
+    "done",
+    "hecho",
+    "implementado",
+    "linked",
+    "listo",
+    "programado",
+    "scheduled",
+    "vinculado",
+    "ya esta",
+    "ya está",
+];
+
+const DEFAULT_NO_MUTATION_SUCCESS_NEGATION_HINTS: &[&str] = &[
+    "did not",
+    "i did not",
+    "no active",
+    "no configure",
+    "no configured",
+    "no cree",
+    "no cree ningun",
+    "no creé",
+    "no creé ningún",
+    "no hice",
+    "no implemente",
+    "no implementé",
+    "no programe",
+    "no programé",
+    "no vincul",
+    "not active",
+    "not configured",
+    "not created",
+    "not implemented",
+    "not linked",
+    "not scheduled",
+    "sin configurar",
+    "sin crear",
+    "sin implementar",
+    "sin programar",
+    "without creating",
+    "without implementing",
+    "without scheduling",
+];
+
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
+static RUNTIME_GUARDRAILS_CONFIG: OnceLock<RwLock<RuntimeGuardrailsConfig>> = OnceLock::new();
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -152,6 +254,10 @@ pub struct Config {
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+
+    /// Runtime guardrails applied by the main agent loop (`[runtime_guardrails]`).
+    #[serde(default)]
+    pub runtime_guardrails: RuntimeGuardrailsConfig,
 
     /// Reliability settings: retries, fallback providers, backoff (`[reliability]`).
     #[serde(default)]
@@ -462,6 +568,11 @@ pub struct DelegateToolConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_delegate_agentic_timeout_secs")]
     pub agentic_timeout_secs: u64,
+    /// Delegate agent names that must return a valid terminal
+    /// `subagent_work_result.v1` WORK_RESULT envelope. Agents not listed here
+    /// remain warn-only for rollout safety.
+    #[serde(default)]
+    pub required_contract_agents: Vec<String>,
 }
 
 impl Default for DelegateToolConfig {
@@ -469,8 +580,368 @@ impl Default for DelegateToolConfig {
         Self {
             timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
             agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            required_contract_agents: Vec::new(),
         }
     }
+}
+
+// ── Runtime Guardrails Configuration ────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RuntimeGuardrailsConfig {
+    /// No-mutation guardrail used when the latest user turn asks for read-only
+    /// behavior. Defaults preserve the built-in Stage 7 runtime policy.
+    #[serde(default)]
+    pub no_mutation: NoMutationGuardrailsConfig,
+}
+
+impl Default for RuntimeGuardrailsConfig {
+    fn default() -> Self {
+        Self {
+            no_mutation: NoMutationGuardrailsConfig::default(),
+        }
+    }
+}
+
+impl RuntimeGuardrailsConfig {
+    pub fn validate(&self) -> Result<()> {
+        self.no_mutation.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NoMutationGuardrailsConfig {
+    /// Enable runtime no-mutation detection and enforcement.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Normalized text snippets that mark the latest user turn as read-only.
+    #[serde(default = "default_no_mutation_request_hints")]
+    pub request_hints: Vec<String>,
+    /// Root tool names that are considered mutating and must be blocked.
+    #[serde(default = "default_no_mutation_blocked_tools")]
+    pub blocked_tools: Vec<String>,
+    /// Named mutating capabilities and their tool members.
+    ///
+    /// This lets the runtime fail closed by operation scope (for example
+    /// `schedule` or `whatsapp_policy_mutation`) instead of only by raw tool
+    /// names. `blocked_tools` remains supported as a legacy/direct override.
+    #[serde(default = "default_no_mutation_capability_policies")]
+    pub capability_policies: HashMap<String, NoMutationCapabilityPolicyConfig>,
+    /// HTTP methods treated as read-only by the `http_request` tool.
+    #[serde(default = "default_no_mutation_read_only_http_methods")]
+    pub read_only_http_methods: Vec<String>,
+    /// Required URL substrings for the only configured non-read HTTP exception.
+    /// The default allows OAuth authorization-link generation while still
+    /// blocking provider writes such as drafts, messages, jobs, or schedules.
+    #[serde(default = "default_no_mutation_allowed_http_write_url_substrings")]
+    pub allowed_http_write_url_substrings: Vec<String>,
+    /// Delegate agent names whose prompt should receive the runtime policy.
+    #[serde(default = "default_no_mutation_delegate_policy_agents")]
+    pub delegate_policy_agents: Vec<String>,
+    /// Per delegate-agent overrides for no-mutation behavior.
+    ///
+    /// Use `[runtime_guardrails.no_mutation.delegate_agent_policies.<agent>]`
+    /// to override the injected policy prompt or to block delegation entirely
+    /// for an agent while the current turn is read-only.
+    #[serde(default)]
+    pub delegate_agent_policies: HashMap<String, NoMutationDelegateAgentPolicyConfig>,
+    /// Prompt section appended to configured delegate calls under no-mutation.
+    #[serde(default = "default_no_mutation_policy_prompt")]
+    pub delegate_policy_prompt: String,
+    /// Hints that indicate a final answer may be claiming side-effect success.
+    #[serde(default = "default_no_mutation_success_claim_hints")]
+    pub success_claim_hints: Vec<String>,
+    /// Hints that negate side-effect success claims.
+    #[serde(default = "default_no_mutation_success_negation_hints")]
+    pub success_negation_hints: Vec<String>,
+}
+
+impl Default for NoMutationGuardrailsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            request_hints: default_no_mutation_request_hints(),
+            blocked_tools: default_no_mutation_blocked_tools(),
+            capability_policies: default_no_mutation_capability_policies(),
+            read_only_http_methods: default_no_mutation_read_only_http_methods(),
+            allowed_http_write_url_substrings:
+                default_no_mutation_allowed_http_write_url_substrings(),
+            delegate_policy_agents: default_no_mutation_delegate_policy_agents(),
+            delegate_agent_policies: HashMap::new(),
+            delegate_policy_prompt: default_no_mutation_policy_prompt(),
+            success_claim_hints: default_no_mutation_success_claim_hints(),
+            success_negation_hints: default_no_mutation_success_negation_hints(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct NoMutationCapabilityPolicyConfig {
+    /// Root tool names that belong to this mutating capability.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Optional safe explanation used in runtime traces when this capability is blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct NoMutationDelegateAgentPolicyConfig {
+    /// Block delegation to this agent while the latest user turn is no-mutation.
+    #[serde(default)]
+    pub block_delegate: bool,
+    /// Optional custom policy prompt for this agent. When omitted, the global
+    /// `delegate_policy_prompt` is used for agents listed in
+    /// `delegate_policy_agents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_prompt: Option<String>,
+    /// Optional user-safe reason included in runtime traces when delegation is
+    /// blocked. Keep this free of internal details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_message: Option<String>,
+}
+
+impl NoMutationGuardrailsConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        validate_non_empty_string_list(
+            "runtime_guardrails.no_mutation.request_hints",
+            &self.request_hints,
+        )?;
+        validate_non_empty_string_list(
+            "runtime_guardrails.no_mutation.blocked_tools",
+            &self.blocked_tools,
+        )?;
+        self.validate_capability_policies()?;
+        validate_non_empty_string_list(
+            "runtime_guardrails.no_mutation.read_only_http_methods",
+            &self.read_only_http_methods,
+        )?;
+        validate_string_list(
+            "runtime_guardrails.no_mutation.allowed_http_write_url_substrings",
+            &self.allowed_http_write_url_substrings,
+        )?;
+        validate_non_empty_string_list(
+            "runtime_guardrails.no_mutation.delegate_policy_agents",
+            &self.delegate_policy_agents,
+        )?;
+        validate_non_empty_string_list(
+            "runtime_guardrails.no_mutation.success_claim_hints",
+            &self.success_claim_hints,
+        )?;
+        validate_non_empty_string_list(
+            "runtime_guardrails.no_mutation.success_negation_hints",
+            &self.success_negation_hints,
+        )?;
+        self.validate_delegate_agent_policies()?;
+
+        for (i, method) in self.read_only_http_methods.iter().enumerate() {
+            let normalized = method.trim();
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == '-')
+            {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.read_only_http_methods[{i}] contains invalid characters: {normalized}"
+                );
+            }
+        }
+
+        let policy_prompt = self.delegate_policy_prompt.trim();
+        if policy_prompt.is_empty() {
+            anyhow::bail!(
+                "runtime_guardrails.no_mutation.delegate_policy_prompt must not be empty"
+            );
+        }
+        if !policy_prompt
+            .to_ascii_lowercase()
+            .contains("no_mutation: true")
+        {
+            anyhow::bail!(
+                "runtime_guardrails.no_mutation.delegate_policy_prompt must include NO_MUTATION: true"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_capability_policies(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for (capability, policy) in &self.capability_policies {
+            let normalized_capability = capability.trim();
+            if normalized_capability.is_empty() {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.capability_policies contains an empty capability name"
+                );
+            }
+            let capability_key = normalized_capability.to_ascii_lowercase();
+            if !seen.insert(capability_key) {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.capability_policies contains duplicate capability entry: {normalized_capability}"
+                );
+            }
+
+            validate_non_empty_string_list(
+                &format!(
+                    "runtime_guardrails.no_mutation.capability_policies.{normalized_capability}.tools"
+                ),
+                &policy.tools,
+            )?;
+
+            if let Some(message) = policy.message.as_deref() {
+                if message.trim().is_empty() {
+                    anyhow::bail!(
+                        "runtime_guardrails.no_mutation.capability_policies.{normalized_capability}.message must not be empty"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_delegate_agent_policies(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for (agent, policy) in &self.delegate_agent_policies {
+            let normalized_agent = agent.trim();
+            if normalized_agent.is_empty() {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.delegate_agent_policies contains an empty agent name"
+                );
+            }
+            let agent_key = normalized_agent.to_ascii_lowercase();
+            if !seen.insert(agent_key) {
+                anyhow::bail!(
+                    "runtime_guardrails.no_mutation.delegate_agent_policies contains duplicate agent entry: {normalized_agent}"
+                );
+            }
+
+            if let Some(prompt) = policy.policy_prompt.as_deref() {
+                let normalized_prompt = prompt.trim();
+                if normalized_prompt.is_empty() {
+                    anyhow::bail!(
+                        "runtime_guardrails.no_mutation.delegate_agent_policies.{normalized_agent}.policy_prompt must not be empty"
+                    );
+                }
+                if !normalized_prompt
+                    .to_ascii_lowercase()
+                    .contains("no_mutation: true")
+                {
+                    anyhow::bail!(
+                        "runtime_guardrails.no_mutation.delegate_agent_policies.{normalized_agent}.policy_prompt must include NO_MUTATION: true"
+                    );
+                }
+            }
+
+            if let Some(message) = policy.block_message.as_deref() {
+                if message.trim().is_empty() {
+                    anyhow::bail!(
+                        "runtime_guardrails.no_mutation.delegate_agent_policies.{normalized_agent}.block_message must not be empty"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn string_vec(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
+fn default_no_mutation_request_hints() -> Vec<String> {
+    string_vec(DEFAULT_NO_MUTATION_REQUEST_HINTS)
+}
+
+fn default_no_mutation_blocked_tools() -> Vec<String> {
+    string_vec(DEFAULT_NO_MUTATION_BLOCKED_TOOLS)
+}
+
+fn default_no_mutation_capability_policies() -> HashMap<String, NoMutationCapabilityPolicyConfig> {
+    [
+        (
+            "schedule",
+            &["cron_add", "cron_remove", "cron_update"][..],
+            "Scheduling, cron creation, cron updates, and cron removal are not allowed in read-only/no-mutation turns.",
+        ),
+        (
+            "file_mutation",
+            &["file_edit", "file_write"][..],
+            "File writes and edits are not allowed in read-only/no-mutation turns.",
+        ),
+        (
+            "whatsapp_policy_mutation",
+            &[
+                "whatsapp_configure_conversation_policy",
+                "whatsapp_create_topic_group",
+                "whatsapp_observe_group",
+                "whatsapp_start_direct_conversation",
+                "whatsapp_unobserve_group",
+            ][..],
+            "WhatsApp policy, group, and observation mutations are not allowed in read-only/no-mutation turns.",
+        ),
+    ]
+    .into_iter()
+    .map(|(capability, tools, message)| {
+        (
+            capability.to_string(),
+            NoMutationCapabilityPolicyConfig {
+                tools: tools.iter().map(|tool| (*tool).to_string()).collect(),
+                message: Some(message.to_string()),
+            },
+        )
+    })
+    .collect()
+}
+
+fn default_no_mutation_read_only_http_methods() -> Vec<String> {
+    string_vec(DEFAULT_NO_MUTATION_READ_ONLY_HTTP_METHODS)
+}
+
+fn default_no_mutation_allowed_http_write_url_substrings() -> Vec<String> {
+    string_vec(DEFAULT_NO_MUTATION_ALLOWED_HTTP_WRITE_URL_SUBSTRINGS)
+}
+
+fn default_no_mutation_delegate_policy_agents() -> Vec<String> {
+    string_vec(DEFAULT_NO_MUTATION_DELEGATE_POLICY_AGENTS)
+}
+
+fn default_no_mutation_policy_prompt() -> String {
+    DEFAULT_NO_MUTATION_POLICY_PROMPT.to_string()
+}
+
+fn default_no_mutation_success_claim_hints() -> Vec<String> {
+    string_vec(DEFAULT_NO_MUTATION_SUCCESS_CLAIM_HINTS)
+}
+
+fn default_no_mutation_success_negation_hints() -> Vec<String> {
+    string_vec(DEFAULT_NO_MUTATION_SUCCESS_NEGATION_HINTS)
+}
+
+fn validate_non_empty_string_list(field: &str, values: &[String]) -> Result<()> {
+    if values.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    validate_string_list(field, values)
+}
+
+fn validate_string_list(field: &str, values: &[String]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (i, value) in values.iter().enumerate() {
+        let normalized = value.trim();
+        if normalized.is_empty() {
+            anyhow::bail!("{field}[{i}] must not be empty");
+        }
+        let key = normalized.to_ascii_lowercase();
+        if !seen.insert(key) {
+            anyhow::bail!("{field} contains duplicate entry: {normalized}");
+        }
+    }
+    Ok(())
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -3429,6 +3900,10 @@ fn runtime_proxy_state() -> &'static RwLock<ProxyConfig> {
     RUNTIME_PROXY_CONFIG.get_or_init(|| RwLock::new(ProxyConfig::default()))
 }
 
+fn runtime_guardrails_state() -> &'static RwLock<RuntimeGuardrailsConfig> {
+    RUNTIME_GUARDRAILS_CONFIG.get_or_init(|| RwLock::new(RuntimeGuardrailsConfig::default()))
+}
+
 fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, reqwest::Client>> {
     RUNTIME_PROXY_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
@@ -3494,6 +3969,24 @@ pub fn set_runtime_proxy_config(config: ProxyConfig) {
 
 pub fn runtime_proxy_config() -> ProxyConfig {
     match runtime_proxy_state().read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+pub fn set_runtime_guardrails_config(config: RuntimeGuardrailsConfig) {
+    match runtime_guardrails_state().write() {
+        Ok(mut guard) => {
+            *guard = config;
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = config;
+        }
+    }
+}
+
+pub fn runtime_guardrails_config() -> RuntimeGuardrailsConfig {
+    match runtime_guardrails_state().read() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
@@ -6539,6 +7032,7 @@ impl Default for Config {
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
+            runtime_guardrails: RuntimeGuardrailsConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
@@ -7649,6 +8143,8 @@ impl Config {
             anyhow::bail!("security.estop.state_file must not be empty");
         }
 
+        self.runtime_guardrails.validate()?;
+
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
             anyhow::bail!("scheduler.max_concurrent must be greater than 0");
@@ -8021,6 +8517,29 @@ impl Config {
         if self.delegate.agentic_timeout_secs == 0 {
             anyhow::bail!("delegate.agentic_timeout_secs must be greater than 0");
         }
+        let configured_agent_names = self
+            .agents
+            .keys()
+            .map(|agent_name| agent_name.trim().to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let mut required_contract_agents = std::collections::HashSet::new();
+        for (i, agent_name) in self.delegate.required_contract_agents.iter().enumerate() {
+            let normalized = agent_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("delegate.required_contract_agents[{i}] must not be empty");
+            }
+            let normalized_key = normalized.to_ascii_lowercase();
+            if !configured_agent_names.contains(&normalized_key) {
+                anyhow::bail!(
+                    "delegate.required_contract_agents[{i}] references unknown agent: {normalized}"
+                );
+            }
+            if !required_contract_agents.insert(normalized_key) {
+                anyhow::bail!(
+                    "delegate.required_contract_agents contains duplicate entry: {normalized}"
+                );
+            }
+        }
 
         // Per-agent delegate timeout overrides
         for (name, agent) in &self.agents {
@@ -8239,6 +8758,64 @@ impl Config {
             }
         }
 
+        // Runtime guardrails: no-mutation policy.
+        if let Ok(flag) = std::env::var("ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_ENABLED") {
+            if let Some(enabled) = parse_proxy_enabled(&flag) {
+                self.runtime_guardrails.no_mutation.enabled = enabled;
+            } else {
+                tracing::warn!(
+                    "Ignoring invalid ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
+                );
+            }
+        }
+        if let Ok(raw) = std::env::var("ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_REQUEST_HINTS") {
+            self.runtime_guardrails.no_mutation.request_hints = normalize_comma_values(vec![raw]);
+        }
+        if let Ok(raw) = std::env::var("ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_BLOCKED_TOOLS") {
+            self.runtime_guardrails.no_mutation.blocked_tools = normalize_comma_values(vec![raw]);
+        }
+        if let Ok(raw) =
+            std::env::var("ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_READ_ONLY_HTTP_METHODS")
+        {
+            self.runtime_guardrails.no_mutation.read_only_http_methods =
+                normalize_comma_values(vec![raw])
+                    .into_iter()
+                    .map(|method| method.to_ascii_uppercase())
+                    .collect();
+        }
+        if let Ok(raw) = std::env::var(
+            "ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_ALLOWED_HTTP_WRITE_URL_SUBSTRINGS",
+        ) {
+            self.runtime_guardrails
+                .no_mutation
+                .allowed_http_write_url_substrings = normalize_comma_values(vec![raw]);
+        }
+        if let Ok(raw) =
+            std::env::var("ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_DELEGATE_POLICY_AGENTS")
+        {
+            self.runtime_guardrails.no_mutation.delegate_policy_agents =
+                normalize_service_list(vec![raw]);
+        }
+        if let Ok(raw) =
+            std::env::var("ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_DELEGATE_POLICY_PROMPT")
+        {
+            if !raw.trim().is_empty() {
+                self.runtime_guardrails.no_mutation.delegate_policy_prompt = raw;
+            }
+        }
+        if let Ok(raw) =
+            std::env::var("ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_SUCCESS_CLAIM_HINTS")
+        {
+            self.runtime_guardrails.no_mutation.success_claim_hints =
+                normalize_comma_values(vec![raw]);
+        }
+        if let Ok(raw) =
+            std::env::var("ZEROCLAW_RUNTIME_GUARDRAILS_NO_MUTATION_SUCCESS_NEGATION_HINTS")
+        {
+            self.runtime_guardrails.no_mutation.success_negation_hints =
+                normalize_comma_values(vec![raw]);
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -8377,6 +8954,12 @@ impl Config {
 
         if self.proxy.enabled && self.proxy.scope == ProxyScope::Environment {
             self.proxy.apply_to_process_env();
+        }
+
+        if let Err(error) = self.runtime_guardrails.validate() {
+            tracing::warn!("Invalid runtime guardrails configuration ignored: {error}");
+        } else {
+            set_runtime_guardrails_config(self.runtime_guardrails.clone());
         }
 
         set_runtime_proxy_config(self.proxy.clone());
@@ -8964,6 +9547,97 @@ mod tests {
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
 
+    #[test]
+    async fn runtime_guardrails_default_is_enabled_and_valid() {
+        let c = Config::default();
+
+        c.runtime_guardrails
+            .validate()
+            .expect("default runtime guardrails should validate");
+        assert!(c.runtime_guardrails.no_mutation.enabled);
+        assert!(c
+            .runtime_guardrails
+            .no_mutation
+            .blocked_tools
+            .iter()
+            .any(|tool| tool == "cron_add"));
+        assert!(c
+            .runtime_guardrails
+            .no_mutation
+            .capability_policies
+            .get("schedule")
+            .is_some_and(|policy| policy.tools.iter().any(|tool| tool == "cron_add")));
+        assert!(c
+            .runtime_guardrails
+            .no_mutation
+            .delegate_policy_prompt
+            .contains("NO_MUTATION: true"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_invalid_no_mutation_guardrails() {
+        let mut c = Config::default();
+        c.runtime_guardrails
+            .no_mutation
+            .blocked_tools
+            .push(" ".to_string());
+
+        let error = c.validate().expect_err("blank blocked tool should fail");
+        assert!(error
+            .to_string()
+            .contains("runtime_guardrails.no_mutation.blocked_tools"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_invalid_no_mutation_capability_policy() {
+        let mut c = Config::default();
+        c.runtime_guardrails.no_mutation.capability_policies.insert(
+            "schedule".to_string(),
+            NoMutationCapabilityPolicyConfig {
+                tools: vec![" ".to_string()],
+                message: Some("bad capability".to_string()),
+            },
+        );
+
+        let error = c.validate().expect_err("blank capability tool should fail");
+        assert!(error
+            .to_string()
+            .contains("runtime_guardrails.no_mutation.capability_policies.schedule.tools"));
+    }
+
+    #[test]
+    async fn config_validate_requires_no_mutation_prompt_marker() {
+        let mut c = Config::default();
+        c.runtime_guardrails.no_mutation.delegate_policy_prompt =
+            "Treat this as read-only.".to_string();
+
+        let error = c
+            .validate()
+            .expect_err("delegate policy prompt without marker should fail");
+        assert!(error.to_string().contains("NO_MUTATION: true"));
+    }
+
+    #[test]
+    async fn config_validate_requires_scoped_no_mutation_prompt_marker() {
+        let mut c = Config::default();
+        c.runtime_guardrails
+            .no_mutation
+            .delegate_agent_policies
+            .insert(
+                "service_builder".to_string(),
+                NoMutationDelegateAgentPolicyConfig {
+                    block_delegate: false,
+                    policy_prompt: Some("Scoped read-only policy.".to_string()),
+                    block_message: None,
+                },
+            );
+
+        let error = c
+            .validate()
+            .expect_err("scoped policy prompt without marker should fail");
+        assert!(error.to_string().contains("NO_MUTATION: true"));
+    }
+
     #[derive(Clone, Default)]
     struct SharedLogBuffer(Arc<StdMutex<Vec<u8>>>);
 
@@ -9230,6 +9904,7 @@ default_temperature = 0.7
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
             },
+            runtime_guardrails: RuntimeGuardrailsConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
@@ -9617,6 +10292,7 @@ tool_dispatcher = "xml"
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
+            runtime_guardrails: RuntimeGuardrailsConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),

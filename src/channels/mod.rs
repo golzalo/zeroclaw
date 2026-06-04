@@ -111,6 +111,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use portable_atomic::{AtomicU64, Ordering};
+use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -1704,6 +1705,38 @@ fn take_pending_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) -> bo
         .remove(sender_key)
 }
 
+fn restore_persisted_sender_history_if_missing(
+    histories: &ConversationHistoryMap,
+    store: Option<&session_store::SessionStore>,
+    sender_key: &str,
+) -> usize {
+    let Some(store) = store else {
+        return 0;
+    };
+
+    {
+        let histories = histories.lock().unwrap_or_else(|e| e.into_inner());
+        if histories
+            .get(sender_key)
+            .is_some_and(|turns| !turns.is_empty())
+        {
+            return 0;
+        }
+    }
+
+    let persisted = store.load(sender_key);
+    if persisted.is_empty() {
+        return 0;
+    }
+
+    let restored = persisted.len();
+    histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), persisted);
+    restored
+}
+
 fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -> String {
     const SKILLS_HEADER: &str = "## Available Skills\n\n";
     const SKILLS_END: &str = "</available_skills>";
@@ -2420,7 +2453,8 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip isolated tool-call JSON artifacts
     let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
     // Strip leading narration lines that announce tool usage
-    strip_tool_narration(&stripped_json)
+    let stripped_narration = strip_tool_narration(&stripped_json);
+    unwrap_provider_auth_markdown_links(&stripped_narration)
 }
 
 const EMPTY_CHANNEL_REPLY_FALLBACK: &str =
@@ -3078,6 +3112,82 @@ fn strip_tool_narration(message: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn provider_auth_markdown_link_by_label_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r#"\[(https://(?:accounts\.google\.com|login\.microsoftonline\.com|slack\.com/oauth)[^\]\s]+)\]\((?:https://)?(?:accounts\.google\.com|login\.microsoftonline\.com|slack\.com/oauth)[^)]*\)"#,
+        )
+        .expect("provider auth label markdown-link regex must compile")
+    })
+}
+
+fn provider_auth_markdown_link_by_target_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r#"\[([^\]\n]{0,4096})\]\(\s*((?:https://)?(?:accounts\.google\.com|login\.microsoftonline\.com|slack\.com/oauth)[^)\s]+)\s*\)"#,
+        )
+        .expect("provider auth target markdown-link regex must compile")
+    })
+}
+
+fn emphasized_provider_auth_url_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r#"\*\*(https://(?:accounts\.google\.com|login\.microsoftonline\.com|slack\.com/oauth)\S+?)\*\*|\*(https://(?:accounts\.google\.com|login\.microsoftonline\.com|slack\.com/oauth)\S+?)\*|_(https://(?:accounts\.google\.com|login\.microsoftonline\.com|slack\.com/oauth)\S+?)_"#,
+        )
+        .expect("provider auth emphasis regex must compile")
+    })
+}
+
+fn unwrap_provider_auth_markdown_links(message: &str) -> String {
+    let mut current = message.to_string();
+    for _ in 0..4 {
+        let next = provider_auth_markdown_link_by_target_regex()
+            .replace_all(&current, |captures: &regex::Captures<'_>| {
+                let label = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+                let target = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+                let normalized_target = if target.starts_with("https://") {
+                    target.to_string()
+                } else {
+                    format!("https://{target}")
+                };
+                if label.starts_with("https://")
+                    && (label.starts_with("https://accounts.google.com")
+                        || label.starts_with("https://login.microsoftonline.com")
+                        || label.starts_with("https://slack.com/oauth"))
+                    && label.len() > normalized_target.len()
+                {
+                    label.to_string()
+                } else {
+                    normalized_target
+                }
+            })
+            .to_string();
+        let next = provider_auth_markdown_link_by_label_regex()
+            .replace_all(&next, "$1")
+            .to_string();
+        let next = emphasized_provider_auth_url_regex()
+            .replace_all(&next, |captures: &regex::Captures<'_>| {
+                captures
+                    .iter()
+                    .skip(1)
+                    .flatten()
+                    .next()
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default()
+            })
+            .to_string();
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
@@ -3908,6 +4018,19 @@ async fn process_channel_message(
         // `/new` should make the next user turn completely fresh even if
         // older cached turns reappear before this message starts.
         clear_sender_history(ctx.as_ref(), &history_key);
+    } else if whatsapp_conversation_policy.is_none() {
+        let restored = restore_persisted_sender_history_if_missing(
+            &ctx.conversation_histories,
+            ctx.session_store.as_deref(),
+            &history_key,
+        );
+        if restored > 0 {
+            tracing::info!(
+                key = %history_key,
+                restored_turns = restored,
+                "Restored persisted channel session for active sender key"
+            );
+        }
     }
 
     let whatsapp_journal_history = whatsapp_conversation_policy.as_ref().map(|policy| {
@@ -4298,9 +4421,6 @@ async fn process_channel_message(
         }))
     };
 
-    // Record history length before tool loop so we can extract tool context after.
-    let history_len_before_tools = history.len();
-
     enum LlmExecutionResult {
         Completed(
             Result<
@@ -4526,10 +4646,6 @@ async fn process_channel_message(
                 }),
             );
 
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
             let persisted_response = if continuation.is_some() {
                 crate::agent::loop_::render_continuation_history_message_with_reference(
                     &history_key,
@@ -4539,11 +4655,7 @@ async fn process_channel_message(
             } else {
                 delivered_response.clone()
             };
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                persisted_response.clone()
-            } else {
-                format!("{tool_summary}\n{persisted_response}")
-            };
+            let history_response = persisted_response.clone();
 
             if whatsapp_conversation_policy.is_none() {
                 append_sender_turn(
@@ -5040,7 +5152,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
          - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
          - If a tool call fails, report the error — never make up data to fill the gap.\n\
          - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\
-         - Never write `[Used tools: ...]` yourself. That line is system-generated only after real tool results.\n\
+         - Never write or repeat `[Used tools: ...]`; tool summaries are internal and must not be user-visible.\n\
          - NEVER invent attachment markers such as `[IMAGE:...]`, `[DOCUMENT:...]`, `[VIDEO:...]`, `[AUDIO:...]`, or `[VOICE:...]`.\n\
          - Only output an attachment marker when it came directly from a tool result or from a file path you verified exists.\n\
          - If the user asks for an image, call `image_generate`; do not fabricate a fake image path.\n\n",
@@ -6658,6 +6770,34 @@ mod tests {
             channel_message_timeout_budget_secs(300, 10),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
+    }
+
+    #[test]
+    fn restore_persisted_sender_history_uses_active_unsanitized_key() {
+        let workspace = TempDir::new().unwrap();
+        let store = session_store::SessionStore::new(workspace.path()).unwrap();
+        let raw_key = "whatsapp:main::__whatsapp_official_group__::+5491140853388";
+        store
+            .append(raw_key, &ChatMessage::user("crear proceso"))
+            .unwrap();
+        store
+            .append(
+                raw_key,
+                &ChatMessage::assistant("Contrato propuesto. Responde YES."),
+            )
+            .unwrap();
+
+        let histories = Arc::new(Mutex::new(HashMap::new()));
+        let restored =
+            restore_persisted_sender_history_if_missing(&histories, Some(&store), raw_key);
+
+        assert_eq!(restored, 2);
+        let loaded = histories.lock().unwrap();
+        let turns = loaded
+            .get(raw_key)
+            .expect("history should be restored under the active raw key");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].content, "crear proceso");
     }
 
     fn test_whatsapp_policy() -> ObservedGroupConfig {
@@ -11212,6 +11352,51 @@ This is an example JSON object for profile settings."#;
         );
 
         assert_eq!(result, MALFORMED_CHANNEL_REPLY_FALLBACK);
+    }
+
+    #[test]
+    fn sanitize_channel_response_unwraps_provider_auth_markdown_link() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&state=xyz";
+        let input = format!("Abrí este enlace: [Abrir autorización]({url})");
+
+        let result = sanitize_channel_response(&input, &tools);
+
+        assert_eq!(result, format!("Abrí este enlace: {url}"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_unwraps_emphasized_provider_auth_markdown_link() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&access_type=offline&state=xyz";
+        let input = format!("Autorizá acá: 👉 **[Connect Google Calendar]({url})**");
+
+        let result = sanitize_channel_response(&input, &tools);
+
+        assert_eq!(result, format!("Autorizá acá: 👉 {url}"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_unwraps_nested_provider_auth_markdown_link() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&state=xyz";
+        let input =
+            format!("Autorizá acá: [Abrir enlace]( [{url}](accounts.google.com/o/oauth2/v2/auth))");
+
+        let result = sanitize_channel_response(&input, &tools);
+
+        assert_eq!(result, format!("Autorizá acá: {url}"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_prefers_provider_auth_target_without_scheme() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let full_url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&access_type=offline&state=xyz";
+        let input = "Abrí: [https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&scope=https%3A%2F](accounts.google.com/o/oauth2/v2/auth?client_id=abc&access_type=offline&state=xyz)";
+
+        let result = sanitize_channel_response(input, &tools);
+
+        assert_eq!(result, format!("Abrí: {full_url}"));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
